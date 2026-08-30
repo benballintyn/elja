@@ -4,6 +4,7 @@ from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.usage import UsageLimits
 
+from elja.compaction import build_compaction
 from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
@@ -46,7 +47,7 @@ def build_agent(
             build_toolset(settings),
             *(build_mcp_toolsets(settings) if mcp_toolsets is None else mcp_toolsets),
         ],
-        capabilities=load_skills(settings),
+        capabilities=[*load_skills(settings), *build_compaction(settings)],
     )
 
 

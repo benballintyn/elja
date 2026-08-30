@@ -103,6 +103,19 @@ class AgentConfig(_Section):
     instructions: str | None = None
 
 
+class CompactionConfig(_Section):
+    """Context compaction policy (see elja.compaction for the strategy rationale)."""
+
+    enabled: bool = True
+    # Conservative default for a local 27B: quality degrades and prefill slows
+    # well before the model's nominal window (Qwen3.8 advertises 262K).
+    target_tokens: int = 24_000
+    # Recent tool call/result pairs kept verbatim by the masking tier.
+    keep_tool_pairs: int = 10
+    # Recent messages kept verbatim if the summarization fallback fires.
+    keep_messages: int = 20
+
+
 class SkillsConfig(_Section):
     """Where markdown skill files live (relative paths anchor at the workspace root)."""
 
@@ -131,6 +144,7 @@ class EljaSettings(BaseSettings):
     tools: ToolsConfig = ToolsConfig()
     mcp: MCPConfig = MCPConfig()
     agent: AgentConfig = AgentConfig()
+    compaction: CompactionConfig = CompactionConfig()
     skills: SkillsConfig = SkillsConfig()
     session: SessionConfig = SessionConfig()
 
