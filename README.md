@@ -22,7 +22,9 @@ Start LM Studio serving a model (default expectation: `qwen/qwen3.8-27b` at
 ```bash
 elja chat                      # interactive REPL (session persisted + resumed)
 elja chat --once "list the files here and summarize them"
+elja chat --once "what is in this screenshot?" --image shot.png
 elja chat --config path/to/elja.toml --session mychat
+# In the REPL, attach an image to a message with: /img <path> <prompt>
 ```
 
 Or from Python:

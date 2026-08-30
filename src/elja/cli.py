@@ -6,12 +6,13 @@ module is a demo shell for driving it interactively against a local model.
 
 import argparse
 import asyncio
-from collections.abc import Callable
+import mimetypes
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from pydantic_ai import Agent, AgentRunResult, AgentRunResultEvent
+from pydantic_ai import Agent, AgentRunResult, AgentRunResultEvent, BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
-from pydantic_ai.messages import (
+from pydantic_ai.messages import (  # noqa: I001
     FunctionToolCallEvent,
     PartDeltaEvent,
     PartStartEvent,
@@ -36,14 +37,36 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--config", type=Path, default=None, help="Path to elja.toml.")
     chat.add_argument("--session", default="default", help="Session name to resume/save.")
     chat.add_argument("--once", default=None, help="Run a single prompt and exit.")
+    chat.add_argument("--image", type=Path, default=None, help="Attach an image to --once.")
     return parser
+
+
+def attach_image(prompt: str, image: Path) -> list[str | BinaryContent]:
+    """Bundle a prompt and an image file into a multimodal user message.
+
+    Args:
+        prompt: The text part of the message.
+        image: Path to an image file.
+
+    Returns:
+        The content list to pass as the user prompt.
+
+    Raises:
+        ValueError: If the file is missing or not an image type.
+    """
+    if not image.is_file():
+        raise ValueError(f"image not found: {image}")
+    media_type, _ = mimetypes.guess_type(image.name)
+    if media_type is None or not media_type.startswith("image/"):
+        raise ValueError(f"not an image: {image}")
+    return [prompt, BinaryContent(data=image.read_bytes(), media_type=media_type)]
 
 
 async def run_turn(
     agent: Agent[EljaDeps, str],
     settings: EljaSettings,
     session: Session,
-    prompt: str,
+    prompt: str | Sequence[str | BinaryContent],
     on_delta: Callable[[str], None],
     on_status: Callable[[str], None] | None = None,
 ) -> str:
@@ -110,6 +133,7 @@ async def repl(
     settings: EljaSettings,
     session_name: str,
     once: str | None = None,
+    image: Path | None = None,
     input_fn: Callable[[str], str] = input,
 ) -> None:
     """Interactive chat loop (or a single turn when ``once`` is given)."""
@@ -144,7 +168,7 @@ async def repl(
     def show_status(label: str) -> None:
         console.print(f"\n⚙ {label}", style="dim", markup=False, highlight=False)
 
-    async def do_turn(prompt: str) -> None:
+    async def do_turn(prompt: str | Sequence[str | BinaryContent]) -> None:
         # A failed turn must never kill the REPL: report, drop the turn
         # (history is only saved on success, atomically), and keep going.
         nonlocal agent
@@ -166,7 +190,7 @@ async def repl(
 
     if once is not None:
         if once.strip():
-            await do_turn(once)
+            await do_turn(attach_image(once, image) if image is not None else once)
         return
     console.print(
         f"[bold]elja[/bold] — model [cyan]{settings.model.name}[/cyan] at "
@@ -181,6 +205,16 @@ async def repl(
             break
         if not prompt.strip():
             continue
+        if prompt.startswith("/img"):
+            parts = prompt.split(maxsplit=2)
+            if len(parts) < 3:
+                console.print("usage: /img <path> <prompt>", style="yellow")
+                continue
+            try:
+                await do_turn(attach_image(parts[2], Path(parts[1])))
+            except ValueError as exc:
+                console.print(str(exc), style="red", markup=False)
+            continue
         await do_turn(prompt)
 
 
@@ -189,7 +223,7 @@ def main() -> None:
     args = build_parser().parse_args()
     settings = load_settings(args.config)
     try:
-        asyncio.run(repl(settings, args.session, once=args.once))
+        asyncio.run(repl(settings, args.session, once=args.once, image=args.image))
     except KeyboardInterrupt:
         print("\ninterrupted")
 
