@@ -62,11 +62,12 @@ class TestAttachImage:
         assert content.media_type == "image/png"
         assert content.data == img.read_bytes()
 
-    def test_jpeg_media_type(self, tmp_path: Path) -> None:
-        img = tmp_path / "photo.jpg"
+    def test_jpeg_detected_by_magic_bytes_despite_extension(self, tmp_path: Path) -> None:
+        img = tmp_path / "photo.jfif"  # extension mimetypes can't map
         img.write_bytes(b"\xff\xd8\xff\xe0 fake")
-        assert isinstance(attach_image("x", img)[1], BinaryContent)
-        assert attach_image("x", img)[1].media_type == "image/jpeg"  # type: ignore[union-attr]
+        content = attach_image("x", img)[1]
+        assert isinstance(content, BinaryContent)
+        assert content.media_type == "image/jpeg"
 
     def test_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="not found"):
@@ -75,8 +76,24 @@ class TestAttachImage:
     def test_non_image_raises(self, tmp_path: Path) -> None:
         f = tmp_path / "notes.txt"
         f.write_text("hi")
-        with pytest.raises(ValueError, match="not an image"):
+        with pytest.raises(ValueError, match="not a supported image"):
             attach_image("x", f)
+
+    def test_renamed_html_rejected(self, tmp_path: Path) -> None:
+        fake = tmp_path / "page.png"
+        fake.write_text("<html><body>gotcha</body></html>")
+        with pytest.raises(ValueError, match="not a supported image"):
+            attach_image("x", fake)
+
+    def test_oversized_image_rejected(self, tmp_path: Path) -> None:
+        from elja.cli import MAX_IMAGE_BYTES
+
+        big = tmp_path / "huge.png"
+        with big.open("wb") as f:
+            f.seek(MAX_IMAGE_BYTES)
+            f.write(b"x")
+        with pytest.raises(ValueError, match="too large"):
+            attach_image("x", big)
 
 
 class TestRunTurnMultimodal:
@@ -143,6 +160,29 @@ class TestReplImageCommand:
         assert seen == []
 
 
+class TestReplImageEdgeCases:
+    async def test_quoted_path_with_spaces(
+        self, settings: EljaSettings, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        img = tmp_path / "Screenshot 2026-08-30 at noon.png"
+        make_png(img)
+        seen: list[object] = []
+        mocker.patch("elja.cli.build_agent", return_value=_capture_agent(seen))
+        prompts = iter([f'/img "{img}" what is it?', "exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        assert isinstance(seen[0], list)
+        assert seen[0][0] == "what is it?"
+
+    async def test_img_prefix_word_is_not_the_command(
+        self, settings: EljaSettings, mocker: MockerFixture
+    ) -> None:
+        seen: list[object] = []
+        mocker.patch("elja.cli.build_agent", return_value=_capture_agent(seen))
+        prompts = iter(["/imgfoo is not a command", "exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        assert seen == ["/imgfoo is not a command"]
+
+
 def test_main_image_flag(tmp_path: Path, mocker: MockerFixture) -> None:
     img = tmp_path / "pic.png"
     make_png(img)
@@ -166,6 +206,26 @@ def test_main_image_flag(tmp_path: Path, mocker: MockerFixture) -> None:
     main()
     assert isinstance(seen[0], list)
     assert isinstance(seen[0][1], BinaryContent)
+
+
+def test_once_with_bad_image_reports_cleanly(
+    tmp_path: Path, mocker: MockerFixture, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "elja.toml"
+    config.write_text(f'[workspace]\nroot = "{tmp_path}"\n')
+    mocker.patch("elja.cli.build_agent", return_value=_capture_agent([]))
+    mocker.patch(
+        "sys.argv",
+        ["elja", "chat", "--config", str(config), "--once", "x", "--image", "/no/such.png"],
+    )
+    main()  # must not raise
+    assert "not found" in capsys.readouterr().out
+
+
+def test_image_without_once_is_an_error(mocker: MockerFixture) -> None:
+    mocker.patch("sys.argv", ["elja", "chat", "--image", "x.png"])
+    with pytest.raises(SystemExit):
+        main()
 
 
 @pytest.mark.integration
