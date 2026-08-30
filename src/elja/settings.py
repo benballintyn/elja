@@ -13,8 +13,9 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 """
 
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -69,6 +70,32 @@ class ToolsConfig(_Section):
     max_retries: int = 3
 
 
+class MCPServerConfig(_Section):
+    """One MCP server to attach: a local stdio subprocess or a remote HTTP endpoint."""
+
+    transport: Literal["stdio", "http"] = "stdio"
+    # stdio: the subprocess to launch.
+    command: str | None = None
+    args: list[str] = []
+    env: dict[str, str] = {}
+    # http: the streamable-HTTP endpoint.
+    url: str | None = None
+
+    @model_validator(mode="after")
+    def _check_transport_fields(self) -> "MCPServerConfig":
+        if self.transport == "stdio" and not self.command:
+            raise ValueError("stdio MCP server requires 'command'")
+        if self.transport == "http" and not self.url:
+            raise ValueError("http MCP server requires 'url'")
+        return self
+
+
+class MCPConfig(_Section):
+    """MCP servers whose tools the agent can use, keyed by a short name."""
+
+    servers: dict[str, MCPServerConfig] = {}
+
+
 class AgentConfig(_Section):
     """Agent-level behavior."""
 
@@ -95,6 +122,7 @@ class EljaSettings(BaseSettings):
     limits: LimitsConfig = LimitsConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     tools: ToolsConfig = ToolsConfig()
+    mcp: MCPConfig = MCPConfig()
     agent: AgentConfig = AgentConfig()
     session: SessionConfig = SessionConfig()
 

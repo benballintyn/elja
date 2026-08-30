@@ -4,6 +4,7 @@ from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
 from elja.deps import EljaDeps
+from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
 from elja.settings import EljaSettings
 from elja.tools import build_toolset
@@ -35,7 +36,7 @@ def build_agent(settings: EljaSettings) -> Agent[EljaDeps, str]:
         deps_type=EljaDeps,
         # An explicit empty string means "no system prompt"; only None gets the default.
         instructions=DEFAULT_INSTRUCTIONS if instructions is None else instructions,
-        toolsets=[build_toolset(settings)],
+        toolsets=[build_toolset(settings), *build_mcp_toolsets(settings)],
     )
 
 

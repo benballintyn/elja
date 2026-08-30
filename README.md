@@ -60,6 +60,16 @@ run_shell = true
 
 [agent]
 instructions = "Optional: replace the default system instructions."
+
+# Attach MCP servers; their tools become available to the agent.
+[mcp.servers.mytools]
+command = "python"          # stdio: launched as a subprocess
+args = ["my_mcp_server.py"]
+env = { API_KEY = "..." }   # optional
+
+[mcp.servers.remote]
+transport = "http"          # streamable-HTTP endpoint
+url = "http://localhost:9000/mcp"
 ```
 
 ## Development
