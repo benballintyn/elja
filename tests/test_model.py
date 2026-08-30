@@ -1,5 +1,7 @@
 """Tests for elja.model."""
 
+from pydantic import SecretStr
+
 from elja.model import build_model
 from elja.settings import EljaSettings, ModelConfig
 
@@ -28,7 +30,7 @@ def test_build_model_respects_overrides() -> None:
         model=ModelConfig(
             name="org/some-model",
             base_url="http://example.com:8080/v1",
-            api_key="secret",
+            api_key=SecretStr("secret"),
             temperature=0.9,
             max_tokens=128,
             supports_strict_tool_definition=True,

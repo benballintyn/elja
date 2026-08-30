@@ -22,7 +22,7 @@ def build_model(settings: EljaSettings) -> OpenAIChatModel:
     """
     provider = OpenAIProvider(
         base_url=settings.model.base_url,
-        api_key=settings.model.api_key,
+        api_key=settings.model.api_key.get_secret_value(),
     )
     profile = OpenAIModelProfile(
         openai_supports_strict_tool_definition=settings.model.supports_strict_tool_definition,

@@ -6,11 +6,15 @@ Settings are resolved from three sources, highest precedence first:
 2. ``ELJA_*`` environment variables, nested with ``__``
    (e.g. ``ELJA_MODEL__BASE_URL``).
 3. An ``elja.toml`` file (path configurable via :func:`load_settings`).
+
+Note: programmatic overrides merge per-key only in dict form —
+``EljaSettings(model={"name": "x"})`` still lets env/TOML fill the other model
+keys, while passing a ``ModelConfig`` instance replaces the whole section.
 """
 
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, SecretStr
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -19,12 +23,18 @@ from pydantic_settings import (
 )
 
 
-class ModelConfig(BaseModel):
+class _Section(BaseModel):
+    """Base for config sections: unknown keys are errors, not silent no-ops."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ModelConfig(_Section):
     """Which LLM to talk to, and how."""
 
     name: str = "qwen/qwen3.8-27b"
     base_url: str = "http://localhost:1234/v1"
-    api_key: str = "lm-studio"
+    api_key: SecretStr = SecretStr("lm-studio")
     temperature: float = 0.2
     max_tokens: int = 4096
     # Most local OpenAI-compatible servers (LM Studio included) don't implement
@@ -32,14 +42,14 @@ class ModelConfig(BaseModel):
     supports_strict_tool_definition: bool = False
 
 
-class LimitsConfig(BaseModel):
+class LimitsConfig(_Section):
     """Caps on a single agent run, to bound runaway tool loops."""
 
     request_limit: int = 25
     total_tokens_limit: int | None = None
 
 
-class WorkspaceConfig(BaseModel):
+class WorkspaceConfig(_Section):
     """The directory tools operate in, and tool-output policies."""
 
     root: Path = Path(".")
@@ -47,7 +57,7 @@ class WorkspaceConfig(BaseModel):
     shell_timeout_seconds: float = 60.0
 
 
-class ToolsConfig(BaseModel):
+class ToolsConfig(_Section):
     """Per-tool enable flags for the built-in toolset."""
 
     read_file: bool = True
@@ -56,13 +66,13 @@ class ToolsConfig(BaseModel):
     run_shell: bool = True
 
 
-class AgentConfig(BaseModel):
+class AgentConfig(_Section):
     """Agent-level behavior."""
 
     instructions: str | None = None
 
 
-class SessionConfig(BaseModel):
+class SessionConfig(_Section):
     """Where conversation history is persisted."""
 
     dir: Path = Path(".elja/sessions")
@@ -75,7 +85,7 @@ class EljaSettings(BaseSettings):
         env_prefix="ELJA_",
         env_nested_delimiter="__",
         toml_file="elja.toml",
-        extra="ignore",
+        extra="forbid",
     )
 
     model: ModelConfig = ModelConfig()
@@ -103,14 +113,20 @@ def load_settings(config_file: Path | None = None) -> EljaSettings:
 
     Args:
         config_file: Path to a TOML config file. When ``None``, ``elja.toml``
-            in the current directory is used if present. A missing file is not
-            an error — defaults and environment variables still apply.
+            in the current directory is used if present (a missing default
+            file is fine — defaults and environment variables still apply).
+            An explicitly given path that doesn't exist is an error.
 
     Returns:
         The resolved settings.
+
+    Raises:
+        FileNotFoundError: If ``config_file`` is given but doesn't exist.
     """
     if config_file is None:
         return EljaSettings()
+    if not config_file.is_file():
+        raise FileNotFoundError(f"config file not found: {config_file}")
 
     class _Settings(EljaSettings):
         model_config = SettingsConfigDict(
