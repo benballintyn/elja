@@ -1,9 +1,11 @@
 """Agent factory: settings -> a ready-to-run elja agent."""
 
 from pydantic_ai import Agent
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.usage import UsageLimits
 
 from elja.deps import EljaDeps
+from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
 from elja.settings import EljaSettings
 from elja.tools import build_toolset
@@ -18,11 +20,15 @@ DEFAULT_INSTRUCTIONS = (
 )
 
 
-def build_agent(settings: EljaSettings) -> Agent[EljaDeps, str]:
+def build_agent(
+    settings: EljaSettings, mcp_toolsets: list[MCPToolset] | None = None
+) -> Agent[EljaDeps, str]:
     """Assemble the elja agent from settings.
 
     Args:
         settings: Resolved elja settings.
+        mcp_toolsets: Pre-built (e.g. preflighted) MCP toolsets to use instead
+            of building fresh ones from settings.
 
     Returns:
         An agent wired with the configured model, instructions, and toolset.
@@ -35,7 +41,10 @@ def build_agent(settings: EljaSettings) -> Agent[EljaDeps, str]:
         deps_type=EljaDeps,
         # An explicit empty string means "no system prompt"; only None gets the default.
         instructions=DEFAULT_INSTRUCTIONS if instructions is None else instructions,
-        toolsets=[build_toolset(settings)],
+        toolsets=[
+            build_toolset(settings),
+            *(build_mcp_toolsets(settings) if mcp_toolsets is None else mcp_toolsets),
+        ],
     )
 
 

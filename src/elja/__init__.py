@@ -2,6 +2,7 @@
 
 from elja.agent import DEFAULT_INSTRUCTIONS, build_agent, build_usage_limits
 from elja.deps import EljaDeps
+from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
 from elja.session import Session
 from elja.settings import EljaSettings, load_settings
@@ -17,6 +18,7 @@ __all__ = [
     "Session",
     "__version__",
     "build_agent",
+    "build_mcp_toolsets",
     "build_model",
     "build_toolset",
     "build_usage_limits",

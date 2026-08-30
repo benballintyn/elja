@@ -23,6 +23,7 @@ from rich.console import Console
 
 from elja.agent import build_agent, build_usage_limits
 from elja.deps import EljaDeps
+from elja.mcp import build_mcp_toolsets, preflight_mcp_toolsets
 from elja.session import Session
 from elja.settings import EljaSettings, load_settings
 
@@ -114,7 +115,27 @@ async def repl(
     """Interactive chat loop (or a single turn when ``once`` is given)."""
     console = Console()
     session = Session.for_name(settings, session_name)
-    agent = build_agent(settings)
+    # Connect MCP servers up front: failures are named and dropped so one bad
+    # entry can't poison every turn.
+    mcp_toolsets = await preflight_mcp_toolsets(
+        build_mcp_toolsets(settings),
+        lambda name, err: console.print(
+            f"warning: MCP server {name!r} unavailable, skipping: {err}",
+            style="yellow",
+            markup=False,
+        ),
+    )
+    alive = {t.id for t in mcp_toolsets}
+
+    def fresh_agent() -> "Agent[EljaDeps, str]":
+        # Fresh toolsets (filtered to servers that passed preflight): a server
+        # that dies mid-call wedges its transport, so errors get new ones.
+        return build_agent(
+            settings,
+            mcp_toolsets=[t for t in build_mcp_toolsets(settings) if t.id in alive],
+        )
+
+    agent = fresh_agent()
 
     def show_delta(delta: str) -> None:
         # Model output is data: never let rich interpret [brackets] as markup.
@@ -126,6 +147,7 @@ async def repl(
     async def do_turn(prompt: str) -> None:
         # A failed turn must never kill the REPL: report, drop the turn
         # (history is only saved on success, atomically), and keep going.
+        nonlocal agent
         try:
             await run_turn(agent, settings, session, prompt, show_delta, show_status)
         except UsageLimitExceeded as exc:
@@ -136,7 +158,10 @@ async def repl(
                 markup=False,
             )
         except Exception as exc:
-            console.print(f"\nerror: {exc} (turn not saved)", style="red", markup=False)
+            console.print(
+                f"\nerror: {str(exc) or exc!r} (turn not saved)", style="red", markup=False
+            )
+            agent = fresh_agent()
         console.print()
 
     if once is not None:
