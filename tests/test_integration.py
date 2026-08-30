@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from elja.agent import build_agent
 from elja.cli import run_turn
 from elja.session import Session
 from elja.settings import EljaSettings, WorkspaceConfig
@@ -21,6 +22,7 @@ async def test_e2e_tool_loop(tmp_path: Path) -> None:
     session = Session.for_name(settings, "it")
     deltas: list[str] = []
     output = await run_turn(
+        build_agent(settings),
         settings,
         session,
         "Create a file named hello.txt containing exactly: elja was here\n"
@@ -38,6 +40,13 @@ async def test_e2e_session_resume(tmp_path: Path) -> None:
     """A second turn sees context from the first."""
     settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
     session = Session.for_name(settings, "resume")
-    await run_turn(settings, session, "Remember this codeword: snowplow77.", lambda d: None)
-    output = await run_turn(settings, session, "What was the codeword?", lambda d: None)
+    agent = build_agent(settings)
+    await run_turn(agent, settings, session, "Remember this codeword: snowplow77.", lambda d: None)
+    output = await run_turn(
+        agent,
+        settings,
+        session,
+        "What was the codeword? Repeat it verbatim, in double quotes.",
+        lambda d: None,
+    )
     assert "snowplow77" in output
