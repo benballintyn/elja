@@ -14,6 +14,8 @@ import signal
 import subprocess
 from pathlib import Path
 
+from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -140,6 +142,27 @@ def do_run_shell(deps: EljaDeps, command: str) -> str:
     return f"{capped}\n{tail}".strip()
 
 
+def do_web_search(deps: EljaDeps, query: str) -> str:
+    """Search the web via DDGS (keyless DuckDuckGo backend) and format the top results.
+
+    Note: ddgs raises on zero hits rather than returning an empty list, so
+    "no results" is detected from the exception and reported as a normal
+    (non-error) outcome the model can act on.
+    """
+    try:
+        results = DDGS().text(query, max_results=5, backend="duckduckgo")
+    except DDGSException as exc:
+        if "no results" in str(exc).lower():
+            return f"no results for {query!r}"
+        raise ToolError(f"web search failed: {exc}") from exc
+    except (OSError, RuntimeError) as exc:
+        raise ToolError(f"web search failed: {exc}") from exc
+    blocks = [
+        f"{r.get('title', '?')} — {r.get('href', '?')}\n{r.get('body', '')}" for r in results
+    ]
+    return _cap_output(deps, "\n\n".join(blocks), "web_search")
+
+
 def read_file(ctx: RunContext[EljaDeps], path: str) -> str:
     """Read a text file. Paths are relative to the workspace root.
 
@@ -189,6 +212,18 @@ def run_shell(ctx: RunContext[EljaDeps], command: str) -> str:
         raise ModelRetry(str(exc)) from exc
 
 
+def web_search(ctx: RunContext[EljaDeps], query: str) -> str:
+    """Search the web and get titles, URLs, and snippets for the top results.
+
+    Args:
+        query: The search query.
+    """
+    try:
+        return do_web_search(ctx.deps, query)
+    except ToolError as exc:
+        raise ModelRetry(str(exc)) from exc
+
+
 def build_toolset(settings: EljaSettings) -> FunctionToolset[EljaDeps]:
     """Assemble the built-in toolset according to the settings' tool toggles.
 
@@ -205,6 +240,7 @@ def build_toolset(settings: EljaSettings) -> FunctionToolset[EljaDeps]:
             (write_file, settings.tools.write_file),
             (list_dir, settings.tools.list_dir),
             (run_shell, settings.tools.run_shell),
+            (web_search, settings.tools.web_search),
         )
         if on
     ]

@@ -232,7 +232,7 @@ class TestBuildToolset:
         settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
         toolset = build_toolset(settings)
         names = set(toolset.tools)
-        assert names == {"read_file", "write_file", "list_dir", "run_shell"}
+        assert names == {"read_file", "write_file", "list_dir", "run_shell", "web_search"}
 
     def test_toggles_disable_tools(self, tmp_path: Path) -> None:
         settings = EljaSettings(
@@ -240,7 +240,7 @@ class TestBuildToolset:
             tools=ToolsConfig(run_shell=False, write_file=False),
         )
         toolset = build_toolset(settings)
-        assert set(toolset.tools) == {"read_file", "list_dir"}
+        assert set(toolset.tools) == {"read_file", "list_dir", "web_search"}
 
     def test_max_retries_from_settings(self, tmp_path: Path) -> None:
         settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))

@@ -57,6 +57,7 @@ root = "."
 
 [tools]
 run_shell = true
+web_search = true  # keyless DuckDuckGo search via ddgs (network egress!)
 
 [agent]
 instructions = "Optional: replace the default system instructions."

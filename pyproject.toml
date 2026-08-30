@@ -20,6 +20,7 @@ dependencies = [
     "loguru (>=0.7,<1)",
     "rich (>=15.0.0,<16.0.0)",
     "fastmcp (>=3,<4)",
+    "ddgs (>=9,<10)",
 ]
 
 [project.scripts]
@@ -52,7 +53,7 @@ testpaths = ["tests"]
 addopts = "--cov=elja --cov-report=term-missing -m 'not integration'"
 asyncio_mode = "auto"
 markers = [
-    "integration: tests that require a live LLM endpoint (deselected in CI)",
+    "integration: tests that need a live external service - LLM endpoint or internet (deselected in CI)",
 ]
 
 [tool.mypy]
