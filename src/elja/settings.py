@@ -65,6 +65,7 @@ class ToolsConfig(_Section):
     write_file: bool = True
     list_dir: bool = True
     run_shell: bool = True
+    web_search: bool = True
     # Consecutive failures allowed per tool before the run aborts. Small local
     # models fumble paths often; request_limit still bounds the overall loop.
     max_retries: int = 3
