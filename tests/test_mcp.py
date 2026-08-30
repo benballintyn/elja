@@ -10,7 +10,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from elja.agent import build_agent
 from elja.deps import EljaDeps
-from elja.mcp import build_mcp_toolsets
+from elja.mcp import build_mcp_toolsets, preflight_mcp_toolsets
 from elja.settings import EljaSettings, MCPServerConfig, WorkspaceConfig
 
 ECHO_SERVER = Path(__file__).parent / "mcp_echo_server.py"
@@ -106,3 +106,77 @@ class TestBuildAgentIncludesMCP:
         agent = build_agent(settings)
         ids = [getattr(t, "id", None) for t in agent.toolsets]
         assert "echo" in ids
+
+
+class TestLifecycle:
+    async def test_stdio_server_persists_across_runs(self, tmp_path: Path) -> None:
+        """The CLI never enters the agent context; keep-alive must reuse the subprocess."""
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            mcp={"servers": {"echo": {"command": sys.executable, "args": [str(ECHO_SERVER)]}}},  # type: ignore[arg-type]
+        )
+        pids: list[str] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(parts=[ToolCallPart(tool_name="pid", args={})])
+            pids.append(str(getattr(messages[-1].parts[0], "content", "")))
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent = build_agent(settings)
+        deps = EljaDeps.from_settings(settings)
+        with agent.override(model=FunctionModel(script)):
+            for _ in range(2):  # no `async with agent` on purpose — mirrors run_turn
+                result = await agent.run("pid?", deps=deps)
+                assert result.output == "ok"
+        assert len(pids) == 2
+        assert pids[0] == pids[1]
+
+
+class TestPreflight:
+    async def test_drops_bad_servers_and_names_them(self, tmp_path: Path) -> None:
+        settings = EljaSettings(
+            mcp={
+                "servers": {
+                    "good": {"command": sys.executable, "args": [str(ECHO_SERVER)]},
+                    "bad": {"command": "definitely-missing-binary-xyz", "args": []},
+                }
+            }  # type: ignore[arg-type]
+        )
+        errors: list[tuple[str, str]] = []
+        ok = await preflight_mcp_toolsets(
+            build_mcp_toolsets(settings), lambda n, e: errors.append((n, e))
+        )
+        assert [t.id for t in ok] == ["good"]
+        assert len(errors) == 1
+        assert errors[0][0] == "bad"
+        assert errors[0][1]  # message is non-empty
+
+    async def test_repl_warns_and_survives_bad_server(
+        self, tmp_path: Path, mocker: object, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from collections.abc import AsyncIterator
+
+        from pytest_mock import MockerFixture
+
+        from elja.cli import repl
+
+        assert isinstance(mocker, MockerFixture)
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            mcp={"servers": {"bad": {"command": "definitely-missing-binary-xyz", "args": []}}},  # type: ignore[arg-type]
+        )
+
+        async def sf(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+            yield "fine"
+
+        from pydantic_ai import Agent
+
+        mocker.patch(
+            "elja.cli.build_agent",
+            return_value=Agent(FunctionModel(stream_function=sf), deps_type=EljaDeps),
+        )
+        await repl(settings, "s", once="hello")
+        out = capsys.readouterr().out
+        assert "warning: MCP server 'bad'" in out
+        assert "fine" in out

@@ -63,13 +63,14 @@ instructions = "Optional: replace the default system instructions."
 
 # Attach MCP servers; their tools become available to the agent.
 [mcp.servers.mytools]
-command = "python"          # stdio: launched as a subprocess
+command = "python3"         # stdio: launched as a subprocess
 args = ["my_mcp_server.py"]
-env = { API_KEY = "..." }   # optional
+env = { API_KEY = "..." }   # optional; NB the subprocess gets a minimal env
+                            # (HOME/PATH/USER...) plus these — not your full shell env
 
 [mcp.servers.remote]
 transport = "http"          # streamable-HTTP endpoint
-url = "http://localhost:9000/mcp"
+url = "http://localhost:9000/mcp"  # unauthenticated — localhost only
 ```
 
 ## Development

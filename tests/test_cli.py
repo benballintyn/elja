@@ -183,6 +183,43 @@ class TestRepl:
         assert "turn not saved" in out
         assert Session.for_name(settings, "s").load() == []
 
+    async def test_blank_error_message_falls_back_to_repr(
+        self,
+        settings: EljaSettings,
+        mocker: MockerFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A ClosedResourceError-style exception with empty str() must still be legible."""
+
+        async def sf(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+            yield "x"
+            raise ConnectionError()
+
+        agent: Agent[EljaDeps, str] = Agent(FunctionModel(stream_function=sf), deps_type=EljaDeps)
+        mocker.patch("elja.cli.build_agent", return_value=agent)
+        await repl(settings, "s", once="go")
+        assert "ConnectionError()" in capsys.readouterr().out
+
+    async def test_repl_recovers_with_fresh_agent_after_error(
+        self, settings: EljaSettings, mocker: MockerFixture
+    ) -> None:
+        """After a failed turn the next turn runs on a rebuilt agent."""
+
+        async def bad_sf(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+            yield "x"
+            raise ConnectionError("gone")
+
+        bad: Agent[EljaDeps, str] = Agent(
+            FunctionModel(stream_function=bad_sf), deps_type=EljaDeps
+        )
+        build = mocker.patch(
+            "elja.cli.build_agent", side_effect=[bad, _streaming_agent("recovered")]
+        )
+        prompts = iter(["boom", "works", "exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        assert build.call_count == 2
+        assert len(Session.for_name(settings, "s").load()) == 2
+
     async def test_usage_limit_exceeded_is_friendly(
         self,
         settings: EljaSettings,
