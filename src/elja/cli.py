@@ -6,10 +6,11 @@ module is a demo shell for driving it interactively against a local model.
 
 import argparse
 import asyncio
-from collections.abc import Callable
+import shlex
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from pydantic_ai import Agent, AgentRunResult, AgentRunResultEvent
+from pydantic_ai import Agent, AgentRunResult, AgentRunResultEvent, BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -36,14 +37,66 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--config", type=Path, default=None, help="Path to elja.toml.")
     chat.add_argument("--session", default="default", help="Session name to resume/save.")
     chat.add_argument("--once", default=None, help="Run a single prompt and exit.")
+    chat.add_argument("--image", type=Path, default=None, help="Attach an image to --once.")
     return parser
+
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# Magic-byte signatures for the raster types LM Studio's OpenAI-compatible
+# endpoint actually accepts; extensions lie (.jfif, renamed files, .heic).
+_IMAGE_MAGIC: list[tuple[bytes, str]] = [
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF8", "image/gif"),
+    (b"RIFF", "image/webp"),  # RIFF container; WEBP tag checked below
+]
+
+
+def _sniff_media_type(header: bytes) -> str | None:
+    for magic, media_type in _IMAGE_MAGIC:
+        if header.startswith(magic):
+            if media_type == "image/webp" and header[8:12] != b"WEBP":
+                continue
+            return media_type
+    return None
+
+
+def attach_image(prompt: str, image: Path) -> list[str | BinaryContent]:
+    """Bundle a prompt and an image file into a multimodal user message.
+
+    Args:
+        prompt: The text part of the message.
+        image: Path to an image file (png/jpeg/gif/webp).
+
+    Returns:
+        The content list to pass as the user prompt.
+
+    Raises:
+        ValueError: If the file is missing, too large, or not a supported
+            image type (detected by content, not extension).
+    """
+    image = image.expanduser()
+    if not image.is_file():
+        raise ValueError(f"image not found: {image}")
+    if image.stat().st_size > MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"image too large: {image} ({image.stat().st_size} bytes > {MAX_IMAGE_BYTES}); "
+            "note attached images persist in the session and are re-sent every turn"
+        )
+    with image.open("rb") as f:
+        header = f.read(12)
+    media_type = _sniff_media_type(header)
+    if media_type is None:
+        raise ValueError(f"not a supported image (png/jpeg/gif/webp): {image}")
+    return [prompt, BinaryContent(data=image.read_bytes(), media_type=media_type)]
 
 
 async def run_turn(
     agent: Agent[EljaDeps, str],
     settings: EljaSettings,
     session: Session,
-    prompt: str,
+    prompt: str | Sequence[str | BinaryContent],
     on_delta: Callable[[str], None],
     on_status: Callable[[str], None] | None = None,
 ) -> str:
@@ -110,6 +163,7 @@ async def repl(
     settings: EljaSettings,
     session_name: str,
     once: str | None = None,
+    image: Path | None = None,
     input_fn: Callable[[str], str] = input,
 ) -> None:
     """Interactive chat loop (or a single turn when ``once`` is given)."""
@@ -144,7 +198,7 @@ async def repl(
     def show_status(label: str) -> None:
         console.print(f"\n⚙ {label}", style="dim", markup=False, highlight=False)
 
-    async def do_turn(prompt: str) -> None:
+    async def do_turn(prompt: str | Sequence[str | BinaryContent]) -> None:
         # A failed turn must never kill the REPL: report, drop the turn
         # (history is only saved on success, atomically), and keep going.
         nonlocal agent
@@ -166,11 +220,17 @@ async def repl(
 
     if once is not None:
         if once.strip():
-            await do_turn(once)
+            try:
+                prompt = attach_image(once, image) if image is not None else once
+            except ValueError as exc:
+                console.print(str(exc), style="red", markup=False)
+                return
+            await do_turn(prompt)
         return
     console.print(
         f"[bold]elja[/bold] — model [cyan]{settings.model.name}[/cyan] at "
-        f"{settings.model.base_url} (session: {session_name}; exit/quit to leave)"
+        f"{settings.model.base_url} (session: {session_name}; /img <path> <prompt> to attach "
+        "an image; exit/quit to leave)"
     )
     while True:
         try:
@@ -181,15 +241,34 @@ async def repl(
             break
         if not prompt.strip():
             continue
+        if prompt.split(maxsplit=1)[0] == "/img":
+            try:
+                tokens = shlex.split(prompt)
+            except ValueError:
+                tokens = []
+            if len(tokens) < 3:
+                console.print(
+                    "usage: /img <path> <prompt> (quote paths containing spaces)",
+                    style="yellow",
+                )
+                continue
+            try:
+                await do_turn(attach_image(" ".join(tokens[2:]), Path(tokens[1])))
+            except ValueError as exc:
+                console.print(str(exc), style="red", markup=False)
+            continue
         await do_turn(prompt)
 
 
 def main() -> None:
     """Console-script entry point."""
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.image is not None and args.once is None:
+        parser.error("--image requires --once (in the REPL, use /img <path> <prompt>)")
     settings = load_settings(args.config)
     try:
-        asyncio.run(repl(settings, args.session, once=args.once))
+        asyncio.run(repl(settings, args.session, once=args.once, image=args.image))
     except KeyboardInterrupt:
         print("\ninterrupted")
 
