@@ -58,12 +58,15 @@ class WorkspaceConfig(_Section):
 
 
 class ToolsConfig(_Section):
-    """Per-tool enable flags for the built-in toolset."""
+    """Per-tool enable flags and retry policy for the built-in toolset."""
 
     read_file: bool = True
     write_file: bool = True
     list_dir: bool = True
     run_shell: bool = True
+    # Consecutive failures allowed per tool before the run aborts. Small local
+    # models fumble paths often; request_limit still bounds the overall loop.
+    max_retries: int = 3
 
 
 class AgentConfig(_Section):
