@@ -85,6 +85,12 @@ class TestAttachImage:
         with pytest.raises(ValueError, match="not a supported image"):
             attach_image("x", fake)
 
+    def test_riff_without_webp_tag_rejected(self, tmp_path: Path) -> None:
+        fake = tmp_path / "clip.webp"
+        fake.write_bytes(b"RIFF\x00\x00\x00\x00WAVE fake audio")
+        with pytest.raises(ValueError, match="not a supported image"):
+            attach_image("x", fake)
+
     def test_oversized_image_rejected(self, tmp_path: Path) -> None:
         from elja.cli import MAX_IMAGE_BYTES
 
@@ -172,6 +178,19 @@ class TestReplImageEdgeCases:
         await repl(settings, "s", input_fn=lambda _: next(prompts))
         assert isinstance(seen[0], list)
         assert seen[0][0] == "what is it?"
+
+    async def test_unclosed_quote_shows_usage(
+        self,
+        settings: EljaSettings,
+        mocker: MockerFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        seen: list[object] = []
+        mocker.patch("elja.cli.build_agent", return_value=_capture_agent(seen))
+        prompts = iter(['/img "unclosed quote.png describe', "exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        assert "usage" in capsys.readouterr().out.lower()
+        assert seen == []
 
     async def test_img_prefix_word_is_not_the_command(
         self, settings: EljaSettings, mocker: MockerFixture
