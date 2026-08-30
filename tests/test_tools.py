@@ -48,6 +48,81 @@ class TestPathResolution:
         do_write_file(deps, str(target), "fine")
         assert target.read_text() == "fine"
 
+    def test_symlink_escape_blocked(self, deps: EljaDeps) -> None:
+        (deps.workspace / "esc").symlink_to("/etc")
+        with pytest.raises(ToolError, match="resolves outside the workspace"):
+            do_list_dir(deps, "esc")
+
+    def test_nul_byte_path_is_tool_error(self, deps: EljaDeps) -> None:
+        with pytest.raises(ToolError, match="invalid path"):
+            do_read_file(deps, "bad\x00name")
+
+
+class TestFailuresBecomeToolErrors:
+    """Ordinary filesystem failures must surface to the model, not kill the run."""
+
+    def test_binary_file_read(self, deps: EljaDeps) -> None:
+        (deps.workspace / "img.png").write_bytes(b"\x89PNG\x00\xff\xfe")
+        with pytest.raises(ToolError, match="not utf-8"):
+            do_read_file(deps, "img.png")
+
+    def test_write_under_existing_file(self, deps: EljaDeps) -> None:
+        do_write_file(deps, "blocker.txt", "x")
+        with pytest.raises(ToolError, match="cannot write"):
+            do_write_file(deps, "blocker.txt/child.txt", "y")
+
+    def test_write_to_directory_path(self, deps: EljaDeps) -> None:
+        (deps.workspace / "adir").mkdir()
+        with pytest.raises(ToolError, match="cannot write"):
+            do_write_file(deps, "adir", "y")
+
+    def test_list_dir_with_broken_symlink(self, deps: EljaDeps) -> None:
+        (deps.workspace / "gone-link").symlink_to(deps.workspace / "no-such-target")
+        listing = do_list_dir(deps, ".")
+        assert "gone-link (broken link)" in listing
+
+    def test_list_dir_on_file(self, deps: EljaDeps) -> None:
+        do_write_file(deps, "f.txt", "x")
+        with pytest.raises(ToolError, match="is not a directory"):
+            do_list_dir(deps, "f.txt")
+
+    def test_run_shell_missing_workspace(self, tmp_path: Path) -> None:
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path / "gone"))
+        deps = EljaDeps.from_settings(settings)
+        with pytest.raises(ToolError, match="cannot run command"):
+            do_run_shell(deps, "echo hi")
+
+    def test_unreadable_file_is_tool_error(self, deps: EljaDeps) -> None:
+        target = deps.workspace / "locked.txt"
+        target.write_text("secret")
+        target.chmod(0o000)
+        try:
+            with pytest.raises(ToolError, match="cannot read"):
+                do_read_file(deps, "locked.txt")
+        finally:
+            target.chmod(0o644)
+
+    def test_run_shell_error_surfaces_as_retry_via_agent(self, tmp_path: Path) -> None:
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path / "gone"))
+        deps = EljaDeps.from_settings(settings)
+        calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="run_shell", args={"command": "echo hi"})]
+                )
+            return ModelResponse(parts=[TextPart(content="noted")])
+
+        agent = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            toolsets=[build_toolset(settings)],
+        )
+        result = agent.run_sync("try", deps=deps)
+        assert result.output == "noted"
+
 
 class TestListDir:
     def test_lists_entries_with_kind(self, deps: EljaDeps) -> None:
@@ -88,6 +163,35 @@ class TestRunShell:
         out = do_run_shell(deps, "sleep 5")
         assert "timed out" in out
 
+    def test_timeout_preserves_partial_output(self, tmp_path: Path) -> None:
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path, shell_timeout_seconds=0.3)
+        )
+        deps = EljaDeps.from_settings(settings)
+        out = do_run_shell(deps, "echo partial-data; exec sleep 5")
+        assert "timed out" in out
+        assert "partial-data" in out
+
+    def test_timeout_kills_process_tree(self, tmp_path: Path) -> None:
+        import time
+
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path, shell_timeout_seconds=0.2)
+        )
+        deps = EljaDeps.from_settings(settings)
+        do_run_shell(deps, "sh -c 'sleep 1; touch grandchild-marker'")
+        time.sleep(1.3)
+        assert not (tmp_path / "grandchild-marker").exists()
+
+    def test_binary_output_does_not_crash(self, deps: EljaDeps) -> None:
+        out = do_run_shell(deps, "head -c 16 /dev/urandom")
+        assert "exit code: 0" in out
+
+    def test_stderr_labeled_when_both_streams(self, deps: EljaDeps) -> None:
+        out = do_run_shell(deps, "echo out; echo err >&2")
+        assert "out" in out
+        assert "stderr:\nerr" in out
+
 
 class TestOutputCapping:
     def test_long_output_truncated_and_spilled(self, tmp_path: Path) -> None:
@@ -109,6 +213,19 @@ class TestOutputCapping:
         do_write_file(deps, "small.txt", "tiny")
         assert do_read_file(deps, "small.txt") == "tiny"
 
+    def test_exact_boundary_untouched(self, tmp_path: Path) -> None:
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path, max_tool_output_chars=10))
+        deps = EljaDeps.from_settings(settings)
+        do_write_file(deps, "b.txt", "x" * 10)
+        assert do_read_file(deps, "b.txt") == "x" * 10
+
+    def test_exit_code_survives_truncation(self, tmp_path: Path) -> None:
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path, max_tool_output_chars=50))
+        deps = EljaDeps.from_settings(settings)
+        out = do_run_shell(deps, "yes fill | head -200; exit 7")
+        assert "truncated" in out
+        assert out.strip().endswith("exit code: 7")
+
 
 class TestBuildToolset:
     def test_all_tools_registered_by_default(self, tmp_path: Path) -> None:
@@ -124,6 +241,10 @@ class TestBuildToolset:
         )
         toolset = build_toolset(settings)
         assert set(toolset.tools) == {"read_file", "list_dir"}
+
+    def test_max_retries_from_settings(self, tmp_path: Path) -> None:
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        assert build_toolset(settings).max_retries == 3
 
 
 class TestToolsViaAgent:
@@ -152,6 +273,32 @@ class TestToolsViaAgent:
         result = agent.run_sync("read missing.txt", deps=deps)
         assert result.output == "done"
         assert any("does not exist" in s for s in seen)
+
+    def test_two_consecutive_same_tool_failures_survive(self, tmp_path: Path) -> None:
+        """Default max_retries must tolerate a fumbling local model (review blocker)."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        deps = EljaDeps.from_settings(settings)
+        calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="read_file", args={"path": "missing.txt"})]
+                )
+            if len(calls) == 2:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="read_file", args={"path": "missing2.txt"})]
+                )
+            return ModelResponse(parts=[TextPart(content="recovered")])
+
+        agent = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            toolsets=[build_toolset(settings)],
+        )
+        result = agent.run_sync("read stuff", deps=deps)
+        assert result.output == "recovered"
 
     def test_write_and_list_errors_surface_as_retries(self, tmp_path: Path) -> None:
         settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
