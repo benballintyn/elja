@@ -1,0 +1,62 @@
+name: release-please
+
+# release-please watches main. For each merged PR it parses the squashed
+# commit (which == the PR title — elja squash-merges, so the PR title is the
+# sole commit message on main) and keeps a standing "release PR" that bumps
+# the version in pyproject.toml and updates CHANGELOG.md. Merge that release
+# PR to tag vX.Y.Z and cut a GitHub Release.
+#
+# When that release PR merges, the `publish` job below calls pypi-publish.yml
+# to build and upload to PyPI. It is invoked directly (`workflow_call`) rather
+# than via the tag push, because release-please creates the tag with the
+# default GITHUB_TOKEN and GitHub does not fire workflows from
+# GITHUB_TOKEN-created events. Calling it here runs the publish inside this
+# same workflow run, which sidesteps that limitation.
+#
+# release-please owns versioning + changelog + tag + GitHub Release;
+# pypi-publish.yml owns the PyPI upload.
+#
+# Versioning comes from Conventional Commit types in PR titles (enforced by
+# pr_title.yml):
+#   fix:      -> patch     feat:     -> minor
+#   feat!: / "BREAKING CHANGE:" footer -> major
+#
+# One-time repo setup:
+#   Settings -> Actions -> General -> Workflow permissions:
+#     enable "Allow GitHub Actions to create and approve pull requests".
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # config + manifest are read from the repo root by default:
+          #   release-please-config.json
+          #   .release-please-manifest.json
+
+  # Runs only when release-please actually cut a release (the release PR was
+  # merged). Calls pypi-publish.yml as a reusable workflow, passing the new
+  # tag — same workflow run, so no cross-workflow trigger is needed.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      id-token: write   # forwarded to pypi-publish.yml for OIDC publishing
+    uses: ./.github/workflows/pypi-publish.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

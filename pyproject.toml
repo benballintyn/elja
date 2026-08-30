@@ -7,12 +7,17 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11,<3.14"
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
+]
+dependencies = [
+    "pydantic-ai-slim[openai,mcp] (>=2.36,<3)",
+    "pydantic-settings (>=2.0,<3)",
+    "loguru (>=0.7,<1)",
 ]
 
 [project.urls]
@@ -20,6 +25,35 @@ Repository = "https://github.com/benballintyn/elja"
 
 [tool.poetry]
 packages = [{ include = "elja", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-cov = "^6.0"
+pytest-mock = "^3.14"
+pytest-asyncio = "^1.0"
+ruff = "^0.15"
+mypy = "^1.14"
+pre-commit = "^4.0"
+
+[tool.ruff]
+line-length = 99
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "A", "SIM", "ANN"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=elja --cov-report=term-missing"
+asyncio_mode = "auto"
+markers = [
+    "integration: tests that require a live LLM endpoint (deselected in CI)",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]

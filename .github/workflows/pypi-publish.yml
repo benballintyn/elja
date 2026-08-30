@@ -1,0 +1,136 @@
+name: Publish to PyPI
+
+# Builds and publishes a tagged release to PyPI. This workflow does NOT
+# trigger itself — it is invoked two ways:
+#
+#   1. Automatically: release_please.yml calls it (`workflow_call`) right
+#      after release-please cuts a release, passing the new tag.
+#   2. Manually: `gh workflow run pypi-publish.yml -f tag=vX.Y.Z` — a
+#      break-glass / re-publish path.
+#
+# It is NOT triggered by tag pushes. release-please creates tags using the
+# default GITHUB_TOKEN, and GitHub deliberately does not fire workflows from
+# GITHUB_TOKEN-created events (recursion prevention) — so a `push: tags`
+# trigger would never fire for an automated release. Calling this workflow
+# directly from release_please.yml runs it inside that same workflow run,
+# sidestepping the limitation entirely.
+#
+# Steps: verify the tag matches pyproject.toml, run tests across supported
+# Pythons, build sdist + wheel, publish to PyPI via OIDC trusted publishing.
+# The GitHub Release itself is created by release-please, not here.
+#
+# PyPI versions are immutable: if this fails after PyPI accepts the upload,
+# the same version cannot be re-published — cut a follow-up patch release.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.1)."
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.1)."
+        required: true
+        type: string
+
+# Concurrency: only one publish at a time.
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify tag matches pyproject
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Verify pyproject.toml version matches tag
+        run: |
+          TAG="${{ inputs.tag }}"            # v0.1.1
+          VERSION="${TAG#v}"                 # 0.1.1
+          PYPROJECT_VERSION=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$PYPROJECT_VERSION" != "$VERSION" ]; then
+            echo "::error::pyproject.toml version ($PYPROJECT_VERSION) does not match tag ($TAG)"
+            exit 1
+          fi
+          echo "Versions match: $PYPROJECT_VERSION"
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pipx install poetry
+      - run: poetry install --with dev --no-interaction
+      - run: poetry run pytest -m "not integration"
+
+  build:
+    name: Build sdist + wheel
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pipx install poetry
+      - name: Build
+        run: poetry build
+      - name: Inspect dist
+        run: ls -la dist/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The `pypi` environment is required for OIDC trusted publishing. The
+    # matching environment name must be set on the PyPI publisher
+    # configuration (https://pypi.org/manage/account/publishing/).
+    environment:
+      name: pypi
+      url: https://pypi.org/p/elja
+    permissions:
+      id-token: write   # required for trusted publishing
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # PEP 740 attestations are disabled because PyPI's Trusted
+          # Publishing currently does not support attestations from
+          # reusable-workflow invocations — the OIDC certificate embeds the
+          # caller's workflow_ref (release_please.yml), which PyPI's
+          # attestation verification rejects. OIDC trusted publishing itself
+          # (the upload-authentication path) works fine through reusable
+          # workflows. See
+          # https://github.com/pypa/gh-action-pypi-publish/issues/166
+          attestations: false

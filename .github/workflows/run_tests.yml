@@ -1,0 +1,53 @@
+name: Run Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        run: |
+          pipx install poetry
+
+      - name: Cache virtualenv
+        # The venv is in-project (.venv) per poetry.toml. Keyed on poetry.lock
+        # so the cache invalidates whenever dependencies change.
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction
+
+      - name: Lint
+        run: poetry run ruff check src tests
+
+      - name: Format check
+        run: poetry run ruff format --check src tests
+
+      - name: Type check
+        # Paths come from [tool.mypy] files = ["src", "tests"] in pyproject.toml.
+        run: poetry run mypy
+
+      - name: Run tests
+        # The `integration` marker requires a live LLM endpoint — skip in CI.
+        run: poetry run pytest -m "not integration" --cov=elja --cov-report=xml --cov-report=term
