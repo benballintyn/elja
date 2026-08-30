@@ -41,7 +41,13 @@ def test_default_instructions_and_full_toolset(tmp_path: Path) -> None:
     settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
     seen = _run(settings)
     assert seen["instructions"] == DEFAULT_INSTRUCTIONS
-    assert seen["tool_names"] == ["list_dir", "read_file", "run_shell", "write_file"]
+    assert seen["tool_names"] == [
+        "list_dir",
+        "read_file",
+        "run_shell",
+        "web_search",
+        "write_file",
+    ]
 
 
 def test_instructions_override(tmp_path: Path) -> None:
@@ -59,7 +65,7 @@ def test_tool_toggles_flow_through(tmp_path: Path) -> None:
         tools=ToolsConfig(run_shell=False, write_file=False),
     )
     seen = _run(settings)
-    assert seen["tool_names"] == ["list_dir", "read_file"]
+    assert seen["tool_names"] == ["list_dir", "read_file", "web_search"]
 
 
 def test_build_agent_uses_configured_model(tmp_path: Path) -> None:

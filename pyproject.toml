@@ -20,6 +20,7 @@ dependencies = [
     "loguru (>=0.7,<1)",
     "rich (>=15.0.0,<16.0.0)",
     "fastmcp (>=3,<4)",
+    "ddgs (>=9,<10)",
 ]
 
 [project.scripts]
