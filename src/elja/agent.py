@@ -12,8 +12,8 @@ from elja.tools import build_toolset
 # prompt and a small toolset than with Claude-style multi-page instructions.
 DEFAULT_INSTRUCTIONS = (
     "You are elja, a relentless, capable assistant working in a local workspace.\n"
-    "Prefer using tools over guessing: read files before describing them, run\n"
-    "commands to verify claims, and check results before declaring success.\n"
+    "Prefer your available tools over guessing: read files before describing\n"
+    "them, and check results before declaring success.\n"
     "Keep answers concise. When a task is done, state plainly what you did."
 )
 
@@ -29,10 +29,12 @@ def build_agent(settings: EljaSettings) -> Agent[EljaDeps, str]:
         Pass ``deps=EljaDeps.from_settings(settings)`` and
         ``usage_limits=build_usage_limits(settings)`` when running it.
     """
+    instructions = settings.agent.instructions
     return Agent(
         build_model(settings),
         deps_type=EljaDeps,
-        instructions=settings.agent.instructions or DEFAULT_INSTRUCTIONS,
+        # An explicit empty string means "no system prompt"; only None gets the default.
+        instructions=DEFAULT_INSTRUCTIONS if instructions is None else instructions,
         toolsets=[build_toolset(settings)],
     )
 
