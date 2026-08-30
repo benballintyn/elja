@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 
 from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -141,18 +142,25 @@ def do_run_shell(deps: EljaDeps, command: str) -> str:
     return f"{capped}\n{tail}".strip()
 
 
-def do_web_search(query: str) -> str:
-    """Search the web via DDGS (keyless) and format the top results."""
+def do_web_search(deps: EljaDeps, query: str) -> str:
+    """Search the web via DDGS (keyless DuckDuckGo backend) and format the top results.
+
+    Note: ddgs raises on zero hits rather than returning an empty list, so
+    "no results" is detected from the exception and reported as a normal
+    (non-error) outcome the model can act on.
+    """
     try:
-        results = DDGS().text(query, max_results=5)
-    except Exception as exc:
+        results = DDGS().text(query, max_results=5, backend="duckduckgo")
+    except DDGSException as exc:
+        if "no results" in str(exc).lower():
+            return f"no results for {query!r}"
         raise ToolError(f"web search failed: {exc}") from exc
-    if not results:
-        return f"no results for {query!r}"
+    except (OSError, RuntimeError) as exc:
+        raise ToolError(f"web search failed: {exc}") from exc
     blocks = [
         f"{r.get('title', '?')} — {r.get('href', '?')}\n{r.get('body', '')}" for r in results
     ]
-    return "\n\n".join(blocks)
+    return _cap_output(deps, "\n\n".join(blocks), "web_search")
 
 
 def read_file(ctx: RunContext[EljaDeps], path: str) -> str:
@@ -204,14 +212,14 @@ def run_shell(ctx: RunContext[EljaDeps], command: str) -> str:
         raise ModelRetry(str(exc)) from exc
 
 
-def web_search(query: str) -> str:
+def web_search(ctx: RunContext[EljaDeps], query: str) -> str:
     """Search the web and get titles, URLs, and snippets for the top results.
 
     Args:
         query: The search query.
     """
     try:
-        return do_web_search(query)
+        return do_web_search(ctx.deps, query)
     except ToolError as exc:
         raise ModelRetry(str(exc)) from exc
 
