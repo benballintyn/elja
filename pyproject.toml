@@ -1,0 +1,26 @@
+[project]
+name = "elja"
+version = "0.0.1"
+description = "A relentless, fully-customizable LLM agent harness built on Pydantic AI. Under active development."
+authors = [{ name = "Ben Ballintyn", email = "benballintyn@gmail.com" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11,<3.14"
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/benballintyn/elja"
+
+[tool.poetry]
+packages = [{ include = "elja", from = "src" }]
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
