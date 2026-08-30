@@ -18,7 +18,11 @@ dependencies = [
     "pydantic-ai-slim[openai,mcp] (>=2.36,<3)",
     "pydantic-settings (>=2.0,<3)",
     "loguru (>=0.7,<1)",
+    "rich (>=15.0.0,<16.0.0)",
 ]
+
+[project.scripts]
+elja = "elja.cli:main"
 
 [project.urls]
 Repository = "https://github.com/benballintyn/elja"
@@ -44,7 +48,7 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "A", "SIM", "ANN"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=elja --cov-report=term-missing"
+addopts = "--cov=elja --cov-report=term-missing -m 'not integration'"
 asyncio_mode = "auto"
 markers = [
     "integration: tests that require a live LLM endpoint (deselected in CI)",
