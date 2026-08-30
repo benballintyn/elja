@@ -64,6 +64,10 @@ web_search = true  # keyless DuckDuckGo search via ddgs (network egress!)
 [agent]
 instructions = "Optional: replace the default system instructions."
 
+# Skills: markdown files in <workspace>/skills/ (or [skills] dir = "...") with
+# YAML frontmatter (id, description) + an instructions body. The model loads
+# them on demand, so a large skill library costs ~no context until used.
+
 # Attach MCP servers; their tools become available to the agent.
 [mcp.servers.mytools]
 command = "python3"         # stdio: launched as a subprocess
