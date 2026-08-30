@@ -103,6 +103,12 @@ class AgentConfig(_Section):
     instructions: str | None = None
 
 
+class SkillsConfig(_Section):
+    """Where markdown skill files live (relative paths anchor at the workspace root)."""
+
+    dir: Path = Path("skills")
+
+
 class SessionConfig(_Section):
     """Where conversation history is persisted."""
 
@@ -125,6 +131,7 @@ class EljaSettings(BaseSettings):
     tools: ToolsConfig = ToolsConfig()
     mcp: MCPConfig = MCPConfig()
     agent: AgentConfig = AgentConfig()
+    skills: SkillsConfig = SkillsConfig()
     session: SessionConfig = SessionConfig()
 
     @classmethod

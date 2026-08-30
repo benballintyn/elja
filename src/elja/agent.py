@@ -8,6 +8,7 @@ from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
 from elja.settings import EljaSettings
+from elja.skills import load_skills
 from elja.tools import build_toolset
 
 # Short and directive on purpose: small local models do better with a tight
@@ -45,6 +46,7 @@ def build_agent(
             build_toolset(settings),
             *(build_mcp_toolsets(settings) if mcp_toolsets is None else mcp_toolsets),
         ],
+        capabilities=load_skills(settings),
     )
 
 
