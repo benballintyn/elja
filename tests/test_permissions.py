@@ -319,3 +319,37 @@ class TestOrdering:
     def test_gate_pins_innermost(self) -> None:
         gate = build_permission_gate(EljaSettings())
         assert gate.get_ordering().position == "innermost"
+
+
+class TestAsyncApprover:
+    async def test_async_approver_awaited(self, tmp_path: Path) -> None:
+        """A coroutine approver (web-UI style) is awaited on the loop."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        prompts: list[str] = []
+
+        async def confirm(description: str) -> bool:
+            prompts.append(description)
+            return True
+
+        seen: list[str] = []
+        result = await _agent(settings, _shell_then_done(seen)).run(
+            "go", deps=EljaDeps.from_settings(settings, confirm=confirm)
+        )
+        assert result.output == "done"
+        assert (tmp_path / "ran.txt").exists()
+        assert prompts and "run_shell" in prompts[0]
+
+    async def test_async_approver_decline(self, tmp_path: Path) -> None:
+        """An async decline skips execution exactly like a sync one."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+
+        async def confirm(description: str) -> bool:
+            return False
+
+        seen: list[str] = []
+        result = await _agent(settings, _shell_then_done(seen)).run(
+            "go", deps=EljaDeps.from_settings(settings, confirm=confirm)
+        )
+        assert result.output == "done"
+        assert any("declined" in s for s in seen)
+        assert not (tmp_path / "ran.txt").exists()

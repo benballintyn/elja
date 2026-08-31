@@ -17,6 +17,7 @@ user exactly like the parent would.
 """
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -89,7 +90,11 @@ class PermissionGate(AbstractCapability[EljaDeps]):
                 "in this run"
             )
         async with _APPROVAL_LOCK:
-            approved = await asyncio.to_thread(confirm, _describe(call))
+            if inspect.iscoroutinefunction(confirm):
+                approved = await confirm(_describe(call))
+            else:
+                # Sync approvers may block on stdin — keep them off the loop.
+                approved = await asyncio.to_thread(confirm, _describe(call))
         if not approved:
             raise SkipToolExecution(
                 f"not executed: the user declined {call.tool_name}; choose a different "
