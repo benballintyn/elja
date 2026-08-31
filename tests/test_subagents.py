@@ -95,6 +95,7 @@ class TestDelegation:
 
         def child_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             child_saw.append(list(messages))
+            assert sorted(t.name for t in info.function_tools) == ["list_dir", "read_file"]
             return ModelResponse(parts=[TextPart(content="child-answer-42")])
 
         mocker.patch("elja.subagents.build_model", return_value=FunctionModel(child_script))
@@ -174,6 +175,9 @@ class TestDelegation:
                 return ModelResponse(
                     parts=[ToolCallPart(tool_name="delegate_researcher", args={"task": "t"})]
                 )
+            last = " ".join(str(p) for p in messages[-1].parts)
+            assert "subagent 'researcher' failed:" in last
+            assert "child exploded" in last
             return ModelResponse(parts=[TextPart(content="carried on")])
 
         toolset = build_subagent_toolset(settings)
@@ -185,9 +189,88 @@ class TestDelegation:
         assert result.output == "carried on"
 
 
+class TestToolGating:
+    def test_child_default_subset_respects_disabled_tools(self, tmp_path: Path) -> None:
+        from elja.settings import ToolsConfig
+        from elja.subagents import _child_toolset
+
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            tools=ToolsConfig(run_shell=False, write_file=False),
+        )
+        cfg = SubagentConfig(description="d", instructions="i")
+        toolset = _child_toolset(settings, "x", cfg)
+        assert set(toolset.tools) == {"read_file", "list_dir", "web_search"}
+
+    def test_explicit_grant_of_disabled_tool_rejected(self, tmp_path: Path) -> None:
+        from elja.settings import ToolsConfig
+        from elja.subagents import _child_toolset
+
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            tools=ToolsConfig(run_shell=False),
+        )
+        cfg = SubagentConfig(description="d", instructions="i", tools=["run_shell"])
+        with pytest.raises(ValueError, match="disabled in"):
+            _child_toolset(settings, "x", cfg)
+
+
+class TestBudget:
+    async def test_request_limit_is_per_delegation(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        """cfg.request_limit budgets THIS delegation, offset by parent spend."""
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            subagents={
+                "helper": SubagentConfig(
+                    description="d", instructions="i", tools=["list_dir"], request_limit=1
+                )
+            },
+        )
+        child_requests: list[int] = []
+
+        def child_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            child_requests.append(1)
+            # Child tries a second request via a tool call: exceeds its budget of 1.
+            return ModelResponse(parts=[ToolCallPart(tool_name="list_dir", args={"path": "."})])
+
+        mocker.patch("elja.subagents.build_model", return_value=FunctionModel(child_script))
+        calls: list[int] = []
+        seen_result: list[str] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_helper", args={"task": "t"})]
+                )
+            seen_result.append(str(messages[-1]))
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run("go", deps=EljaDeps.from_settings(settings))
+        # Budget exhaustion is terminal info, not a retry loop: run survives.
+        assert result.output == "handled"
+        assert any("budget exhausted" in s for s in seen_result)
+        assert any("Do not delegate this again" in s for s in seen_result)
+
+
 class TestAgentWiring:
     def test_build_agent_includes_delegates(self, settings: EljaSettings) -> None:
         from elja.agent import build_agent
 
+        seen: list[str] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            seen.extend(t.name for t in info.function_tools)
+            return ModelResponse(parts=[TextPart(content="ok")])
+
         agent = build_agent(settings)
-        assert agent is not None
+        with agent.override(model=FunctionModel(script)):
+            agent.run_sync("hi", deps=EljaDeps.from_settings(settings))
+        assert "delegate_researcher" in seen

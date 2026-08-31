@@ -104,7 +104,7 @@ class SubagentConfig(_Section):
     instructions: str
     # Built-in tool names the subagent may use; None = all enabled built-ins.
     tools: list[str] | None = None
-    request_limit: int | None = None
+    request_limit: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def _check_tools(self) -> "SubagentConfig":

@@ -78,7 +78,8 @@ keep_messages = 20     # verbatim tail if the summarization fallback fires
 [subagents.researcher]
 description = "Researches a question and reports key facts."
 instructions = "Answer tersely with sources."
-tools = ["read_file", "web_search"]  # subset of built-ins; omit for all
+tools = ["read_file", "web_search"]  # subset of ENABLED built-ins; omit for all enabled
+request_limit = 8                     # per-delegation request budget (optional)
 
 # Attach MCP servers; their tools become available to the agent.
 [mcp.servers.mytools]
