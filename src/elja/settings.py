@@ -15,7 +15,7 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -45,6 +45,14 @@ class ModelConfig(_Section):
     name: str = "qwen/qwen3.8-27b"
     base_url: str | None = None
     api_key: SecretStr | None = None
+
+    @field_validator("base_url", "api_key", mode="before")
+    @classmethod
+    def _empty_env_means_unset(cls, v: object) -> object:
+        # ELJA_MODEL__BASE_URL='' is the natural env spelling of "back to
+        # default"; an empty string would otherwise reach the SDKs verbatim.
+        return None if v == "" else v
+
     temperature: float = 0.2
     max_tokens: int = 4096
     # Most local OpenAI-compatible servers (LM Studio included) don't implement

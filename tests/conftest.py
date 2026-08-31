@@ -12,10 +12,14 @@ from pytest_mock import MockerFixture
 def _hermetic(tmp_path: Path, mocker: MockerFixture) -> Iterator[None]:
     """Isolate every test from the developer's environment.
 
-    Settings read ``ELJA_*`` env vars and ``./elja.toml``; without this, a
-    stray env var or a config file in the repo root would change test results.
+    Settings read ``ELJA_*`` env vars and ``./elja.toml``, and the model
+    factory reads provider API keys; without this, a stray env var or a config
+    file in the repo root would change test results.
     """
-    clean = {k: v for k, v in os.environ.items() if not k.startswith("ELJA_")}
+    provider_keys = {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"}
+    clean = {
+        k: v for k, v in os.environ.items() if not k.startswith("ELJA_") and k not in provider_keys
+    }
     mocker.patch.dict("os.environ", clean, clear=True)
     original = Path.cwd()
     os.chdir(tmp_path)

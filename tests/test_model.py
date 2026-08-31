@@ -96,7 +96,79 @@ class TestGoogleMissingKey:
             build_model(settings)
 
 
+class TestEffectiveEndpoint:
+    def test_openai_default_is_local(self) -> None:
+        """The banner must show the real local endpoint, not 'openai'."""
+        from elja.model import effective_endpoint
+
+        assert effective_endpoint(ModelConfig()) == "http://localhost:1234/v1"
+        assert effective_endpoint(ModelConfig(base_url="http://x:1/v1")) == "http://x:1/v1"
+        assert "anthropic" in effective_endpoint(
+            ModelConfig(provider="anthropic", name="claude-sonnet-5")
+        )
+
+
+class TestOpenAIEnvKey:
+    def test_openai_api_key_env_fallback(self, mocker: MockerFixture) -> None:
+        """provider=openai + cloud endpoint honors OPENAI_API_KEY (not lm-studio)."""
+        mocker.patch.dict("os.environ", {"OPENAI_API_KEY": "cloud-key"})
+        settings = EljaSettings(
+            model=ModelConfig(name="gpt-5.2", base_url="https://api.openai.com/v1")
+        )
+        model = build_model(settings)
+        assert model.system == "openai"
+
+
+class TestMissingExtras:
+    def test_missing_anthropic_extra_is_clear(self, mocker: MockerFixture) -> None:
+        """Selecting a provider without its extra names the install command."""
+        import sys
+
+        from elja.model import ModelProviderError
+
+        mocker.patch.dict(sys.modules, {"pydantic_ai.models.anthropic": None})
+        settings = EljaSettings(model=ModelConfig(provider="anthropic", name="claude-sonnet-5"))
+        with pytest.raises(ModelProviderError, match="elja\\[anthropic\\]"):
+            build_model(settings)
+
+    def test_missing_google_extra_is_clear(self, mocker: MockerFixture) -> None:
+        """Same for google."""
+        import sys
+
+        from elja.model import ModelProviderError
+
+        mocker.patch.dict(sys.modules, {"pydantic_ai.models.google": None})
+        settings = EljaSettings(
+            model=ModelConfig(
+                provider="google", name="gemini-3-flash-preview", api_key=SecretStr("k")
+            )
+        )
+        with pytest.raises(ModelProviderError, match="elja\\[google\\]"):
+            build_model(settings)
+
+
+class TestGoogleEnvPrecedence:
+    def test_google_key_beats_gemini_key(self, mocker: MockerFixture) -> None:
+        """GOOGLE_API_KEY wins over GEMINI_API_KEY, matching the SDK convention."""
+        mocker.patch.dict("os.environ", {"GOOGLE_API_KEY": "g1", "GEMINI_API_KEY": "g2"})
+        settings = EljaSettings(
+            model=ModelConfig(provider="google", name="gemini-3-flash-preview")
+        )
+        assert build_model(settings).system == "google"
+
+    def test_gemini_key_alone_works(self, mocker: MockerFixture) -> None:
+        """GEMINI_API_KEY is honored when GOOGLE_API_KEY is absent."""
+        mocker.patch.dict("os.environ", {"GEMINI_API_KEY": "g2"})
+        settings = EljaSettings(
+            model=ModelConfig(provider="google", name="gemini-3-flash-preview")
+        )
+        assert build_model(settings).system == "google"
+
+
 class TestValidation:
     def test_unknown_provider_rejected(self) -> None:
-        with pytest.raises(Exception, match="provider"):
+        """An unsupported provider name fails config validation."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="provider"):
             ModelConfig(provider="frontier-corp")  # type: ignore[arg-type]

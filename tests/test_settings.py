@@ -120,3 +120,11 @@ def test_env_overrides_toml(tmp_path: Path, mocker: MockerFixture) -> None:
     settings = load_settings(config)
     assert settings.model.name == "from-env"
     assert settings.limits.request_limit == 3
+
+
+def test_empty_env_string_means_unset(mocker: MockerFixture) -> None:
+    """ELJA_MODEL__BASE_URL='' resets to the default rather than sending ''."""
+    mocker.patch.dict("os.environ", {"ELJA_MODEL__BASE_URL": "", "ELJA_MODEL__API_KEY": ""})
+    settings = EljaSettings()
+    assert settings.model.base_url is None
+    assert settings.model.api_key is None

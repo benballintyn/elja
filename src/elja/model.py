@@ -28,7 +28,7 @@ _LOCAL_API_KEY = "lm-studio"
 
 
 class ModelProviderError(Exception):
-    """A provider was selected whose optional dependency isn't installed."""
+    """The selected provider can't be built — missing extra or credentials."""
 
 
 def _model_settings(cfg: ModelConfig) -> ModelSettings:
@@ -40,7 +40,11 @@ def _build_openai(cfg: ModelConfig) -> Model:
     from pydantic_ai.profiles.openai import OpenAIModelProfile
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    api_key = cfg.api_key.get_secret_value() if cfg.api_key is not None else _LOCAL_API_KEY
+    api_key = (
+        cfg.api_key.get_secret_value()
+        if cfg.api_key is not None
+        else os.environ.get("OPENAI_API_KEY") or _LOCAL_API_KEY
+    )
     return OpenAIChatModel(
         cfg.name,
         provider=OpenAIProvider(base_url=cfg.base_url or _LOCAL_BASE_URL, api_key=api_key),
@@ -55,11 +59,13 @@ def _build_anthropic(cfg: ModelConfig) -> Model:
     try:
         from pydantic_ai.models.anthropic import AnthropicModel
         from pydantic_ai.providers.anthropic import AnthropicProvider
-    except ImportError as exc:  # pragma: no cover - dev env installs all extras
+    except ImportError as exc:
         raise ModelProviderError(
             "provider 'anthropic' needs the anthropic extra: pip install 'elja[anthropic]'"
         ) from exc
     api_key = cfg.api_key.get_secret_value() if cfg.api_key is not None else None
+    # Explicit branches: the providers' typed overloads don't uniformly accept
+    # base_url=None, and mypy strict holds us to them.
     if cfg.base_url is None:
         provider = AnthropicProvider(api_key=api_key)
     else:
@@ -71,7 +77,7 @@ def _build_google(cfg: ModelConfig) -> Model:
     try:
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
-    except ImportError as exc:  # pragma: no cover - dev env installs all extras
+    except ImportError as exc:
         raise ModelProviderError(
             "provider 'google' needs the google extra: pip install 'elja[google]'"
         ) from exc
@@ -82,7 +88,7 @@ def _build_google(cfg: ModelConfig) -> Model:
     )
     if not key:
         raise ModelProviderError(
-            "provider 'google' needs model.api_key or the GOOGLE_API_KEY env var"
+            "provider 'google' needs model.api_key or the GOOGLE_API_KEY / GEMINI_API_KEY env var"
         )
     provider = (
         GoogleProvider(api_key=key)
@@ -90,6 +96,13 @@ def _build_google(cfg: ModelConfig) -> Model:
         else GoogleProvider(api_key=key, base_url=cfg.base_url)
     )
     return GoogleModel(cfg.name, provider=provider, settings=_model_settings(cfg))
+
+
+def effective_endpoint(cfg: ModelConfig) -> str:
+    """The endpoint a built model will actually talk to (for display)."""
+    if cfg.base_url is not None:
+        return cfg.base_url
+    return _LOCAL_BASE_URL if cfg.provider == "openai" else f"{cfg.provider} API"
 
 
 _BUILDERS = {
@@ -110,6 +123,6 @@ def build_model(settings: EljaSettings) -> Model:
 
     Raises:
         ModelProviderError: If the selected provider's optional dependency is
-            not installed.
+            not installed, or required credentials are missing.
     """
     return _BUILDERS[settings.model.provider](settings.model)

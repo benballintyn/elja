@@ -25,6 +25,7 @@ from rich.console import Console
 from elja.agent import build_agent, build_usage_limits
 from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets, preflight_mcp_toolsets
+from elja.model import effective_endpoint
 from elja.session import Session
 from elja.settings import EljaSettings, load_settings
 
@@ -242,7 +243,7 @@ async def repl(
         return
     console.print(
         f"[bold]elja[/bold] — model [cyan]{settings.model.name}[/cyan] at "
-        f"{settings.model.base_url or settings.model.provider} (session: {session_name}; "
+        f"{effective_endpoint(settings.model)} (session: {session_name}; "
         "/img <path> <prompt> to attach "
         "an image; exit/quit to leave)"
     )

@@ -70,6 +70,8 @@ web_search = true  # keyless DuckDuckGo search via ddgs (network egress!)
 instructions = "Optional: replace the default system instructions."
 
 [compaction]           # evidence-based tiered compaction (see elja/compaction.py)
+                       # NB: 24000 is tuned for a local 27B; raise it for large-window
+                       # cloud providers to avoid early masking + paid summarizer calls
 enabled = true
 target_tokens = 24000  # load the LM Studio model with at least this + headroom
 keep_tool_pairs = 10   # recent tool results kept verbatim by the masking tier
