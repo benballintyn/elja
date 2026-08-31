@@ -121,7 +121,7 @@ async def run_turn(
     Returns:
         The final response text.
     """
-    deps = EljaDeps.from_settings(settings, confirm=confirm)
+    deps = EljaDeps.from_settings(settings, confirm=confirm, on_status=on_status)
     history = session.load()
     result: AgentRunResult[str] | None = None
     started = False

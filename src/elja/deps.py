@@ -24,18 +24,22 @@ class EljaDeps:
     shell_timeout_seconds: float
     # Interactive approver for [permissions] 'ask' policies; None = fail closed.
     confirm: Callable[[str], bool] | None = None
+    # Status sink for sub-agent activity (e.g. "researcher → run_shell").
+    on_status: Callable[[str], None] | None = None
 
     @classmethod
     def from_settings(
         cls,
         settings: EljaSettings,
         confirm: Callable[[str], bool] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> "EljaDeps":
         """Build deps from resolved settings.
 
         Args:
             settings: Resolved elja settings.
             confirm: Interactive approver for 'ask' permission policies.
+            on_status: Status sink for sub-agent activity.
 
         Returns:
             Deps with an absolute workspace root and spill directory under it.
@@ -47,4 +51,5 @@ class EljaDeps:
             max_tool_output_chars=settings.workspace.max_tool_output_chars,
             shell_timeout_seconds=settings.workspace.shell_timeout_seconds,
             confirm=confirm,
+            on_status=on_status,
         )

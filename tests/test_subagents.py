@@ -274,3 +274,147 @@ class TestAgentWiring:
         with agent.override(model=FunctionModel(script)):
             agent.run_sync("hi", deps=EljaDeps.from_settings(settings))
         assert "delegate_researcher" in seen
+
+
+class TestDelegationVisibility:
+    async def test_child_tool_calls_surface_as_status(
+        self, settings: EljaSettings, mocker: MockerFixture
+    ) -> None:
+        """With a status sink in deps, each child tool call is announced."""
+        from collections.abc import AsyncIterator
+
+        from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+        child_steps: list[int] = []
+
+        async def child_sf(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[str | DeltaToolCalls]:
+            child_steps.append(1)
+            if len(child_steps) == 1:
+                yield {1: DeltaToolCall(name="list_dir", json_args='{"path": "."}')}
+            else:
+                yield "child done"
+
+        mocker.patch(
+            "elja.subagents.build_model",
+            return_value=FunctionModel(stream_function=child_sf),
+        )
+        calls: list[int] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_researcher", args={"task": "t"})]
+                )
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        statuses: list[str] = []
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run(
+            "go",
+            deps=EljaDeps.from_settings(settings, on_status=statuses.append),
+        )
+        assert result.output == "done"
+        assert "researcher → list_dir" in statuses
+
+    async def test_budget_exhaustion_on_streaming_path(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        """The CLI always has a sink, so pin budget behavior on the streaming path."""
+        from collections.abc import AsyncIterator
+
+        from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            subagents={
+                "helper": SubagentConfig(
+                    description="d", instructions="i", tools=["list_dir"], request_limit=1
+                )
+            },
+        )
+
+        async def child_sf(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[str | DeltaToolCalls]:
+            yield {1: DeltaToolCall(name="list_dir", json_args='{"path": "."}')}
+
+        mocker.patch(
+            "elja.subagents.build_model",
+            return_value=FunctionModel(stream_function=child_sf),
+        )
+        calls: list[int] = []
+        seen: list[str] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_helper", args={"task": "t"})]
+                )
+            seen.extend(str(p) for p in messages[-1].parts)
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        statuses: list[str] = []
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run(
+            "go", deps=EljaDeps.from_settings(settings, on_status=statuses.append)
+        )
+        assert result.output == "handled"
+        assert any("budget exhausted" in s for s in seen)
+
+    async def test_broken_sink_does_not_abort_delegation(
+        self, settings: EljaSettings, mocker: MockerFixture
+    ) -> None:
+        """A raising status sink is telemetry-only; the delegation completes."""
+        from collections.abc import AsyncIterator
+
+        from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+        child_steps: list[int] = []
+
+        async def child_sf(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[str | DeltaToolCalls]:
+            child_steps.append(1)
+            if len(child_steps) == 1:
+                yield {1: DeltaToolCall(name="list_dir", json_args='{"path": "."}')}
+            else:
+                yield "child done"
+
+        mocker.patch(
+            "elja.subagents.build_model",
+            return_value=FunctionModel(stream_function=child_sf),
+        )
+        calls: list[int] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_researcher", args={"task": "t"})]
+                )
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        def broken_sink(_: str) -> None:
+            raise BrokenPipeError("stdout gone")
+
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run(
+            "go", deps=EljaDeps.from_settings(settings, on_status=broken_sink)
+        )
+        assert result.output == "done"

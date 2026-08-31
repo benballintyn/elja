@@ -9,11 +9,13 @@ into the parent run's usage and limits, and children get the same compaction
 policy as the parent.
 """
 
+import contextlib
 import re
 from collections.abc import Awaitable, Callable
 
-from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai import Agent, AgentRunResult, AgentRunResultEvent, ModelRetry, RunContext
 from pydantic_ai.exceptions import UsageLimitExceeded
+from pydantic_ai.messages import FunctionToolCallEvent
 from pydantic_ai.tools import ToolFuncEither
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import UsageLimits
@@ -122,16 +124,34 @@ def _make_delegate(
             limit = ctx.usage.requests + cfg.request_limit
         else:
             limit = settings.limits.request_limit
+        limits = UsageLimits(
+            request_limit=limit,
+            total_tokens_limit=settings.limits.total_tokens_limit,
+        )
+        result: AgentRunResult[str] | None = None
         try:
-            result = await child.run(
-                task,
-                deps=ctx.deps,
-                usage=ctx.usage,
-                usage_limits=UsageLimits(
-                    request_limit=limit,
-                    total_tokens_limit=settings.limits.total_tokens_limit,
-                ),
-            )
+            if ctx.deps.on_status is None:
+                # Plain path kept deliberately: streaming requires a
+                # stream-capable model (e.g. FunctionModel needs a
+                # stream_function), and library callers without a sink
+                # shouldn't pay the streamed-request mode switch.
+                result = await child.run(task, deps=ctx.deps, usage=ctx.usage, usage_limits=limits)
+            else:
+                # Stream child events so a long delegation doesn't look like
+                # a hang: each child tool call surfaces as "<name> → <tool>".
+                async with child.run_stream_events(
+                    task, deps=ctx.deps, usage=ctx.usage, usage_limits=limits
+                ) as events:
+                    async for event in events:
+                        if isinstance(event, FunctionToolCallEvent):
+                            # Status is best-effort telemetry: a broken sink
+                            # must never abort or misattribute the delegation.
+                            with contextlib.suppress(Exception):
+                                ctx.deps.on_status(f"{name} → {event.part.tool_name}")
+                        elif isinstance(event, AgentRunResultEvent):
+                            result = event.result
+            if result is None:  # pragma: no cover - failures re-raise from the iterator
+                raise RuntimeError("delegation event stream ended without a result")
         except UsageLimitExceeded as exc:
             # Terminal, not a retry: re-delegating cannot succeed once the
             # budget is spent, and a ModelRetry loop would kill the run.
