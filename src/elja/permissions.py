@@ -7,9 +7,10 @@ tool name). Policies come from ``[permissions]``:
 - ``allow`` — execute normally.
 - ``deny`` — never execute; the model receives a normal tool result saying
   the call was denied (no retry burn, the run continues).
-- ``ask`` — execute only if the run's approver (``EljaDeps.confirm``, wired
-  by the CLI to an interactive y/N prompt) says yes. With no approver
-  available the call is refused — fail closed.
+- ``ask`` — execute only if the run's approver (``EljaDeps.confirm``) says
+  yes: the CLI wires an interactive y/N prompt; a web UI supplies an async
+  callback awaiting the user's click. With no approver available the call
+  is refused — fail closed.
 
 The same gate instance is attached to sub-agents, and the approver travels in
 ``EljaDeps``, so a delegated child asking to run a gated tool prompts the
@@ -89,12 +90,17 @@ class PermissionGate(AbstractCapability[EljaDeps]):
                 f"not executed: {call.tool_name} requires approval, which is unavailable "
                 "in this run"
             )
-        async with _APPROVAL_LOCK:
-            if inspect.iscoroutinefunction(confirm):
-                approved = await confirm(_describe(call))
-            else:
-                # Sync approvers may block on stdin — keep them off the loop.
+        if inspect.iscoroutinefunction(confirm):
+            approved = await confirm(_describe(call))
+        else:
+            # Sync approvers may block on stdin — keep them off the loop, and
+            # serialize them: parallel prompts would race on a single stdin.
+            async with _APPROVAL_LOCK:
                 approved = await asyncio.to_thread(confirm, _describe(call))
+            if inspect.isawaitable(approved):
+                # A sync callable that RETURNS an awaitable (async __call__
+                # object, wrapper lambda) — await it; never truth-test it.
+                approved = await approved
         if not approved:
             raise SkipToolExecution(
                 f"not executed: the user declined {call.tool_name}; choose a different "

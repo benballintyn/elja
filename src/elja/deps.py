@@ -27,7 +27,9 @@ class EljaDeps:
     shell_timeout_seconds: float
     # Interactive approver for [permissions] 'ask' policies; None = fail closed.
     # Sync approvers (e.g. terminal input) run in a worker thread; async
-    # approvers (e.g. a web UI round-trip) are awaited on the event loop.
+    # approvers (e.g. a web UI round-trip) are awaited on the event loop and
+    # must contain their own transport errors (a raise kills the run) and
+    # apply their own timeout (an unresolved approval hangs its run).
     confirm: "ConfirmCallback | None" = None
     # Status sink for sub-agent activity (e.g. "researcher → run_shell").
     on_status: Callable[[str], None] | None = None
