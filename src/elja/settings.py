@@ -166,10 +166,14 @@ class AgentConfig(_Section):
 class PermissionsConfig(_Section):
     """Per-tool execution policy: allow, ask (interactive approval), or deny.
 
-    ``tools`` matches any tool name — built-ins, MCP tools, ``delegate_*``.
-    For MCP servers with a ``tool_prefix``, entries must use the PREFIXED
-    name (e.g. ``helper_echo``, not ``echo``). ``ask`` fails closed when no
-    interactive approver is available.
+    ``tools`` matches by tool NAME — built-ins, MCP tools, ``delegate_*``.
+    Unprefixed MCP tools match their raw server-side name (two servers
+    exposing the same name share one policy — set ``tool_prefix`` for
+    per-server policies, and entries must then use the PREFIXED name, e.g.
+    ``helper_echo``). NB the shipped default gates only the built-in
+    ``run_shell``; MCP-provided execution tools follow ``default`` unless
+    named here. ``ask`` fails closed when no interactive approver is
+    available.
     """
 
     default: Literal["allow", "ask", "deny"] = "allow"
