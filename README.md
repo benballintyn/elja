@@ -103,7 +103,11 @@ env = { API_KEY = "..." }   # optional; NB the subprocess gets a minimal env
 
 [mcp.servers.remote]
 transport = "http"          # streamable-HTTP endpoint
-url = "http://localhost:9000/mcp"  # unauthenticated — localhost only
+url = "http://localhost:9000/mcp"
+headers = { Authorization = "Bearer ..." }  # optional auth headers
+tool_prefix = "remote"      # optional: tools appear as remote_<name>; NB [permissions.tools]
+                            # entries must then use the prefixed name
+init_timeout = 30           # optional: seconds for slow (npx/uvx) server startup
 ```
 
 ## Development

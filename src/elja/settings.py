@@ -12,6 +12,7 @@ Note: programmatic overrides merge per-key only in dict form —
 keys, while passing a ``ModelConfig`` instance replaces the whole section.
 """
 
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -98,6 +99,14 @@ class MCPServerConfig(_Section):
     env: dict[str, str] = {}
     # http: the streamable-HTTP endpoint.
     url: str | None = None
+    # http only: extra request headers (e.g. Authorization); values are secret.
+    headers: dict[str, SecretStr] = {}
+    # Expose this server's tools as <tool_prefix>_<name> to avoid collisions.
+    # NB: [permissions.tools] entries must then use the PREFIXED name.
+    tool_prefix: str | None = None
+    # Seconds allowed for server startup/handshake (SDK default is 5 — too
+    # short for npx/uvx-style servers with cold caches).
+    init_timeout: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_transport_fields(self) -> "MCPServerConfig":
@@ -105,6 +114,12 @@ class MCPServerConfig(_Section):
             raise ValueError("stdio MCP server requires 'command'")
         if self.transport == "http" and not self.url:
             raise ValueError("http MCP server requires 'url'")
+        if self.transport == "stdio" and self.headers:
+            raise ValueError("'headers' only applies to http MCP servers")
+        if self.tool_prefix is not None and not re.match(
+            r"^[A-Za-z][A-Za-z0-9_]*$", self.tool_prefix
+        ):
+            raise ValueError("'tool_prefix' must be letters/digits/underscores")
         return self
 
 
@@ -112,6 +127,14 @@ class MCPConfig(_Section):
     """MCP servers whose tools the agent can use, keyed by a short name."""
 
     servers: dict[str, MCPServerConfig] = {}
+
+    @model_validator(mode="after")
+    def _check_unique_prefixes(self) -> "MCPConfig":
+        prefixes = [s.tool_prefix for s in self.servers.values() if s.tool_prefix]
+        dupes = {p for p in prefixes if prefixes.count(p) > 1}
+        if dupes:
+            raise ValueError(f"duplicate tool_prefix across MCP servers: {sorted(dupes)}")
+        return self
 
 
 class SubagentConfig(_Section):
@@ -143,8 +166,14 @@ class AgentConfig(_Section):
 class PermissionsConfig(_Section):
     """Per-tool execution policy: allow, ask (interactive approval), or deny.
 
-    ``tools`` matches any tool name — built-ins, MCP tools, ``delegate_*``.
-    ``ask`` fails closed when no interactive approver is available.
+    ``tools`` matches by tool NAME — built-ins, MCP tools, ``delegate_*``.
+    Unprefixed MCP tools match their raw server-side name (two servers
+    exposing the same name share one policy — set ``tool_prefix`` for
+    per-server policies, and entries must then use the PREFIXED name, e.g.
+    ``helper_echo``). NB the shipped default gates only the built-in
+    ``run_shell``; MCP-provided execution tools follow ``default`` unless
+    named here. ``ask`` fails closed when no interactive approver is
+    available.
     """
 
     default: Literal["allow", "ask", "deny"] = "allow"

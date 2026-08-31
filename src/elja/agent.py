@@ -1,7 +1,9 @@
 """Agent factory: settings -> a ready-to-run elja agent."""
 
+from typing import Any
+
 from pydantic_ai import Agent
-from pydantic_ai.mcp import MCPToolset
+from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
 from elja.compaction import build_compaction
@@ -25,7 +27,7 @@ DEFAULT_INSTRUCTIONS = (
 
 
 def build_agent(
-    settings: EljaSettings, mcp_toolsets: list[MCPToolset] | None = None
+    settings: EljaSettings, mcp_toolsets: list[AbstractToolset[Any]] | None = None
 ) -> Agent[EljaDeps, str]:
     """Assemble the elja agent from settings.
 
