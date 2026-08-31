@@ -9,7 +9,7 @@ from elja.settings import EljaSettings, load_settings
 from elja.tools import build_toolset
 
 # Version is managed by release-please (kept in sync with pyproject.toml).
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "DEFAULT_INSTRUCTIONS",

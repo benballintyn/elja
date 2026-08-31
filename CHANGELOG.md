@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.0](https://github.com/benballintyn/elja/compare/v0.3.0...v0.4.0) (2026-08-31)
+
+
+### Features
+
+* async-capable approval callbacks ([#22](https://github.com/benballintyn/elja/issues/22)) ([9690c27](https://github.com/benballintyn/elja/commit/9690c279298a3f691c20cd0718555bcbc97a7e90))
+* delegation progress visibility ([#20](https://github.com/benballintyn/elja/issues/20)) ([3d4af57](https://github.com/benballintyn/elja/commit/3d4af5715ae3d65fccb7b694258eb025abd9d1de))
+* MCP server options — auth headers, tool_prefix, init_timeout ([#19](https://github.com/benballintyn/elja/issues/19)) ([8897da4](https://github.com/benballintyn/elja/commit/8897da40da4018476f1bb6cc5a9f64bcb4b64c61))
+* permission gate with per-tool allow/ask/deny policies ([#18](https://github.com/benballintyn/elja/issues/18)) ([c401955](https://github.com/benballintyn/elja/commit/c4019556ba7968ffaf667bec1bd608e16b04699c))
+
 ## [0.3.0](https://github.com/benballintyn/elja/compare/v0.2.0...v0.3.0) (2026-08-31)
 
 
