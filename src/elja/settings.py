@@ -15,7 +15,7 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -109,11 +109,11 @@ class CompactionConfig(_Section):
     enabled: bool = True
     # Conservative default for a local 27B: quality degrades and prefill slows
     # well before the model's nominal window (Qwen3.8 advertises 262K).
-    target_tokens: int = 24_000
+    target_tokens: int = Field(default=24_000, ge=1000)
     # Recent tool call/result pairs kept verbatim by the masking tier.
-    keep_tool_pairs: int = 10
+    keep_tool_pairs: int = Field(default=10, ge=1)
     # Recent messages kept verbatim if the summarization fallback fires.
-    keep_messages: int = 20
+    keep_messages: int = Field(default=20, ge=1)
 
 
 class SkillsConfig(_Section):

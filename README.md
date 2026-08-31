@@ -64,6 +64,12 @@ web_search = true  # keyless DuckDuckGo search via ddgs (network egress!)
 [agent]
 instructions = "Optional: replace the default system instructions."
 
+[compaction]           # evidence-based tiered compaction (see elja/compaction.py)
+enabled = true
+target_tokens = 24000  # load the LM Studio model with at least this + headroom
+keep_tool_pairs = 10   # recent tool results kept verbatim by the masking tier
+keep_messages = 20     # verbatim tail if the summarization fallback fires
+
 # Skills: markdown files in <workspace>/skills/ (or [skills] dir = "...") with
 # YAML frontmatter (id, description) + an instructions body. The model loads
 # them on demand, so a large skill library costs ~no context until used.
