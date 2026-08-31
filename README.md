@@ -74,6 +74,13 @@ keep_messages = 20     # verbatim tail if the summarization fallback fires
 # YAML frontmatter (id, description) + an instructions body. The model loads
 # them on demand, so a large skill library costs ~no context until used.
 
+# Sub-agents: delegate tools with isolated context (results-only return).
+[subagents.researcher]
+description = "Researches a question and reports key facts."
+instructions = "Answer tersely with sources."
+tools = ["read_file", "web_search"]  # subset of ENABLED built-ins; omit for all enabled
+request_limit = 8                     # per-delegation request budget (optional)
+
 # Attach MCP servers; their tools become available to the agent.
 [mcp.servers.mytools]
 command = "python3"         # stdio: launched as a subprocess

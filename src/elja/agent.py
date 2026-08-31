@@ -10,6 +10,7 @@ from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
 from elja.settings import EljaSettings
 from elja.skills import load_skills
+from elja.subagents import build_subagent_toolset
 from elja.tools import build_toolset
 
 # Short and directive on purpose: small local models do better with a tight
@@ -45,6 +46,7 @@ def build_agent(
         instructions=DEFAULT_INSTRUCTIONS if instructions is None else instructions,
         toolsets=[
             build_toolset(settings),
+            *([st] if (st := build_subagent_toolset(settings)) is not None else []),
             *(build_mcp_toolsets(settings) if mcp_toolsets is None else mcp_toolsets),
         ],
         capabilities=[*load_skills(settings), *build_compaction(settings)],
