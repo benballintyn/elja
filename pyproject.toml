@@ -21,6 +21,7 @@ dependencies = [
     "rich (>=15.0.0,<16.0.0)",
     "fastmcp (>=3,<4)",
     "ddgs (>=9,<10)",
+    "pyyaml (>=6.0.3,<7.0.0)",
 ]
 
 [project.scripts]
@@ -40,6 +41,7 @@ pytest-asyncio = "^1.0"
 ruff = "^0.15"
 mypy = "^1.14"
 pre-commit = "^4.0"
+types-pyyaml = "^6.0.12.20260815"
 
 [tool.ruff]
 line-length = 99

@@ -189,7 +189,12 @@ async def repl(
             mcp_toolsets=[t for t in build_mcp_toolsets(settings) if t.id in alive],
         )
 
-    agent = fresh_agent()
+    try:
+        agent = fresh_agent()
+    except Exception as exc:
+        # A malformed skill file or bad config must not dump a traceback.
+        console.print(f"cannot start agent: {str(exc) or exc!r}", style="red", markup=False)
+        return
 
     def show_delta(delta: str) -> None:
         # Model output is data: never let rich interpret [brackets] as markup.
@@ -215,7 +220,15 @@ async def repl(
             console.print(
                 f"\nerror: {str(exc) or exc!r} (turn not saved)", style="red", markup=False
             )
-            agent = fresh_agent()
+            try:
+                agent = fresh_agent()
+            except Exception as rebuild_exc:
+                console.print(
+                    f"warning: agent rebuild failed ({str(rebuild_exc) or rebuild_exc!r}); "
+                    "keeping current agent",
+                    style="yellow",
+                    markup=False,
+                )
         console.print()
 
     if once is not None:
