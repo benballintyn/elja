@@ -97,6 +97,26 @@ class MCPConfig(_Section):
     servers: dict[str, MCPServerConfig] = {}
 
 
+class SubagentConfig(_Section):
+    """A delegate agent the main agent can hand tasks to."""
+
+    description: str
+    instructions: str
+    # Built-in tool names the subagent may use; None = all enabled built-ins.
+    tools: list[str] | None = None
+    request_limit: int | None = None
+
+    @model_validator(mode="after")
+    def _check_tools(self) -> "SubagentConfig":
+        if self.tools is not None:
+            from elja.subagents import known_tool_names
+
+            unknown = set(self.tools) - known_tool_names()
+            if unknown:
+                raise ValueError(f"unknown tool(s) for subagent: {sorted(unknown)}")
+        return self
+
+
 class AgentConfig(_Section):
     """Agent-level behavior."""
 
@@ -143,6 +163,7 @@ class EljaSettings(BaseSettings):
     workspace: WorkspaceConfig = WorkspaceConfig()
     tools: ToolsConfig = ToolsConfig()
     mcp: MCPConfig = MCPConfig()
+    subagents: dict[str, SubagentConfig] = {}
     agent: AgentConfig = AgentConfig()
     compaction: CompactionConfig = CompactionConfig()
     skills: SkillsConfig = SkillsConfig()
