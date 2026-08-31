@@ -1,5 +1,6 @@
 """Tests for elja.permissions."""
 
+import contextlib
 from pathlib import Path
 
 from pydantic_ai import Agent
@@ -319,3 +320,124 @@ class TestOrdering:
     def test_gate_pins_innermost(self) -> None:
         gate = build_permission_gate(EljaSettings())
         assert gate.get_ordering().position == "innermost"
+
+
+class TestAsyncApprover:
+    async def test_async_approver_awaited(self, tmp_path: Path) -> None:
+        """A coroutine approver (web-UI style) is awaited on the loop."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        prompts: list[str] = []
+
+        async def confirm(description: str) -> bool:
+            prompts.append(description)
+            return True
+
+        seen: list[str] = []
+        result = await _agent(settings, _shell_then_done(seen)).run(
+            "go", deps=EljaDeps.from_settings(settings, confirm=confirm)
+        )
+        assert result.output == "done"
+        assert (tmp_path / "ran.txt").exists()
+        assert prompts and "run_shell" in prompts[0]
+
+    async def test_async_approver_decline(self, tmp_path: Path) -> None:
+        """An async decline skips execution exactly like a sync one."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+
+        async def confirm(description: str) -> bool:
+            return False
+
+        seen: list[str] = []
+        result = await _agent(settings, _shell_then_done(seen)).run(
+            "go", deps=EljaDeps.from_settings(settings, confirm=confirm)
+        )
+        assert result.output == "done"
+        assert any("declined" in s for s in seen)
+        assert not (tmp_path / "ran.txt").exists()
+
+
+class TestApproverShapes:
+    """Every type-valid declining approver shape must fail CLOSED (review blocker:
+    unawaited coroutine objects are truthy — a declined tool executed)."""
+
+    @staticmethod
+    async def _outcome(tmp_path: Path, confirm: object) -> bool:
+        """Returns True if the gated tool executed."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        seen: list[str] = []
+        result = await _agent(settings, _shell_then_done(seen)).run(
+            "go",
+            deps=EljaDeps.from_settings(settings, confirm=confirm),  # type: ignore[arg-type]
+        )
+        assert result.output == "done"
+        return (tmp_path / "ran.txt").exists()
+
+    async def test_plain_async_def(self, tmp_path: Path) -> None:
+        async def decline(_: str) -> bool:
+            return False
+
+        assert not await self._outcome(tmp_path, decline)
+
+    async def test_partial_of_async_def(self, tmp_path: Path) -> None:
+        import functools
+
+        async def decline(_flag: bool, _desc: str) -> bool:
+            return False
+
+        assert not await self._outcome(tmp_path, functools.partial(decline, True))
+
+    async def test_bound_async_method(self, tmp_path: Path) -> None:
+        class Approver:
+            async def decline(self, _: str) -> bool:
+                return False
+
+        assert not await self._outcome(tmp_path, Approver().decline)
+
+    async def test_async_dunder_call_object(self, tmp_path: Path) -> None:
+        """The natural stateful web-approver shape — was the fail-open bug."""
+
+        class Approver:
+            async def __call__(self, _: str) -> bool:
+                return False
+
+        assert not await self._outcome(tmp_path, Approver())
+
+    async def test_sync_wrapper_returning_coroutine(self, tmp_path: Path) -> None:
+        async def decline(_: str) -> bool:
+            return False
+
+        assert not await self._outcome(tmp_path, lambda d: decline(d))
+
+
+class TestApprovalConcurrency:
+    async def test_hung_async_approver_does_not_starve_others(self, tmp_path: Path) -> None:
+        """One abandoned web approval must not block approvals in other sessions."""
+        import asyncio
+
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        hang_forever: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+
+        async def hung(_: str) -> bool:
+            return await hang_forever  # pragma: no cover - never resolves
+
+        async def prompt_b(_: str) -> bool:
+            return True
+
+        seen_a: list[str] = []
+        task_a = asyncio.create_task(
+            _agent(settings, _shell_then_done(seen_a)).run(
+                "go", deps=EljaDeps.from_settings(settings, confirm=hung)
+            )
+        )
+        await asyncio.sleep(0.1)  # session A is now parked on its approval
+        seen_b: list[str] = []
+        result_b = await asyncio.wait_for(
+            _agent(settings, _shell_then_done(seen_b)).run(
+                "go", deps=EljaDeps.from_settings(settings, confirm=prompt_b)
+            ),
+            timeout=5,
+        )
+        assert result_b.output == "done"
+        task_a.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task_a

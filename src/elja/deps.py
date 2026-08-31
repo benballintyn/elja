@@ -1,10 +1,13 @@
 """Run-scoped dependencies injected into every tool via ``RunContext``."""
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from elja.settings import EljaSettings
+
+# An approver takes the human-readable call description and answers yes/no.
+ConfirmCallback = Callable[[str], bool] | Callable[[str], Awaitable[bool]]
 
 
 @dataclass
@@ -23,7 +26,11 @@ class EljaDeps:
     max_tool_output_chars: int
     shell_timeout_seconds: float
     # Interactive approver for [permissions] 'ask' policies; None = fail closed.
-    confirm: Callable[[str], bool] | None = None
+    # Sync approvers (e.g. terminal input) run in a worker thread; async
+    # approvers (e.g. a web UI round-trip) are awaited on the event loop and
+    # must contain their own transport errors (a raise kills the run) and
+    # apply their own timeout (an unresolved approval hangs its run).
+    confirm: "ConfirmCallback | None" = None
     # Status sink for sub-agent activity (e.g. "researcher → run_shell").
     on_status: Callable[[str], None] | None = None
 
@@ -31,7 +38,7 @@ class EljaDeps:
     def from_settings(
         cls,
         settings: EljaSettings,
-        confirm: Callable[[str], bool] | None = None,
+        confirm: "ConfirmCallback | None" = None,
         on_status: Callable[[str], None] | None = None,
     ) -> "EljaDeps":
         """Build deps from resolved settings.
