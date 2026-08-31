@@ -23,8 +23,10 @@ from elja.settings import EljaSettings
 # Closing fence must be its own line — '---' inside a frontmatter value or the
 # body must not terminate the frontmatter block.
 _FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)(.*)\Z", re.DOTALL)
-# Keep ids typeable by a small local model (and valid capability ids).
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# Keep ids typeable by a small local model (and valid capability ids). The
+# leading letter also reserves _-prefixed ids for elja internals (e.g. the
+# permission gate).
+_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 class SkillError(Exception):

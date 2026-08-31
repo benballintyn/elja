@@ -100,6 +100,7 @@ async def run_turn(
     prompt: str | Sequence[str | BinaryContent],
     on_delta: Callable[[str], None],
     on_status: Callable[[str], None] | None = None,
+    confirm: Callable[[str], bool] | None = None,
 ) -> str:
     """Run one conversational turn, streaming output and persisting history.
 
@@ -120,7 +121,7 @@ async def run_turn(
     Returns:
         The final response text.
     """
-    deps = EljaDeps.from_settings(settings)
+    deps = EljaDeps.from_settings(settings, confirm=confirm)
     history = session.load()
     result: AgentRunResult[str] | None = None
     started = False
@@ -204,12 +205,22 @@ async def repl(
     def show_status(label: str) -> None:
         console.print(f"\n⚙ {label}", style="dim", markup=False, highlight=False)
 
+    def confirm(description: str) -> bool:
+        # Runs in a worker thread; EOF declines. (A real Ctrl+C is delivered
+        # to the main thread and won't interrupt this read — press Enter/EOF
+        # to decline.)
+        console.print(f"\napprove {description}?", style="yellow", markup=False)
+        try:
+            return input_fn("[y/N] ").strip().lower() in {"y", "yes"}
+        except (EOFError, KeyboardInterrupt):
+            return False
+
     async def do_turn(prompt: str | Sequence[str | BinaryContent]) -> None:
         # A failed turn must never kill the REPL: report, drop the turn
         # (history is only saved on success, atomically), and keep going.
         nonlocal agent
         try:
-            await run_turn(agent, settings, session, prompt, show_delta, show_status)
+            await run_turn(agent, settings, session, prompt, show_delta, show_status, confirm)
         except UsageLimitExceeded as exc:
             console.print(
                 f"\nerror: {exc} — raise limits.request_limit in elja.toml to allow "

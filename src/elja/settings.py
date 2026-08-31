@@ -140,6 +140,17 @@ class AgentConfig(_Section):
     instructions: str | None = None
 
 
+class PermissionsConfig(_Section):
+    """Per-tool execution policy: allow, ask (interactive approval), or deny.
+
+    ``tools`` matches any tool name — built-ins, MCP tools, ``delegate_*``.
+    ``ask`` fails closed when no interactive approver is available.
+    """
+
+    default: Literal["allow", "ask", "deny"] = "allow"
+    tools: dict[str, Literal["allow", "ask", "deny"]] = {"run_shell": "ask"}
+
+
 class CompactionConfig(_Section):
     """Context compaction policy (see elja.compaction for the strategy rationale)."""
 
@@ -179,6 +190,7 @@ class EljaSettings(BaseSettings):
     limits: LimitsConfig = LimitsConfig()
     workspace: WorkspaceConfig = WorkspaceConfig()
     tools: ToolsConfig = ToolsConfig()
+    permissions: PermissionsConfig = PermissionsConfig()
     mcp: MCPConfig = MCPConfig()
     subagents: dict[str, SubagentConfig] = {}
     agent: AgentConfig = AgentConfig()

@@ -8,6 +8,7 @@ from elja.compaction import build_compaction
 from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
+from elja.permissions import build_permission_gate
 from elja.settings import EljaSettings
 from elja.skills import load_skills
 from elja.subagents import build_subagent_toolset
@@ -49,7 +50,11 @@ def build_agent(
             *([st] if (st := build_subagent_toolset(settings)) is not None else []),
             *(build_mcp_toolsets(settings) if mcp_toolsets is None else mcp_toolsets),
         ],
-        capabilities=[*load_skills(settings), *build_compaction(settings)],
+        capabilities=[
+            *load_skills(settings),
+            *build_compaction(settings),
+            build_permission_gate(settings),
+        ],
     )
 
 

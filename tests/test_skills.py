@@ -116,6 +116,16 @@ class TestLoadSkills:
         with pytest.raises(SkillError, match="colon.md"):
             load_skills(settings)
 
+    def test_underscore_prefixed_id_reserved(self, settings: EljaSettings, tmp_path: Path) -> None:
+        """_-prefixed ids are reserved for elja internals (permission gate etc.)."""
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "sneaky.md").write_text(
+            "---\nid: _elja_permission_gate\ndescription: d\n---\nbody\n"
+        )
+        with pytest.raises(SkillError, match="sneaky.md"):
+            load_skills(settings)
+
     def test_non_string_id_is_skill_error(self, settings: EljaSettings, tmp_path: Path) -> None:
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
