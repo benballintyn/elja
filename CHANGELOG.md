@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/benballintyn/elja/compare/v0.2.0...v0.3.0) (2026-08-31)
+
+
+### Features
+
+* config-defined sub-agents as delegate tools ([#15](https://github.com/benballintyn/elja/issues/15)) ([a179b0d](https://github.com/benballintyn/elja/commit/a179b0d30a36daebf48ffe45763194b6a0544870))
+* evidence-based tiered context compaction ([#14](https://github.com/benballintyn/elja/issues/14)) ([4c47b38](https://github.com/benballintyn/elja/commit/4c47b381f7b7faf45184e9f2f2d8094e98627a7c))
+* image input for the multimodal model ([#11](https://github.com/benballintyn/elja/issues/11)) ([a3a37ad](https://github.com/benballintyn/elja/commit/a3a37adbb4a6ae4a5e2640e876d06a11a17f18dc))
+* markdown skills as on-demand capabilities ([#13](https://github.com/benballintyn/elja/issues/13)) ([419f384](https://github.com/benballintyn/elja/commit/419f3847490749338f8bcba01bad1604580c5004))
+* MCP servers from config ([#9](https://github.com/benballintyn/elja/issues/9)) ([3723b33](https://github.com/benballintyn/elja/commit/3723b3315156cdab2ec39c57be587eb9635e7250))
+* native Anthropic and Google provider support ([#17](https://github.com/benballintyn/elja/issues/17)) ([0040828](https://github.com/benballintyn/elja/commit/00408286c1aadaf00f521349a6de2d37844692d9))
+* web_search tool ([#10](https://github.com/benballintyn/elja/issues/10)) ([367a827](https://github.com/benballintyn/elja/commit/367a827756559bd5dc33769f9265b9d103e67afe))
+
+
+### Bug Fixes
+
+* regenerate lockfile for pydantic-ai-harness pin ([#16](https://github.com/benballintyn/elja/issues/16)) ([6357071](https://github.com/benballintyn/elja/commit/6357071ec031c0ae484076a0af20898cc7b79be5))
+
 ## [0.2.0](https://github.com/benballintyn/elja/compare/v0.1.0...v0.2.0) (2026-08-30)
 
 
