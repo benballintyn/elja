@@ -102,6 +102,7 @@ class MCPServerConfig(_Section):
     # http only: extra request headers (e.g. Authorization); values are secret.
     headers: dict[str, SecretStr] = {}
     # Expose this server's tools as <tool_prefix>_<name> to avoid collisions.
+    # NB: [permissions.tools] entries must then use the PREFIXED name.
     tool_prefix: str | None = None
     # Seconds allowed for server startup/handshake (SDK default is 5 — too
     # short for npx/uvx-style servers with cold caches).
@@ -115,7 +116,9 @@ class MCPServerConfig(_Section):
             raise ValueError("http MCP server requires 'url'")
         if self.transport == "stdio" and self.headers:
             raise ValueError("'headers' only applies to http MCP servers")
-        if self.tool_prefix is not None and not re.match(r"^[A-Za-z0-9_]+$", self.tool_prefix):
+        if self.tool_prefix is not None and not re.match(
+            r"^[A-Za-z][A-Za-z0-9_]*$", self.tool_prefix
+        ):
             raise ValueError("'tool_prefix' must be letters/digits/underscores")
         return self
 
@@ -124,6 +127,14 @@ class MCPConfig(_Section):
     """MCP servers whose tools the agent can use, keyed by a short name."""
 
     servers: dict[str, MCPServerConfig] = {}
+
+    @model_validator(mode="after")
+    def _check_unique_prefixes(self) -> "MCPConfig":
+        prefixes = [s.tool_prefix for s in self.servers.values() if s.tool_prefix]
+        dupes = {p for p in prefixes if prefixes.count(p) > 1}
+        if dupes:
+            raise ValueError(f"duplicate tool_prefix across MCP servers: {sorted(dupes)}")
+        return self
 
 
 class SubagentConfig(_Section):
@@ -156,7 +167,9 @@ class PermissionsConfig(_Section):
     """Per-tool execution policy: allow, ask (interactive approval), or deny.
 
     ``tools`` matches any tool name — built-ins, MCP tools, ``delegate_*``.
-    ``ask`` fails closed when no interactive approver is available.
+    For MCP servers with a ``tool_prefix``, entries must use the PREFIXED
+    name (e.g. ``helper_echo``, not ``echo``). ``ask`` fails closed when no
+    interactive approver is available.
     """
 
     default: Literal["allow", "ask", "deny"] = "allow"

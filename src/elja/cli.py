@@ -192,7 +192,9 @@ async def repl(
         )
 
     try:
-        agent = fresh_agent()
+        # Initial build reuses the preflighted toolsets (their stdio servers
+        # are already warm); fresh_agent() is for post-error recovery only.
+        agent = build_agent(settings, mcp_toolsets=mcp_toolsets)
     except Exception as exc:
         # A malformed skill file or bad config must not dump a traceback.
         console.print(f"cannot start agent: {str(exc) or exc!r}", style="red", markup=False)

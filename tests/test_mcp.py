@@ -224,8 +224,10 @@ class TestServerOptions:
                 }
             }  # type: ignore[arg-type]
         )
+        from pydantic_ai.toolsets import PrefixedToolset
+
         (toolset,) = build_mcp_toolsets(settings)
-        assert type(toolset).__name__ == "PrefixedToolset"
+        assert isinstance(toolset, PrefixedToolset)
         assert toolset_name(toolset) == "helper"
 
     def test_init_timeout_forwarded(self, mocker: MockerFixture) -> None:
@@ -237,6 +239,65 @@ class TestServerOptions:
         )
         build_mcp_toolsets(settings)
         assert spy.call_args.kwargs["init_timeout"] == 30
+
+    def test_init_timeout_forwarded_with_prefix(self, mocker: MockerFixture) -> None:
+        from pydantic_ai.mcp import MCPToolset as RealToolset
+
+        spy = mocker.patch("elja.mcp.MCPToolset", wraps=RealToolset)
+        settings = EljaSettings(
+            mcp={
+                "servers": {
+                    "slow": {
+                        "command": "python",
+                        "args": ["x.py"],
+                        "init_timeout": 30,
+                        "tool_prefix": "slow",
+                    }
+                }
+            }  # type: ignore[arg-type]
+        )
+        build_mcp_toolsets(settings)
+        assert spy.call_args.kwargs["init_timeout"] == 30
+
+    def test_duplicate_prefixes_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="duplicate tool_prefix"):
+            EljaSettings(
+                mcp={
+                    "servers": {
+                        "a": {"command": "python", "args": [], "tool_prefix": "p"},
+                        "b": {"command": "python", "args": [], "tool_prefix": "p"},
+                    }
+                }  # type: ignore[arg-type]
+            )
+
+    def test_toolset_name_raises_without_id(self) -> None:
+        from pydantic_ai.toolsets import FunctionToolset
+
+        from elja.mcp import toolset_name
+
+        with pytest.raises(ValueError, match="no server name"):
+            toolset_name(FunctionToolset())
+
+    async def test_prefixed_preflight_failure_named_by_server(self) -> None:
+        from elja.mcp import preflight_mcp_toolsets
+
+        settings = EljaSettings(
+            mcp={
+                "servers": {
+                    "bad": {
+                        "command": "definitely-missing-binary-xyz",
+                        "args": [],
+                        "tool_prefix": "bad",
+                    }
+                }
+            }  # type: ignore[arg-type]
+        )
+        errors: list[tuple[str, str]] = []
+        ok = await preflight_mcp_toolsets(
+            build_mcp_toolsets(settings), lambda n, e: errors.append((n, e))
+        )
+        assert ok == []
+        assert errors[0][0] == "bad"
 
     async def test_prefixed_tools_callable_end_to_end(self, tmp_path: Path) -> None:
         """A prefixed server's tool is visible and callable as <prefix>_<name>."""
@@ -275,3 +336,41 @@ class TestServerOptions:
                 result = await agent.run("echo hi", deps=deps)
         assert result.output == "done"
         assert any("echo:hi" in r for r in returned)
+
+
+class TestPrefixedPermissions:
+    async def test_gate_matches_prefixed_name(self, tmp_path: Path) -> None:
+        """Permission entries must use the prefixed name — pin the hook ordering."""
+        from elja.deps import EljaDeps as Deps
+        from elja.settings import PermissionsConfig
+
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            permissions=PermissionsConfig(tools={"helper_echo": "deny"}),
+            mcp={
+                "servers": {
+                    "echo": {
+                        "command": sys.executable,
+                        "args": [str(ECHO_SERVER)],
+                        "tool_prefix": "helper",
+                    }
+                }
+            },  # type: ignore[arg-type]
+        )
+        seen: list[str] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if len(messages) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="helper_echo", args={"text": "hi"})]
+                )
+            seen.extend(str(p) for p in messages[-1].parts)
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        agent = build_agent(settings)
+        with agent.override(model=FunctionModel(script)):
+            async with agent:
+                result = await agent.run("go", deps=Deps.from_settings(settings))
+        assert result.output == "done"
+        assert any("denied" in s for s in seen)
+        assert not any("echo:hi" in s for s in seen)

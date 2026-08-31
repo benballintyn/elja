@@ -11,8 +11,13 @@ from elja.settings import EljaSettings
 
 
 def toolset_name(toolset: AbstractToolset[Any]) -> str:
-    """The configured server name behind a (possibly prefixed) MCP toolset."""
-    return str(getattr(toolset, "wrapped", toolset).id)
+    """The configured server name behind a (possibly wrapped) MCP toolset."""
+    inner = toolset
+    while hasattr(inner, "wrapped"):
+        inner = inner.wrapped
+    if inner.id is None:
+        raise ValueError(f"toolset {toolset!r} has no server name")
+    return str(inner.id)
 
 
 def build_mcp_toolsets(settings: EljaSettings) -> list[AbstractToolset[Any]]:
@@ -42,6 +47,8 @@ def build_mcp_toolsets(settings: EljaSettings) -> list[AbstractToolset[Any]]:
             headers = {k: v.get_secret_value() for k, v in server.headers.items()}
             transport = StreamableHttpTransport(server.url, headers=headers or None)
         toolset: AbstractToolset[Any]
+        # Keep the if/else: MCPToolset distinguishes "unset" (5s default) from
+        # an explicit None (wait forever) — don't collapse to a single call.
         if server.init_timeout is None:
             toolset = MCPToolset(transport, id=name, max_retries=settings.tools.max_retries)
         else:
