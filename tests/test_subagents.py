@@ -274,3 +274,51 @@ class TestAgentWiring:
         with agent.override(model=FunctionModel(script)):
             agent.run_sync("hi", deps=EljaDeps.from_settings(settings))
         assert "delegate_researcher" in seen
+
+
+class TestDelegationVisibility:
+    async def test_child_tool_calls_surface_as_status(
+        self, settings: EljaSettings, mocker: MockerFixture
+    ) -> None:
+        """With a status sink in deps, each child tool call is announced."""
+        from collections.abc import AsyncIterator
+
+        from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+        child_steps: list[int] = []
+
+        async def child_sf(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[str | DeltaToolCalls]:
+            child_steps.append(1)
+            if len(child_steps) == 1:
+                yield {1: DeltaToolCall(name="list_dir", json_args='{"path": "."}')}
+            else:
+                yield "child done"
+
+        mocker.patch(
+            "elja.subagents.build_model",
+            return_value=FunctionModel(stream_function=child_sf),
+        )
+        calls: list[int] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_researcher", args={"task": "t"})]
+                )
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        statuses: list[str] = []
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run(
+            "go",
+            deps=EljaDeps.from_settings(settings, on_status=statuses.append),
+        )
+        assert result.output == "done"
+        assert "researcher → list_dir" in statuses
