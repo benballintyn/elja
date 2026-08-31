@@ -69,6 +69,12 @@ web_search = true  # keyless DuckDuckGo search via ddgs (network egress!)
 [agent]
 instructions = "Optional: replace the default system instructions."
 
+[permissions]          # per-tool policy: allow | ask | deny (any tool name,
+default = "allow"      # incl. MCP tools and delegate_*). ask prompts y/N in the
+                       # REPL and FAILS CLOSED when non-interactive.
+[permissions.tools]
+run_shell = "ask"      # the default: shell commands need a nod
+
 [compaction]           # evidence-based tiered compaction (see elja/compaction.py)
                        # NB: 24000 is tuned for a local 27B; raise it for large-window
                        # cloud providers to avoid early masking + paid summarizer calls

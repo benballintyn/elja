@@ -21,6 +21,7 @@ from pydantic_ai.usage import UsageLimits
 from elja.compaction import build_compaction
 from elja.deps import EljaDeps
 from elja.model import build_model
+from elja.permissions import build_permission_gate
 from elja.settings import EljaSettings, SubagentConfig
 from elja.tools import list_dir, read_file, run_shell, web_search, write_file
 
@@ -109,7 +110,7 @@ def _make_delegate(
         deps_type=EljaDeps,
         instructions=cfg.instructions,
         toolsets=[_child_toolset(settings, name, cfg)],
-        capabilities=build_compaction(settings),
+        capabilities=[*build_compaction(settings), build_permission_gate(settings)],
     )
 
     async def delegate(ctx: RunContext[EljaDeps], task: str) -> str:

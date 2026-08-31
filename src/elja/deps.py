@@ -1,5 +1,6 @@
 """Run-scoped dependencies injected into every tool via ``RunContext``."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,13 +22,20 @@ class EljaDeps:
     spill_dir: Path
     max_tool_output_chars: int
     shell_timeout_seconds: float
+    # Interactive approver for [permissions] 'ask' policies; None = fail closed.
+    confirm: Callable[[str], bool] | None = None
 
     @classmethod
-    def from_settings(cls, settings: EljaSettings) -> "EljaDeps":
+    def from_settings(
+        cls,
+        settings: EljaSettings,
+        confirm: Callable[[str], bool] | None = None,
+    ) -> "EljaDeps":
         """Build deps from resolved settings.
 
         Args:
             settings: Resolved elja settings.
+            confirm: Interactive approver for 'ask' permission policies.
 
         Returns:
             Deps with an absolute workspace root and spill directory under it.
@@ -38,4 +46,5 @@ class EljaDeps:
             spill_dir=workspace / ".elja" / "spill",
             max_tool_output_chars=settings.workspace.max_tool_output_chars,
             shell_timeout_seconds=settings.workspace.shell_timeout_seconds,
+            confirm=confirm,
         )
