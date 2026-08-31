@@ -123,6 +123,20 @@ class TestLoadSkills:
         with pytest.raises(SkillError, match="nullid.md"):
             load_skills(settings)
 
+    def test_non_mapping_frontmatter_raises(self, settings: EljaSettings, tmp_path: Path) -> None:
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "list.md").write_text("---\n- just\n- a list\n---\nbody\n")
+        with pytest.raises(SkillError, match="list.md"):
+            load_skills(settings)
+
+    def test_empty_description_raises(self, settings: EljaSettings, tmp_path: Path) -> None:
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        (skills_dir / "blank.md").write_text("---\nid: blank\ndescription: '  '\n---\nbody\n")
+        with pytest.raises(SkillError, match="blank.md"):
+            load_skills(settings)
+
     def test_dashes_inside_frontmatter_value_survive(
         self, settings: EljaSettings, tmp_path: Path
     ) -> None:
