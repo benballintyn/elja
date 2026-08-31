@@ -9,6 +9,7 @@ into the parent run's usage and limits, and children get the same compaction
 policy as the parent.
 """
 
+import contextlib
 import re
 from collections.abc import Awaitable, Callable
 
@@ -127,21 +128,26 @@ def _make_delegate(
             request_limit=limit,
             total_tokens_limit=settings.limits.total_tokens_limit,
         )
+        result: AgentRunResult[str] | None = None
         try:
             if ctx.deps.on_status is None:
-                result: AgentRunResult[str] | None = await child.run(
-                    task, deps=ctx.deps, usage=ctx.usage, usage_limits=limits
-                )
+                # Plain path kept deliberately: streaming requires a
+                # stream-capable model (e.g. FunctionModel needs a
+                # stream_function), and library callers without a sink
+                # shouldn't pay the streamed-request mode switch.
+                result = await child.run(task, deps=ctx.deps, usage=ctx.usage, usage_limits=limits)
             else:
                 # Stream child events so a long delegation doesn't look like
                 # a hang: each child tool call surfaces as "<name> → <tool>".
-                result = None
                 async with child.run_stream_events(
                     task, deps=ctx.deps, usage=ctx.usage, usage_limits=limits
                 ) as events:
                     async for event in events:
                         if isinstance(event, FunctionToolCallEvent):
-                            ctx.deps.on_status(f"{name} → {event.part.tool_name}")
+                            # Status is best-effort telemetry: a broken sink
+                            # must never abort or misattribute the delegation.
+                            with contextlib.suppress(Exception):
+                                ctx.deps.on_status(f"{name} → {event.part.tool_name}")
                         elif isinstance(event, AgentRunResultEvent):
                             result = event.result
             if result is None:  # pragma: no cover - failures re-raise from the iterator
