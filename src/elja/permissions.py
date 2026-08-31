@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, CapabilityOrdering
 from pydantic_ai.exceptions import SkipToolExecution
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
@@ -30,23 +30,39 @@ from pydantic_ai.tools import ToolDefinition
 from elja.deps import EljaDeps
 from elja.settings import EljaSettings
 
+# One approval at a time, process-wide: parallel tool calls would otherwise
+# race interleaved prompts on a single stdin.
+_APPROVAL_LOCK = asyncio.Lock()
+
+# Generous cap with a LOUD middle elision: the user approves what they see,
+# so hiding a command tail is a real attack surface.
+_MAX_SHOWN = 2000
+
 
 def _describe(call: ToolCallPart) -> str:
     try:
         args = json.dumps(call.args_as_dict())
     except Exception:  # noqa: BLE001 - display only; never block on repr issues
         args = str(call.args)
-    if len(args) > 300:
-        args = args[:300] + "…"
+    if len(args) > _MAX_SHOWN:
+        half = _MAX_SHOWN // 2
+        hidden = len(args) - _MAX_SHOWN
+        args = f"{args[:half]} …[{hidden} chars hidden]… {args[-half:]}"
     return f"{call.tool_name}({args})"
 
 
-@dataclass
+@dataclass(kw_only=True)
 class PermissionGate(AbstractCapability[EljaDeps]):
     """Applies ``[permissions]`` policies to every tool call."""
 
-    settings: EljaSettings = None  # type: ignore[assignment]
-    id: str = "permission-gate"
+    settings: EljaSettings
+    # Leading underscore: skill ids must start with a letter, so a skill can
+    # never collide with the gate's capability id.
+    id: str = "_elja_permission_gate"
+
+    def get_ordering(self) -> CapabilityOrdering:
+        """Pin the gate innermost so no later hook mutates approved args."""
+        return CapabilityOrdering(position="innermost")
 
     async def before_tool_execute(
         self,
@@ -69,10 +85,11 @@ class PermissionGate(AbstractCapability[EljaDeps]):
         confirm = ctx.deps.confirm
         if confirm is None:
             raise SkipToolExecution(
-                f"not executed: {call.tool_name} requires interactive approval and no "
-                "approver is available (set [permissions] to 'allow' it, or run in the REPL)"
+                f"not executed: {call.tool_name} requires approval, which is unavailable "
+                "in this run"
             )
-        approved = await asyncio.to_thread(confirm, _describe(call))
+        async with _APPROVAL_LOCK:
+            approved = await asyncio.to_thread(confirm, _describe(call))
         if not approved:
             raise SkipToolExecution(
                 f"not executed: the user declined {call.tool_name}; choose a different "

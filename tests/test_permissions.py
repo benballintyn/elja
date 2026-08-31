@@ -43,13 +43,16 @@ def _agent(settings: EljaSettings, model: FunctionModel) -> Agent[EljaDeps, str]
 
 
 class TestDescribe:
-    def test_truncates_long_args(self) -> None:
+    def test_middle_elides_very_long_args_with_loud_marker(self) -> None:
+        """Both ENDS of a long command stay visible — hiding the tail is an attack."""
         from elja.permissions import _describe
 
-        call = ToolCallPart(tool_name="run_shell", args={"command": "x" * 500})
+        call = ToolCallPart(tool_name="run_shell", args={"command": "HEAD" + "x" * 3000 + "TAIL"})
         text = _describe(call)
-        assert len(text) < 400
-        assert text.endswith("…)") or "…" in text
+        assert len(text) < 2600
+        assert "chars hidden" in text
+        assert "HEAD" in text
+        assert "TAIL" in text
 
     def test_unserializable_args_fall_back(self) -> None:
         from elja.permissions import _describe
@@ -88,7 +91,7 @@ class TestPolicies:
             deps=EljaDeps.from_settings(settings),  # no confirm callback
         )
         assert result.output == "done"
-        assert any("requires interactive approval" in s for s in seen)
+        assert any("requires approval" in s for s in seen)
         assert not (tmp_path / "ran.txt").exists()
 
     async def test_ask_approved_executes(self, tmp_path: Path) -> None:
@@ -267,3 +270,52 @@ class TestReplApproval:
 
         await repl(settings, "s", input_fn=input_fn)
         assert not (tmp_path / "no.txt").exists()
+
+
+class TestApprovalSerialization:
+    async def test_parallel_asks_never_overlap(self, tmp_path: Path) -> None:
+        """Two gated calls in one step must prompt one at a time (shared stdin)."""
+        import threading
+        import time
+
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def confirm(_: str) -> bool:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return True
+
+        calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name="run_shell", args={"command": "touch a.txt"}),
+                        ToolCallPart(tool_name="run_shell", args={"command": "touch b.txt"}),
+                    ]
+                )
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        result = await _agent(settings, FunctionModel(script)).run(
+            "go", deps=EljaDeps.from_settings(settings, confirm=confirm)
+        )
+        assert result.output == "done"
+        assert (tmp_path / "a.txt").exists()
+        assert (tmp_path / "b.txt").exists()
+        assert max_active == 1
+
+
+class TestOrdering:
+    def test_gate_pins_innermost(self) -> None:
+        gate = build_permission_gate(EljaSettings())
+        assert gate.get_ordering().position == "innermost"

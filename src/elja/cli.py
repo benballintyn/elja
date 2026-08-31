@@ -206,6 +206,9 @@ async def repl(
         console.print(f"\n⚙ {label}", style="dim", markup=False, highlight=False)
 
     def confirm(description: str) -> bool:
+        # Runs in a worker thread; EOF declines. (A real Ctrl+C is delivered
+        # to the main thread and won't interrupt this read — press Enter/EOF
+        # to decline.)
         console.print(f"\napprove {description}?", style="yellow", markup=False)
         try:
             return input_fn("[y/N] ").strip().lower() in {"y", "yes"}
