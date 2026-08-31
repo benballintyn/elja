@@ -25,6 +25,10 @@ dependencies = [
     "pydantic-ai-harness (>=0.27,<0.28)",
 ]
 
+[project.optional-dependencies]
+anthropic = ["pydantic-ai-slim[anthropic] (>=2.36,<3)"]
+google = ["pydantic-ai-slim[google] (>=2.36,<3)"]
+
 [project.scripts]
 elja = "elja.cli:main"
 
@@ -43,6 +47,7 @@ ruff = "^0.15"
 mypy = "^1.14"
 pre-commit = "^4.0"
 types-pyyaml = "^6.0.12.20260815"
+pydantic-ai-slim = {version = ">=2.36,<3", extras = ["anthropic", "google"]}
 
 [tool.ruff]
 line-length = 99

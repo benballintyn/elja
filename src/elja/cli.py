@@ -242,7 +242,8 @@ async def repl(
         return
     console.print(
         f"[bold]elja[/bold] — model [cyan]{settings.model.name}[/cyan] at "
-        f"{settings.model.base_url} (session: {session_name}; /img <path> <prompt> to attach "
+        f"{settings.model.base_url or settings.model.provider} (session: {session_name}; "
+        "/img <path> <prompt> to attach "
         "an image; exit/quit to leave)"
     )
     while True:

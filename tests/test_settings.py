@@ -12,11 +12,13 @@ from elja.settings import EljaSettings, load_settings
 def test_defaults_target_lm_studio() -> None:
     """With no config file or env, settings default to LM Studio + Qwen3.8-27B."""
     settings = EljaSettings()
+    assert settings.model.provider == "openai"
     assert settings.model.name == "qwen/qwen3.8-27b"
-    assert settings.model.base_url == "http://localhost:1234/v1"
-    assert settings.model.api_key.get_secret_value() == "lm-studio"
+    assert settings.model.base_url is None
+    assert settings.model.api_key is None
     # Secrets must not leak through repr/logging.
-    assert "lm-studio" not in repr(settings)
+    leaky = EljaSettings(model={"api_key": "super-secret"})  # type: ignore[arg-type]
+    assert "super-secret" not in repr(leaky)
     assert settings.limits.request_limit == 25
     assert settings.limits.total_tokens_limit is None
     assert settings.workspace.root == Path(".")
@@ -100,7 +102,7 @@ instructions = "Be terse."
     assert settings.model.name == "some/other-model"
     assert settings.model.temperature == 0.7
     # Unset TOML keys keep their defaults.
-    assert settings.model.base_url == "http://localhost:1234/v1"
+    assert settings.model.base_url is None
     assert settings.limits.request_limit == 5
     assert settings.workspace.root == Path("/tmp/ws")
     assert settings.tools.run_shell is False

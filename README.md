@@ -47,9 +47,14 @@ override, e.g. `ELJA_MODEL__BASE_URL`):
 
 ```toml
 [model]
+provider = "openai"      # "openai" (any OpenAI-compatible endpoint — the default,
+                         # aimed at LM Studio), "anthropic", or "google".
+                         # Native providers need: pip install 'elja[anthropic]' / 'elja[google]'
 name = "qwen/qwen3.8-27b"
-base_url = "http://localhost:1234/v1"
+base_url = "http://localhost:1234/v1"   # unset with provider="openai" = local LM Studio
 temperature = 0.2
+# api_key: set for cloud endpoints; native providers also honor
+# ANTHROPIC_API_KEY / GOOGLE_API_KEY from the environment.
 
 [limits]
 request_limit = 25

@@ -31,15 +31,24 @@ class _Section(BaseModel):
 
 
 class ModelConfig(_Section):
-    """Which LLM to talk to, and how."""
+    """Which LLM to talk to, and how.
 
+    ``provider`` selects the API dialect: ``openai`` (default — any
+    OpenAI-compatible endpoint, incl. LM Studio/Ollama/vLLM/OpenRouter),
+    ``anthropic``, or ``google``. With ``provider = "openai"``, an unset
+    ``base_url``/``api_key`` defaults to a local LM Studio server; for the
+    native providers an unset ``api_key`` falls back to the SDK's standard
+    environment variable (ANTHROPIC_API_KEY / GOOGLE_API_KEY).
+    """
+
+    provider: Literal["openai", "anthropic", "google"] = "openai"
     name: str = "qwen/qwen3.8-27b"
-    base_url: str = "http://localhost:1234/v1"
-    api_key: SecretStr = SecretStr("lm-studio")
+    base_url: str | None = None
+    api_key: SecretStr | None = None
     temperature: float = 0.2
     max_tokens: int = 4096
     # Most local OpenAI-compatible servers (LM Studio included) don't implement
-    # strict tool schemas; flip this on for backends that do.
+    # strict tool schemas; flip this on for backends that do. (openai provider only.)
     supports_strict_tool_definition: bool = False
 
 
