@@ -24,7 +24,7 @@ from rich.console import Console
 
 from elja.agent import build_agent, build_usage_limits
 from elja.deps import EljaDeps
-from elja.mcp import build_mcp_toolsets, preflight_mcp_toolsets
+from elja.mcp import build_mcp_toolsets, preflight_mcp_toolsets, toolset_name
 from elja.model import effective_endpoint
 from elja.session import Session
 from elja.settings import EljaSettings, load_settings
@@ -181,14 +181,14 @@ async def repl(
             markup=False,
         ),
     )
-    alive = {t.id for t in mcp_toolsets}
+    alive = {toolset_name(t) for t in mcp_toolsets}
 
     def fresh_agent() -> "Agent[EljaDeps, str]":
         # Fresh toolsets (filtered to servers that passed preflight): a server
         # that dies mid-call wedges its transport, so errors get new ones.
         return build_agent(
             settings,
-            mcp_toolsets=[t for t in build_mcp_toolsets(settings) if t.id in alive],
+            mcp_toolsets=[t for t in build_mcp_toolsets(settings) if toolset_name(t) in alive],
         )
 
     try:
