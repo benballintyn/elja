@@ -1,5 +1,7 @@
 """Tests for elja.settings."""
 
+import subprocess
+import sys
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -189,6 +191,16 @@ class TestModelSettingsValidation:
         with pytest.raises(ValidationError, match=r"duplicates model\.max_tokens"):
             ModelConfig(max_tokens=100, settings={"max_tokens": 200})
 
+    def test_both_clashing_parameters_are_named_at_once(self) -> None:
+        """Naming only the first would send the user round the loop twice."""
+        with pytest.raises(ValidationError) as exc:
+            ModelConfig(
+                temperature=0.5, max_tokens=100, settings={"temperature": 0.1, "max_tokens": 2}
+            )
+        message = str(exc.value)
+        assert "model.max_tokens" in message
+        assert "model.temperature" in message
+
     def test_an_untouched_default_is_not_a_duplicate(self) -> None:
         cfg = ModelConfig(settings={"temperature": 0.7})
         assert cfg.settings["temperature"] == 0.7
@@ -218,6 +230,25 @@ class TestProviderSettingsValidation:
         )
         with pytest.raises(ValueError, match=r"anthropic_not_a_real_key"):
             validate_provider_settings("anthropic", {"anthropic_not_a_real_key": 1})
+
+
+class TestImportWeight:
+    def test_importing_elja_does_not_load_a_provider_sdk(self) -> None:
+        """A host pays for its own provider, not for all three.
+
+        The settings validator must not touch pydantic_ai.models.openai for the
+        default empty [model.settings]; doing so pulled the entire OpenAI SDK
+        into every `import elja` and defeated model.py's lazy provider imports.
+        A subprocess, because this session has already imported plenty.
+        """
+        result = subprocess.run(
+            [sys.executable, "-c", "import elja, sys; print('openai' in sys.modules)"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+        assert result.stdout.strip() == "False"
 
 
 class TestSettingsValuesAreValidatedToo:
