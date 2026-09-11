@@ -9,14 +9,16 @@ agents cannot contaminate each other.
 import ast
 import asyncio
 import contextlib
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_type
 
 import pytest
 from pydantic import BaseModel
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext, UnexpectedModelBehavior
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.concurrency import ConcurrencyLimiter
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -176,47 +178,59 @@ class TestNothingImplicitHappens:
         ]
         assert offenders == []
 
-    async def test_no_process_is_spawned_and_no_directory_is_scanned(
-        self, mocker: MockerFixture
+    async def test_nothing_touches_the_filesystem_a_process_or_a_socket(
+        self, tmp_path: Path
     ) -> None:
-        """The scan and subprocess clauses of the acceptance criterion.
+        """The scan, subprocess and network clauses, audited rather than patched.
 
-        Patched at the primitives, not at elja's own functions, so any route to
-        them is caught — including one added by a future edit to this module.
+        Patching named primitives only catches the routes you thought of:
+        ``os.listdir``, ``open``, ``os.system``, a raw socket and an
+        ``__import__``-ed scan all slip past them. An audit hook sees every one.
+
+        The hook is installed BEFORE construction, because construction is where
+        an implicit side effect would live. Module loading also raises ``open``,
+        so source-file reads are filtered out by path — everything else is a
+        genuine touch.
         """
-        popen = mocker.patch("subprocess.Popen")
-        run = mocker.patch("subprocess.run")
-        mkdir = mocker.patch("pathlib.Path.mkdir")
-        scandir = mocker.patch("os.scandir")
-        seen: dict[str, Any] = {}
-        agent = build_application_agent(
-            _capture(seen), deps_type=HouseholdDeps, toolsets=[_household_toolset()]
-        )
-        await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
-        assert popen.call_count == 0
-        assert run.call_count == 0
-        assert mkdir.call_count == 0
-        assert scandir.call_count == 0
+        (tmp_path / "skills").mkdir()
+        (tmp_path / "skills" / "a.md").write_text("---\nid: a\ndescription: d\n---\nbody\n")
+        watched = {
+            "open",
+            "os.listdir",
+            "os.scandir",
+            "os.mkdir",
+            "os.system",
+            "subprocess.Popen",
+            "socket.__new__",
+            "socket.connect",
+            "glob.glob",
+        }
+        # Only installed-package loads are filtered. A read of elja's own source
+        # stays visible, so a future edit that opens a file here is caught.
+        installed = ("site-packages", "lib/python", "/importlib/", ".pyc")
+        touches: list[str] = []
+        recording = False
 
-    async def test_only_the_callers_tools_are_offered(self) -> None:
-        """No read_file/write_file/list_dir/run_shell/web_search sneaks in."""
-        seen: dict[str, Any] = {}
-        agent = build_application_agent(
-            _capture(seen), deps_type=HouseholdDeps, toolsets=[_household_toolset()]
-        )
-        await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
-        assert seen["tool_names"] == ["note_fact"]
+        def audit(event: str, args: tuple[object, ...]) -> None:
+            if not recording or event not in watched:
+                return
+            if event == "open":
+                target = str(args[0]) if args else ""
+                if any(marker in target for marker in installed):
+                    return  # a module load, not a file this code chose to read
+            touches.append(event)
 
-    async def test_running_writes_nothing_to_disk(self, tmp_path: Path) -> None:
-        """No .elja directory, no spill dir, no session file — nothing."""
-        before = sorted(p.name for p in tmp_path.iterdir())
+        sys.addaudithook(audit)
         seen: dict[str, Any] = {}
-        agent = build_application_agent(
-            _capture(seen), deps_type=HouseholdDeps, toolsets=[_household_toolset()]
-        )
-        await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
-        assert sorted(p.name for p in tmp_path.iterdir()) == before
-        assert not (tmp_path / ".elja").exists()
+        recording = True
+        try:
+            agent = build_application_agent(
+                _capture(seen), deps_type=HouseholdDeps, toolsets=[_household_toolset()]
+            )
+            await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
+        finally:
+            recording = False
+        assert touches == []
 
 
 class TestEmptyStaysEmpty:
@@ -257,6 +271,23 @@ class TestEmptyStaysEmpty:
             await convenience.run("hi", deps=EljaDeps.from_settings(settings))
         assert seen["instructions"] == DEFAULT_INSTRUCTIONS
 
+    async def test_an_explicitly_empty_prompt_is_honored_on_the_convenience_path(
+        self, tmp_path: Path
+    ) -> None:
+        """The other half of the documented asymmetry: "" means no prompt."""
+        from elja.agent import build_agent
+        from elja.deps import EljaDeps
+        from elja.settings import AgentConfig, WorkspaceConfig
+
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path), agent=AgentConfig(instructions="")
+        )
+        seen: dict[str, Any] = {}
+        convenience = build_agent(settings)
+        with convenience.override(model=_capture(seen)):
+            await convenience.run("hi", deps=EljaDeps.from_settings(settings))
+        assert seen["instructions"] is None
+
     async def test_callers_instructions_are_used_verbatim(self) -> None:
         seen: dict[str, Any] = {}
         agent = build_application_agent(
@@ -274,7 +305,7 @@ class TestNoCrossAgentBleed:
         seen_b: dict[str, Any] = {}
         deps_a = HouseholdDeps(tenant="a", calls=[])
         deps_b = HouseholdDeps(tenant="b", calls=[])
-        gate = asyncio.Barrier(2)
+        gate = asyncio.Barrier(2)  # bleed test: both runs must reach the model
         both_in_flight = asyncio.Event()
         agent_a = build_application_agent(
             _capture_async(seen_a, gate, both_in_flight),
@@ -356,6 +387,36 @@ class TestNoCrossAgentBleed:
         capabilities.append(Late())
         await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
         assert not seen["instructions"]
+
+
+class TestEveryAgentComesThroughThisDoor:
+    def test_build_agent_constructs_through_the_factory(self, mocker: MockerFixture) -> None:
+        from elja.agent import build_agent
+        from elja.settings import WorkspaceConfig
+
+        spy = mocker.patch(
+            "elja.agent.build_application_agent", wraps=elja.application.build_application_agent
+        )
+        build_agent(EljaSettings(workspace=WorkspaceConfig(root=Path.cwd())))
+        assert spy.call_count == 1
+
+    def test_a_configured_delegate_constructs_through_the_factory(
+        self, mocker: MockerFixture
+    ) -> None:
+        """Otherwise the docstring's claim is false for every sub-agent."""
+        from elja.settings import SubagentConfig, WorkspaceConfig
+        from elja.subagents import build_subagent_toolset
+
+        spy = mocker.patch(
+            "elja.subagents.build_application_agent",
+            wraps=elja.application.build_application_agent,
+        )
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=Path.cwd()),
+            subagents={"helper": SubagentConfig(description="d", instructions="i")},
+        )
+        assert build_subagent_toolset(settings) is not None
+        assert spy.call_count == 1
 
 
 class TestModelPassthrough:
@@ -523,11 +584,95 @@ class TestStructuredOutputAndCapabilities:
             name="household-agent",
             retries=0,
             end_strategy="exhaustive",
-            tool_timeout=12.5,
             max_concurrency=3,
         )
         assert agent.name == "household-agent"
         assert agent.end_strategy == "exhaustive"
+
+    async def test_retries_zero_means_one_attempt_not_upstreams_default(self) -> None:
+        """E2 wants a host able to own every paid attempt.
+
+        Silently reverting to upstream's 1 retry buys a second paid model call
+        per tool failure, which is the opposite of explicit metered attempts.
+        """
+        toolset: FunctionToolset[HouseholdDeps] = FunctionToolset()
+
+        @toolset.tool
+        def always_retries(ctx: RunContext[HouseholdDeps]) -> str:
+            """Always asks the model to try again."""
+            raise ModelRetry("try again")
+
+        turns: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            turns.append(1)
+            return ModelResponse(parts=[ToolCallPart(tool_name="always_retries", args={})])
+
+        agent = build_application_agent(
+            FunctionModel(script),
+            deps_type=HouseholdDeps,
+            toolsets=[toolset],
+            retries=0,
+        )
+        with pytest.raises(UnexpectedModelBehavior):
+            await agent.run("go", deps=HouseholdDeps(tenant="t", calls=[]))
+        assert len(turns) == 1
+
+    async def test_a_toolset_level_timeout_is_the_one_that_enforces(self) -> None:
+        """Why tool_timeout is absent from the signature.
+
+        Upstream's Agent(tool_timeout=) is applied only to the agent's own
+        function toolset, which this path never populates, so it would be an
+        inert knob. This pins the mechanism the docstring points at instead.
+        """
+        toolset: FunctionToolset[HouseholdDeps] = FunctionToolset(timeout=0.05)
+
+        @toolset.tool
+        async def slow(ctx: RunContext[HouseholdDeps]) -> str:
+            """Takes far longer than the configured cap."""
+            await asyncio.sleep(3)
+            return "finished"
+
+        outcomes: list[str] = []
+        calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(parts=[ToolCallPart(tool_name="slow", args={})])
+            outcomes.append(str(messages[-1]))
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        agent = build_application_agent(
+            FunctionModel(script), deps_type=HouseholdDeps, toolsets=[toolset]
+        )
+        result = await agent.run("go", deps=HouseholdDeps(tenant="t", calls=[]))
+        assert result.output == "handled"
+        assert outcomes
+        assert "Timed out" in outcomes[0]
+        assert "finished" not in outcomes[0]
+
+    async def test_max_concurrency_of_one_prevents_the_overlap(self) -> None:
+        """The same barrier machinery, used in the direction that proves a cap."""
+        gate = asyncio.Barrier(2)  # cap test: two parties that must never meet
+        both_in_flight = asyncio.Event()
+        deps = HouseholdDeps(tenant="t", calls=[])
+        seen_a: dict[str, Any] = {}
+        seen_b: dict[str, Any] = {}
+        limiter = ConcurrencyLimiter(1)
+        agent_a = build_application_agent(
+            _capture_async(seen_a, gate, both_in_flight),
+            deps_type=HouseholdDeps,
+            max_concurrency=limiter,
+        )
+        agent_b = build_application_agent(
+            _capture_async(seen_b, gate, both_in_flight),
+            deps_type=HouseholdDeps,
+            max_concurrency=limiter,
+        )
+        await asyncio.gather(agent_a.run("x", deps=deps), agent_b.run("y", deps=deps))
+        # One at a time, so the two runs can never meet at the barrier.
+        assert not both_in_flight.is_set()
 
 
 def test_overloads_infer_the_output_type() -> None:

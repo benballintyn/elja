@@ -25,9 +25,13 @@ elja's own pieces remain available, by opting in rather than by default:
   whose tools are idempotent reads and whose workspace holds that directory.
   Neither is true here: your tools may have side effects, and this path creates
   no workspace, so the recovery route does not exist. Until the placeholder is
-  configurable, either build your own ``TieredCompaction``/``ClearToolResults``
-  with a ``placeholder=`` that says "retrieve the saved result", or leave
-  compaction off.
+  configurable, either build your own
+  ``TieredCompaction``/``ClearToolResults``/``SummarizingCompaction`` with a
+  ``placeholder=`` that says "retrieve the saved result", or leave compaction
+  off. If you build your own, copy ``build_compaction``'s body rather than the
+  upstream defaults — in particular its ``keep_tokens``, without which an
+  irreducible tail above the target re-fires a **paid** summarizer call on every
+  single request.
 - **Skills**: ``capabilities=load_skills(settings)`` if you want markdown
   skills; that one does read a directory, which is why it is not implicit.
 - **Permissions**: :class:`~elja.permissions.PermissionGate` reads
@@ -50,9 +54,14 @@ retroactive. ``tests/test_application.py`` pins that, because it is a property
 a host relies on and pydantic-ai is a pinned range, not a frozen version.
 
 :func:`elja.build_agent` collects its settings-derived pieces and then calls
-through to here, so there is one place where an ``Agent`` is constructed. What
-still distinguishes the two paths — which toolsets, which capabilities, which
-instruction default — lives entirely in ``build_agent``.
+through to here, and so does each configured sub-agent delegate, so every
+``Agent`` elja constructs comes through this one door. What still distinguishes
+the paths — which toolsets, which capabilities, which instruction default —
+lives in the callers.
+
+That is construction only. A delegate still builds its **own** model and its own
+compaction from settings, so a wrapper you pass here does not govern a
+delegation; keep sub-agents off this path until elja propagates them explicitly.
 """
 
 from collections.abc import Sequence
@@ -93,7 +102,6 @@ def build_application_agent(
     name: str | None = None,
     retries: int | AgentRetries | None = None,
     end_strategy: EndStrategy = "graceful",
-    tool_timeout: float | None = None,
     max_concurrency: AnyConcurrencyLimit = None,
 ) -> Agent[DepsT, str]: ...
 
@@ -111,7 +119,6 @@ def build_application_agent(
     name: str | None = None,
     retries: int | AgentRetries | None = None,
     end_strategy: EndStrategy = "graceful",
-    tool_timeout: float | None = None,
     max_concurrency: AnyConcurrencyLimit = None,
 ) -> Agent[DepsT, OutputT]: ...
 
@@ -128,7 +135,6 @@ def build_application_agent(
     name: str | None = None,
     retries: int | AgentRetries | None = None,
     end_strategy: EndStrategy = "graceful",
-    tool_timeout: float | None = None,
     max_concurrency: AnyConcurrencyLimit = None,
 ) -> Agent[DepsT, OutputT]:
     """Build an agent for a host application, with no implicit elja machinery.
@@ -161,10 +167,16 @@ def build_application_agent(
             as upstream defines them. ``None`` keeps upstream's default;
             pass ``0`` to own every attempt explicitly.
         end_strategy: Upstream's end strategy, unchanged.
-        tool_timeout: Per-tool wall-clock cap, for a host that must not let one
-            tool hold a request open.
         max_concurrency: Upstream's cap on concurrent agent runs — an int, or
             one of its limiter objects.
+
+    Deliberately absent: ``tool_timeout``. Upstream applies it only to the
+    agent's *own* function toolset, which this path never populates, so
+    forwarding it would advertise an enforcement that never fires. Put a
+    wall-clock cap where it works — ``FunctionToolset(timeout=...)`` for a whole
+    toolset, or ``@toolset.tool(timeout=...)`` for one tool. Both were measured;
+    ``Agent(tool_timeout=...)`` against a tool in a passed-in toolset was not
+    enforced at all.
 
     Returns:
         A native ``Agent`` bound to ``deps_type`` and ``output_type``.
@@ -180,6 +192,5 @@ def build_application_agent(
         name=name,
         retries=retries,
         end_strategy=end_strategy,
-        tool_timeout=tool_timeout,
         max_concurrency=max_concurrency,
     )
