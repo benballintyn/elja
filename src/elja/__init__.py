@@ -1,6 +1,7 @@
 """elja: a relentless, fully-customizable LLM agent harness built on Pydantic AI."""
 
 from elja.agent import DEFAULT_INSTRUCTIONS, build_agent, build_usage_limits
+from elja.application import build_application_agent
 from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
@@ -18,6 +19,7 @@ __all__ = [
     "Session",
     "__version__",
     "build_agent",
+    "build_application_agent",
     "build_mcp_toolsets",
     "build_model",
     "build_toolset",

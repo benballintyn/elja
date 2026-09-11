@@ -42,6 +42,55 @@ result = agent.run_sync(
 print(result.output)
 ```
 
+### Embedding elja in an application
+
+`build_agent` is the convenience factory: it reads settings and assembles a
+complete local agent — workspace tools, filesystem skills, sub-agents, MCP
+clients, compaction, permission gate. A server that owns its own tools,
+dependencies and persistence wants the other door, which assembles **nothing
+you did not ask for**:
+
+```python
+from dataclasses import dataclass
+
+from pydantic_ai import RunContext
+from pydantic_ai.toolsets import FunctionToolset
+
+from elja import build_application_agent
+
+
+@dataclass
+class AppDeps:            # your own type — no EljaDeps, no workspace
+    tenant: str
+    repo: "Repository"
+
+
+toolset: FunctionToolset[AppDeps] = FunctionToolset()
+
+
+@toolset.tool
+async def record_fact(ctx: RunContext[AppDeps], fact: str) -> str:
+    """A domain tool: it gets your deps object, untouched."""
+    return await ctx.deps.repo.add(ctx.deps.tenant, fact)
+
+
+agent = build_application_agent(
+    my_model,                     # a Model instance, passed through untouched
+    deps_type=AppDeps,
+    instructions="You keep a household's records.",
+    toolsets=[toolset],
+)
+result = await agent.run("remember the vet is tuesday", deps=AppDeps(...))
+```
+
+No file/shell/web-search tools, no skills directory scan, no MCP subprocess, no
+`.elja` writes, no workspace. The return value is a native `pydantic_ai.Agent`,
+so `run_stream_events`, `message_history`, `output_type`, per-run
+`model_settings`, `usage` and `usage_limits` all behave as they do upstream.
+elja's own capabilities stay available by opting in, e.g.
+`capabilities=build_compaction(settings)`. See `elja/application.py` for the
+full contract, including how `None` and empty differ between the two paths.
+
 Configuration lives in `elja.toml` (all keys optional; `ELJA_*` env vars
 override, e.g. `ELJA_MODEL__BASE_URL`):
 
