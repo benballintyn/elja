@@ -61,8 +61,27 @@ def build_agent(
 
 
 def build_usage_limits(settings: EljaSettings) -> UsageLimits:
-    """Per-run caps from settings, bounding runaway tool loops."""
+    """Per-run caps from settings, bounding runaway tool loops.
+
+    Every ``[limits]`` field is forwarded, so a caller that sets a cost or
+    tool-call ceiling in config gets it enforced rather than dropped. Callers
+    holding their own ``UsageLimits`` can pass it to ``Agent.run`` directly
+    instead; this factory is the config-driven path.
+
+    Args:
+        settings: Resolved elja settings.
+
+    Returns:
+        The limits for one run.
+    """
+    limits = settings.limits
     return UsageLimits(
-        request_limit=settings.limits.request_limit,
-        total_tokens_limit=settings.limits.total_tokens_limit,
+        request_limit=limits.request_limit,
+        total_tokens_limit=limits.total_tokens_limit,
+        cost_limit=limits.cost_limit,
+        tool_calls_limit=limits.tool_calls_limit,
+        input_tokens_limit=limits.input_tokens_limit,
+        output_tokens_limit=limits.output_tokens_limit,
+        per_request_input_tokens_limit=limits.per_request_input_tokens_limit,
+        count_tokens_before_request=limits.count_tokens_before_request,
     )

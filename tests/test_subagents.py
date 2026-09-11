@@ -16,7 +16,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pytest_mock import MockerFixture
 
 from elja.deps import EljaDeps
-from elja.settings import EljaSettings, SubagentConfig, WorkspaceConfig
+from elja.settings import EljaSettings, LimitsConfig, SubagentConfig, WorkspaceConfig
 from elja.subagents import build_subagent_toolset
 from elja.tools import build_toolset
 
@@ -258,6 +258,53 @@ class TestBudget:
         assert result.output == "handled"
         assert any("budget exhausted" in s for s in seen_result)
         assert any("Do not delegate this again" in s for s in seen_result)
+
+    async def test_a_child_inherits_every_ceiling_but_request_limit(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        """A configured tool-call ceiling binds the child too, not just the parent.
+
+        Without inheritance the child runs with request_limit alone and keeps
+        calling tools until it burns the whole request budget.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            limits=LimitsConfig(tool_calls_limit=1),
+            subagents={
+                "helper": SubagentConfig(description="d", instructions="i", tools=["list_dir"])
+            },
+        )
+        child_requests: list[int] = []
+
+        def child_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            child_requests.append(1)
+            return ModelResponse(parts=[ToolCallPart(tool_name="list_dir", args={"path": "."})])
+
+        mocker.patch("elja.subagents.build_model", return_value=FunctionModel(child_script))
+        calls: list[int] = []
+        seen_result: list[str] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_helper", args={"task": "t"})]
+                )
+            seen_result.append(str(messages[-1]))
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run("go", deps=EljaDeps.from_settings(settings))
+        assert result.output == "handled"
+        assert any("budget exhausted" in s for s in seen_result)
+        # One tool call is allowed, so the child's SECOND request is refused.
+        # Uninherited, the ceiling would not apply and the child would loop
+        # against request_limit (25) instead.
+        assert len(child_requests) == 2
 
 
 class TestAgentWiring:

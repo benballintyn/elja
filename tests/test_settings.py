@@ -1,12 +1,19 @@
 """Tests for elja.settings."""
 
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
-from elja.settings import EljaSettings, load_settings
+from elja.settings import (
+    EljaSettings,
+    LimitsConfig,
+    ModelConfig,
+    load_settings,
+    unsupported_settings_keys,
+)
 
 
 def test_defaults_target_lm_studio() -> None:
@@ -128,3 +135,96 @@ def test_empty_env_string_means_unset(mocker: MockerFixture) -> None:
     settings = EljaSettings()
     assert settings.model.base_url is None
     assert settings.model.api_key is None
+
+
+class TestModelSettingsValidation:
+    """model.settings is checked against the selected dialect, before any request."""
+
+    def test_unknown_key_is_rejected_by_name(self) -> None:
+        with pytest.raises(ValidationError, match=r"unsupported model\.settings key"):
+            ModelConfig(settings={"temparature": 0.5})
+
+    def test_the_message_names_the_offending_key_and_provider(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            ModelConfig(provider="anthropic", settings={"nope": 1, "also_nope": 2})
+        message = str(exc.value)
+        assert "'also_nope', 'nope'" in message
+        assert "'anthropic'" in message
+
+    def test_another_providers_key_is_rejected(self) -> None:
+        """A google key under anthropic is a config bug, not a passthrough."""
+        with pytest.raises(ValidationError, match=r"google_thinking_config"):
+            ModelConfig(provider="anthropic", settings={"google_thinking_config": {}})
+
+    def test_the_selected_providers_own_key_is_accepted(self) -> None:
+        cfg = ModelConfig(provider="google", settings={"google_thinking_config": {"x": 1}})
+        assert cfg.settings == {"google_thinking_config": {"x": 1}}
+
+    def test_portable_keys_are_accepted_for_every_provider(self) -> None:
+        for provider in ("openai", "anthropic", "google"):
+            cfg = ModelConfig(provider=provider, settings={"thinking": {"type": "enabled"}})
+            assert cfg.settings["thinking"] == {"type": "enabled"}
+
+    def test_a_parameter_set_in_both_places_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"duplicates model\.temperature"):
+            ModelConfig(temperature=0.5, settings={"temperature": 0.7})
+
+    def test_max_tokens_set_in_both_places_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"duplicates model\.max_tokens"):
+            ModelConfig(max_tokens=100, settings={"max_tokens": 200})
+
+    def test_an_untouched_default_is_not_a_duplicate(self) -> None:
+        cfg = ModelConfig(settings={"temperature": 0.7})
+        assert cfg.settings["temperature"] == 0.7
+        assert cfg.temperature == 0.2  # still the default; _model_settings drops it
+
+
+class TestUnsupportedSettingsKeys:
+    def test_missing_extra_defers_to_build_model_for_its_own_keys(
+        self, mocker: MockerFixture
+    ) -> None:
+        """Without the extra the dialect's keys can't be listed, so they pass here."""
+        mocker.patch(
+            "elja.settings.importlib.import_module", side_effect=ImportError("no anthropic")
+        )
+        assert unsupported_settings_keys("anthropic", ["anthropic_thinking"]) == []
+        assert unsupported_settings_keys("anthropic", ["temperature"]) == []
+        assert unsupported_settings_keys("anthropic", ["bogus", "google_x"]) == [
+            "bogus",
+            "google_x",
+        ]
+
+    def test_installed_extra_enumerates_real_keys(self) -> None:
+        assert unsupported_settings_keys("anthropic", ["anthropic_thinking"]) == []
+        assert unsupported_settings_keys("anthropic", ["anthropic_not_a_real_key"]) == [
+            "anthropic_not_a_real_key"
+        ]
+
+
+class TestLimitsValidation:
+    def test_a_zero_tool_call_ceiling_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            LimitsConfig(tool_calls_limit=0)
+
+    def test_a_negative_cost_ceiling_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            LimitsConfig(cost_limit=Decimal("-1"))
+
+    def test_a_zero_cost_ceiling_is_allowed(self) -> None:
+        """Zero is a meaningful ceiling: refuse every priced request."""
+        assert LimitsConfig(cost_limit=Decimal("0")).cost_limit == Decimal("0")
+
+
+class TestOmittingSamplingParameters:
+    def test_env_empty_string_omits_temperature(self, mocker: MockerFixture) -> None:
+        """'' is the only spelling env has for "send no temperature"."""
+        mocker.patch.dict("os.environ", {"ELJA_MODEL__TEMPERATURE": ""})
+        assert EljaSettings().model.temperature is None
+
+    def test_env_empty_string_omits_max_tokens(self, mocker: MockerFixture) -> None:
+        mocker.patch.dict("os.environ", {"ELJA_MODEL__MAX_TOKENS": ""})
+        assert EljaSettings().model.max_tokens is None
+
+    def test_env_value_still_parses(self, mocker: MockerFixture) -> None:
+        mocker.patch.dict("os.environ", {"ELJA_MODEL__TEMPERATURE": "0.75"})
+        assert EljaSettings().model.temperature == 0.75

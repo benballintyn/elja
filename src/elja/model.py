@@ -16,6 +16,7 @@ tools, skills, compaction, sessions, and sub-agents are provider-independent.
 """
 
 import os
+from typing import Any, cast
 
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
@@ -32,7 +33,19 @@ class ModelProviderError(Exception):
 
 
 def _model_settings(cfg: ModelConfig) -> ModelSettings:
-    return ModelSettings(temperature=cfg.temperature, max_tokens=cfg.max_tokens)
+    """Native settings for this config: ``settings`` plus the two shortcuts.
+
+    ``temperature``/``max_tokens`` are omitted entirely when ``None`` (some
+    reasoning models reject them). ``ModelConfig`` already refuses a key
+    spelled in both places, so the merge order cannot hide a conflict.
+    """
+    merged: dict[str, Any] = dict(cfg.settings)
+    for key, value in (("temperature", cfg.temperature), ("max_tokens", cfg.max_tokens)):
+        if value is not None and key not in merged:
+            merged[key] = value
+    # ModelSettings is a total=False TypedDict; a dict of validated keys is the
+    # only way to build one with a dynamic key set.
+    return cast(ModelSettings, merged)
 
 
 def _build_openai(cfg: ModelConfig) -> Model:

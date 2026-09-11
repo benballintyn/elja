@@ -172,3 +172,70 @@ class TestValidation:
 
         with pytest.raises(ValidationError, match="provider"):
             ModelConfig(provider="frontier-corp")  # type: ignore[arg-type]
+
+
+class TestNativeModelSettings:
+    """model.settings carries native ModelSettings through untouched."""
+
+    def test_portable_setting_reaches_the_model(self) -> None:
+        settings = EljaSettings(model=ModelConfig(settings={"top_p": 0.4, "seed": 11}))
+        built = build_model(settings)
+        assert built.settings is not None
+        assert built.settings.get("top_p") == 0.4
+        assert built.settings.get("seed") == 11
+        # The convenience shortcuts still apply alongside it.
+        assert built.settings.get("temperature") == 0.2
+        assert built.settings.get("max_tokens") == 4096
+
+    def test_provider_specific_reasoning_setting_reaches_the_model(self) -> None:
+        """No elja-side enum: the provider's own key passes through verbatim."""
+        settings = EljaSettings(
+            model=ModelConfig(provider="openai", settings={"openai_reasoning_effort": "high"})
+        )
+        built = build_model(settings)
+        assert built.settings is not None
+        assert built.settings.get("openai_reasoning_effort") == "high"
+
+    def test_anthropic_thinking_setting_reaches_the_model(self) -> None:
+        settings = EljaSettings(
+            model=ModelConfig(
+                provider="anthropic",
+                name="claude-sonnet-5",
+                api_key=SecretStr("k"),
+                settings={"anthropic_thinking": {"type": "enabled", "budget_tokens": 2048}},
+            )
+        )
+        built = build_model(settings)
+        assert built.settings is not None
+        assert built.settings.get("anthropic_thinking") == {
+            "type": "enabled",
+            "budget_tokens": 2048,
+        }
+
+    def test_none_temperature_omits_the_parameter_entirely(self) -> None:
+        """Reasoning models that reject temperature must not receive one."""
+        settings = EljaSettings(model=ModelConfig(temperature=None))
+        built = build_model(settings)
+        assert built.settings is not None
+        assert "temperature" not in built.settings
+        assert built.settings.get("max_tokens") == 4096
+
+    def test_none_max_tokens_omits_the_parameter_entirely(self) -> None:
+        settings = EljaSettings(model=ModelConfig(max_tokens=None))
+        built = build_model(settings)
+        assert built.settings is not None
+        assert "max_tokens" not in built.settings
+        assert built.settings.get("temperature") == 0.2
+
+    def test_settings_wins_over_an_unset_convenience_default(self) -> None:
+        """Leaving temperature at its default is not a conflict; settings rules."""
+        settings = EljaSettings(model=ModelConfig(settings={"temperature": 0.9}))
+        built = build_model(settings)
+        assert built.settings is not None
+        assert built.settings.get("temperature") == 0.9
+
+    def test_empty_settings_changes_nothing(self) -> None:
+        built = build_model(EljaSettings(model=ModelConfig(settings={})))
+        assert built.settings is not None
+        assert built.settings.get("temperature") == 0.2
+        assert built.settings.get("max_tokens") == 4096

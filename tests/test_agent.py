@@ -1,5 +1,6 @@
 """Tests for elja.agent."""
 
+from decimal import Decimal
 from pathlib import Path
 
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
@@ -86,3 +87,41 @@ def test_build_usage_limits_defaults() -> None:
     limits = build_usage_limits(EljaSettings())
     assert limits.request_limit == 25
     assert limits.total_tokens_limit is None
+
+
+def test_build_usage_limits_forwards_every_configured_ceiling() -> None:
+    """Each [limits] field reaches UsageLimits, not just the original two."""
+    settings = EljaSettings(
+        limits=LimitsConfig(
+            request_limit=7,
+            total_tokens_limit=1000,
+            cost_limit=Decimal("2.50"),
+            tool_calls_limit=4,
+            input_tokens_limit=800,
+            output_tokens_limit=200,
+            per_request_input_tokens_limit=300,
+            count_tokens_before_request=True,
+        )
+    )
+    limits = build_usage_limits(settings)
+    assert limits.request_limit == 7
+    assert limits.total_tokens_limit == 1000
+    assert limits.cost_limit == Decimal("2.50")
+    assert limits.tool_calls_limit == 4
+    assert limits.input_tokens_limit == 800
+    assert limits.output_tokens_limit == 200
+    assert limits.per_request_input_tokens_limit == 300
+    assert limits.count_tokens_before_request is True
+
+
+def test_build_usage_limits_defaults_leave_the_new_ceilings_uncapped() -> None:
+    """An existing config resolves exactly as it did before the new fields."""
+    limits = build_usage_limits(EljaSettings())
+    assert limits.request_limit == 25
+    assert limits.total_tokens_limit is None
+    assert limits.cost_limit is None
+    assert limits.tool_calls_limit is None
+    assert limits.input_tokens_limit is None
+    assert limits.output_tokens_limit is None
+    assert limits.per_request_input_tokens_limit is None
+    assert limits.count_tokens_before_request is False

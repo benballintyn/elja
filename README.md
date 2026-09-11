@@ -51,13 +51,29 @@ provider = "openai"      # "openai" (any OpenAI-compatible endpoint — the defa
                          # aimed at LM Studio), "anthropic", or "google".
                          # Native providers need: pip install 'elja[anthropic]' / 'elja[google]'
 name = "qwen/qwen3.8-27b"
-base_url = "http://localhost:1234/v1"   # unset with provider="openai" = local LM Studio
-temperature = 0.2
+base_url = "http://localhost:1234/v1"   # unset with provider="openai" = local LM Studio.
+                         # provider="openai" NEVER means api.openai.com on its own —
+                         # a hosted app must name the endpoint and model it intends.
+temperature = 0.2        # omit the parameter entirely with ELJA_MODEL__TEMPERATURE=""
+max_tokens = 4096        # (same: "" means "send no max_tokens")
 # api_key: set for cloud endpoints; native providers also honor
 # ANTHROPIC_API_KEY / GOOGLE_API_KEY from the environment.
 
-[limits]
+# Any other native pydantic-ai ModelSettings key, checked against the selected
+# provider's own dialect — an unsupported key is a config error, not a no-op.
+[model.settings]
+top_p = 0.9
+openai_reasoning_effort = "high"   # or anthropic_thinking / google_thinking_config
+
+[limits]                 # every field maps to pydantic-ai's UsageLimits
 request_limit = 25
+total_tokens_limit = 120000
+cost_limit = 2.50        # provider currency units; priced models only
+tool_calls_limit = 40
+input_tokens_limit = 100000
+output_tokens_limit = 20000
+per_request_input_tokens_limit = 30000
+count_tokens_before_request = false   # extra count-tokens round trip per request
 
 [workspace]
 root = "."
