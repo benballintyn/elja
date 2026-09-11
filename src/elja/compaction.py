@@ -23,6 +23,39 @@ Loaded skill BODIES, however, travel as tool returns inside history: if the
 summarization tier drops a load, the skill silently unloads (the catalog
 survives, so the model can re-load it) — the summary prompt is extended to
 call this out.
+
+**Composing this for a host application.** Every piece of the policy above is
+an argument, because the defaults are right for a local workspace and wrong for
+a server:
+
+- ``cleared_placeholder`` replaces what a masked tool result says. The default
+  invites the model to *re-run the tool*, which is safe only because elja's own
+  tools are idempotent reads. A host whose tools have side effects must pass its
+  own text — "retrieve the saved result" — or the masking tier is an invitation
+  to double-write.
+- ``summary_prompt`` replaces the summarization instruction, and
+  ``summarizer_model`` the model that writes it.
+- ``receipts`` leaves a deterministic note where history was summarized away, so
+  the model knows its memory of earlier work is secondhand. With a capability
+  implementing the harness's ``TranscriptHandleProvider`` protocol attached, the
+  receipt also carries a handle for the persisted transcript.
+- Replacing the policy wholesale is always available: pass your own
+  ``TieredCompaction``/``ClearToolResults``/``SummarizingCompaction`` as
+  ``capabilities=`` instead of calling this factory at all.
+
+**Ordering matters, and it is list order.** None of these capabilities declare
+an ordering, so ``ReportContextUsage`` measures whatever the capabilities before
+it produced. Placed *after* compaction it reports the request that was actually
+sent; placed before, it reports one that never existed — measured at 1177 versus
+7239 tokens for the same run. Put reporting last.
+
+**What survives, verified rather than assumed.** Pinned parts
+(``pydantic_ai_harness.compaction.pin``) survive every tier, including when the
+pinned text alone exceeds the target — ``TieredCompaction`` re-injects them after
+each tier. Tool call/result pairing stays valid across both tiers. There is no
+upstream signal for "the target could not be reached": nothing is silently
+dropped, but a host that needs to know should compare a post-compaction
+``ReportContextUsage`` reading against its own target.
 """
 
 import inspect
@@ -103,6 +136,9 @@ def build_compaction(
     *,
     summarizer_model: Model | None = None,
     summarizer_model_settings: ModelSettings | None = None,
+    cleared_placeholder: str | None = None,
+    summary_prompt: str | None = None,
+    receipts: bool = False,
 ) -> list[AbstractCapability[Any]]:
     """Build the compaction capability from settings (empty list if disabled).
 
@@ -116,6 +152,17 @@ def build_compaction(
             summarization should use a different provider, a cheaper model, or
             its own separately-attributed guard. An instance is handed to the
             summarizer untouched, never rebuilt from its display name.
+        cleared_placeholder: What a masked tool result is replaced with.
+            ``None`` keeps :data:`CLEARED_PLACEHOLDER`, which tells the model to
+            re-run the tool — correct for elja's idempotent built-ins, and an
+            invitation to repeat a side effect for anything else. A host with
+            write tools should pass text pointing at its own store instead.
+        summary_prompt: Replaces the summarization instruction. ``None`` keeps
+            elja's, which is the harness default plus a note about skills
+            unloading. A host with no skills has no reason to carry that note.
+        receipts: Leave a deterministic receipt where history was summarized
+            away, so the model treats its memory of earlier work as secondhand.
+            Off by default, as upstream has it.
 
             Deliberately a ``Model``, not a model *name*: a name makes the
             summarizer build a fresh provider client from environment
@@ -145,7 +192,9 @@ def build_compaction(
                 ClearToolResults(
                     max_tokens=1,
                     keep_pairs=cfg.keep_tool_pairs,
-                    placeholder=CLEARED_PLACEHOLDER,
+                    placeholder=(
+                        CLEARED_PLACEHOLDER if cleared_placeholder is None else cleared_placeholder
+                    ),
                 ),
                 SummarizingCompaction(
                     model=summarizer_model,
@@ -158,7 +207,10 @@ def build_compaction(
                     preserve_first_user_message=True,
                     incremental=True,
                     model_settings=summarizer_model_settings,
-                    summary_prompt=default_summary_prompt(),
+                    summary_prompt=(
+                        default_summary_prompt() if summary_prompt is None else summary_prompt
+                    ),
+                    receipts=receipts,
                 ),
             ],
             target_tokens=cfg.target_tokens,

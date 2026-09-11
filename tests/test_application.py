@@ -572,9 +572,9 @@ class TestStructuredOutputAndCapabilities:
         elja's placeholder invites the model to RE-RUN a cleared tool, which is
         safe for the convenience path's idempotent reads and unsafe for a host
         with side-effecting tools. It also names .elja/spill/, which this path
-        never creates. Until the placeholder is configurable here, the docstring
-        tells hosts to supply their own — and this test fails the moment the
-        text stops matching that advice.
+        never creates. The docstring tells hosts to pass their own via
+        build_compaction(cleared_placeholder=...), and this test fails the moment
+        the default text stops matching that advice.
         """
         from elja.compaction import CLEARED_PLACEHOLDER, build_compaction
         from elja.settings import CompactionConfig

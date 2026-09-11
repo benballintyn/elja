@@ -233,6 +233,33 @@ above; recorded rather than pretended to be covered.
   `ctx.deps.confirm` and is therefore typed to `EljaDeps`. A host with its own
   approval UX should gate inside its own toolset.
 
+## Composing compaction
+
+`build_compaction(settings, ...)` takes every part of the policy as an argument,
+because the defaults are tuned for a local workspace:
+
+| argument | why a host changes it |
+| --- | --- |
+| `cleared_placeholder` | The default says "re-run the tool if you need it again" and names `.elja/spill/`. Safe for idempotent reads in a workspace; an invitation to double-write anywhere else. Point it at your own store. |
+| `summary_prompt` | The default carries a note about reloading elja skills. A host with no skills has no reason to ship it. |
+| `summarizer_model` | A different provider, a cheaper model, or separate budget attribution (see above). |
+| `receipts` | Leaves a deterministic note where history was summarized away. With a capability implementing the harness's `TranscriptHandleProvider` protocol attached, the receipt carries a handle to your persisted transcript. |
+
+Replacing the policy wholesale is always available: build your own
+`TieredCompaction` and pass it as a capability instead of calling the factory.
+
+**Put `ReportContextUsage` last.** None of these capabilities declare an
+ordering, so list order decides what reporting measures. On one measured run the
+same turn reported 1177 tokens with reporting after compaction and 7239 with it
+before — the second number describes a request that was never sent.
+
+**What survives, measured not assumed.** Pinned parts
+(`pydantic_ai_harness.compaction.pin`) survive every tier, including when the
+pinned text alone exceeds the target. Tool call/result pairing stays valid across
+both tiers. There is no upstream signal for "the target could not be reached":
+nothing is silently dropped, but a host that needs to know should compare a
+post-compaction `ReportContextUsage` reading against its own target.
+
 ## Persistence
 
 History is caller-owned on the embedded path. Pass `message_history=` and
