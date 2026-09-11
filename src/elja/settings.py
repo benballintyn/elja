@@ -14,12 +14,21 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 
 import importlib
 import re
-from collections.abc import Iterable
+from collections.abc import Mapping
 from decimal import Decimal
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    create_model,
+    field_validator,
+    model_validator,
+)
 from pydantic_ai.settings import ModelSettings
 from pydantic_settings import (
     BaseSettings,
@@ -28,11 +37,10 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
-# Settings keys each provider dialect understands, on top of the portable
+# Settings each provider dialect understands, on top of the portable
 # ``ModelSettings`` ones. Imported lazily because anthropic/google live behind
-# extras; when the extra is missing we fall back to accepting the dialect's own
-# ``<provider>_`` prefix and let build_model raise the real "install the extra"
-# error.
+# extras — and only when a config actually sets ``[model.settings]``, so the
+# common case never drags a provider SDK into an ``import elja``.
 _SETTINGS_CLASSES = {
     "openai": ("pydantic_ai.models.openai", "OpenAIChatModelSettings"),
     "anthropic": ("pydantic_ai.models.anthropic", "AnthropicModelSettings"),
@@ -40,29 +48,63 @@ _SETTINGS_CLASSES = {
 }
 
 
-def unsupported_settings_keys(provider: str, keys: "Iterable[str]") -> list[str]:
-    """Which ``model.settings`` keys this provider dialect does not understand.
+@cache
+def _value_validator(dialect: type) -> type[BaseModel]:
+    """A model that validates one dialect's setting VALUES, not just its keys.
+
+    ``TypeAdapter`` cannot be configured for a ``TypedDict`` directly, and these
+    dialects annotate ``timeout`` as ``float | httpx.Timeout``, which needs
+    ``arbitrary_types_allowed``. A generated wrapper model supplies both.
+    """
+    return create_model(
+        f"_{dialect.__name__}Values",
+        __config__=ConfigDict(arbitrary_types_allowed=True),
+        settings=(dialect, ...),
+    )
+
+
+def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Check ``model.settings`` against one provider dialect, keys and values.
 
     Args:
         provider: A ``ModelConfig.provider`` value.
-        keys: The settings keys a config supplies.
+        settings: The settings a config supplies.
 
     Returns:
-        The offending keys, sorted. Empty means every key is valid. The check
-        covers the portable ``ModelSettings`` keys plus the provider's own. When
-        the provider's optional dependency is not installed its specific keys
-        cannot be enumerated, so ``<provider>_``-prefixed keys pass here and the
-        missing extra is reported by :func:`build_model` instead.
+        The settings with values coerced to their annotated types — which is
+        also how ``ELJA_MODEL__SETTINGS__TOP_P=0.9`` stops being the string
+        ``"0.9"`` by the time it reaches a provider.
+
+    Raises:
+        ValueError: If a key is not part of this dialect. A value that does not
+            match its annotation raises ``pydantic.ValidationError``, which is
+            also what a bad ``model.temperature`` raises.
     """
     portable = frozenset(ModelSettings.__annotations__)
     module_name, class_name = _SETTINGS_CLASSES[provider]
     try:
         module = importlib.import_module(module_name)
     except ImportError:
+        # Without the extra the dialect's own keys cannot be enumerated, let
+        # alone type-checked; accept its prefix and let build_model report the
+        # missing extra, which is the error the user actually needs.
         prefix = f"{provider}_"
-        return sorted(k for k in keys if k not in portable and not k.startswith(prefix))
-    allowed = portable | frozenset(getattr(module, class_name).__annotations__)
-    return sorted(set(keys) - allowed)
+        unknown = sorted(k for k in settings if k not in portable and not k.startswith(prefix))
+        _reject(provider, unknown)
+        return dict(settings)
+    dialect = getattr(module, class_name)
+    # Unknown keys must be rejected explicitly: pydantic silently DROPS extra
+    # keys from a TypedDict rather than complaining about them.
+    _reject(provider, sorted(set(settings) - portable - frozenset(dialect.__annotations__)))
+    validated = _value_validator(dialect)(settings=settings)
+    # create_model's product is dynamic, so mypy cannot see the field it defines.
+    return dict(validated.settings)  # type: ignore[attr-defined]
+
+
+def _reject(provider: str, unknown: list[str]) -> None:
+    """Raise for settings keys this provider dialect does not have."""
+    if unknown:
+        raise ValueError(f"unsupported model.settings key(s) for provider {provider!r}: {unknown}")
 
 
 class _Section(BaseModel):
@@ -119,19 +161,19 @@ class ModelConfig(_Section):
 
     @model_validator(mode="after")
     def _check_settings(self) -> "ModelConfig":
-        unknown = unsupported_settings_keys(self.provider, self.settings)
-        if unknown:
-            raise ValueError(
-                f"unsupported model.settings key(s) for provider {self.provider!r}: {unknown}"
-            )
+        # The overwhelmingly common case, and the one that runs when this class
+        # is constructed for EljaSettings' own default: nothing to check, and no
+        # provider SDK imported.
+        if not self.settings:
+            return self
         # Two spellings of one parameter is a config bug, not a precedence
         # puzzle — but only when the convenience field was set on purpose.
         both = ("temperature", "max_tokens")
         clash = sorted(k for k in both if k in self.settings and k in self.model_fields_set)
         if clash:
-            raise ValueError(
-                f"model.settings duplicates model.{clash[0]}; set it in one place only"
-            )
+            named = ", ".join(f"model.{k}" for k in clash)
+            raise ValueError(f"model.settings duplicates {named}; set each in one place only")
+        self.settings = validate_provider_settings(self.provider, self.settings)
         return self
 
 
@@ -141,8 +183,20 @@ class LimitsConfig(_Section):
     Every field maps to the same-named ``pydantic_ai.usage.UsageLimits``
     argument. ``request_limit`` keeps elja's own lower default (25 rather than
     upstream's 50); the rest default to ``None``, i.e. uncapped, so an existing
-    config resolves exactly as before. ``cost_limit`` is in provider currency
-    units and is only enforced for models pydantic-ai can price.
+    config resolves exactly as before.
+
+    Two fields come with conditions worth knowing before relying on them:
+
+    - ``cost_limit`` is in **USD** and is only enforced for models pydantic-ai
+      can price. On an unpriced model (the local default among them) the run's
+      cost is ``None``, the limit does nothing, and pydantic-ai emits a
+      ``CostNotFoundWarning`` on every request.
+    - ``count_tokens_before_request`` needs a provider that offers a
+      count-tokens call. Only ``anthropic`` and ``google`` do, so
+      :class:`EljaSettings` refuses it together with ``provider = "openai"``
+      rather than letting every request fail with ``NotImplementedError``.
+      ``per_request_input_tokens_limit`` works on every provider without it,
+      checked against the usage a response reports.
     """
 
     request_limit: int | None = 25
@@ -315,6 +369,23 @@ class EljaSettings(BaseSettings):
     compaction: CompactionConfig = CompactionConfig()
     skills: SkillsConfig = SkillsConfig()
     session: SessionConfig = SessionConfig()
+
+    @model_validator(mode="after")
+    def _check_cross_section(self) -> "EljaSettings":
+        # Only anthropic and google implement Model.count_tokens; for every
+        # other dialect the base method raises NotImplementedError, so the flag
+        # would kill each run before its first request instead of capping it.
+        if self.limits.count_tokens_before_request and self.model.provider not in (
+            "anthropic",
+            "google",
+        ):
+            raise ValueError(
+                "limits.count_tokens_before_request needs a provider with a count-tokens "
+                f"API: model.provider {self.model.provider!r} has none, so every request "
+                "would fail. Use 'anthropic' or 'google', or drop the flag — "
+                "per_request_input_tokens_limit is still enforced without it."
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(

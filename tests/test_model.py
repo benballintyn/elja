@@ -1,7 +1,10 @@
 """Tests for elja.model."""
 
+import asyncio
+
 import pytest
 from pydantic import SecretStr
+from pydantic_ai.models import ModelRequestParameters
 from pytest_mock import MockerFixture
 
 from elja.model import build_model
@@ -196,6 +199,19 @@ class TestNativeModelSettings:
         assert built.settings is not None
         assert built.settings.get("openai_reasoning_effort") == "high"
 
+    def test_google_reasoning_setting_reaches_the_model(self) -> None:
+        settings = EljaSettings(
+            model=ModelConfig(
+                provider="google",
+                name="gemini-2.5-pro",
+                api_key=SecretStr("k"),
+                settings={"google_thinking_config": {"thinking_budget": 2048}},
+            )
+        )
+        built = build_model(settings)
+        assert built.settings is not None
+        assert built.settings.get("google_thinking_config") == {"thinking_budget": 2048}
+
     def test_anthropic_thinking_setting_reaches_the_model(self) -> None:
         settings = EljaSettings(
             model=ModelConfig(
@@ -239,3 +255,90 @@ class TestNativeModelSettings:
         assert built.settings is not None
         assert built.settings.get("temperature") == 0.2
         assert built.settings.get("max_tokens") == 4096
+
+
+class TestSettingsAreNotShared:
+    """A built model must not reach back into the config it came from."""
+
+    def test_the_built_settings_are_a_copy_of_the_config(self) -> None:
+        cfg = ModelConfig(settings={"top_p": 0.4})
+        built = build_model(EljaSettings(model=cfg))
+        assert built.settings is not None
+        assert built.settings is not cfg.settings
+
+    def test_building_twice_does_not_accumulate_into_the_config(self) -> None:
+        """The shortcuts are merged into the request settings, not into config.
+
+        Aliasing instead of copying would write temperature/max_tokens back into
+        ModelConfig.settings, which also makes a later re-validation raise the
+        duplicate-parameter error.
+        """
+        cfg = ModelConfig(settings={"top_p": 0.4})
+        first = build_model(EljaSettings(model=cfg))
+        second = build_model(EljaSettings(model=cfg))
+        assert cfg.settings == {"top_p": 0.4}
+        assert first.settings is not second.settings
+        for built in (first, second):
+            assert built.settings is not None
+            assert built.settings.get("temperature") == 0.2
+
+    async def test_per_run_settings_do_not_leak_between_concurrent_runs(self) -> None:
+        """E3: no setting bleed between simultaneous runs."""
+        model = build_model(EljaSettings(model=ModelConfig(settings={"top_p": 0.4})))
+        before = dict(model.settings or {})
+        params = ModelRequestParameters()
+        resolved = await asyncio.gather(
+            *(
+                asyncio.to_thread(model.prepare_request, {"temperature": t}, params)
+                for t in (0.1, 0.5, 0.9)
+            )
+        )
+        seen = [(s or {}).get("temperature") for s, _ in resolved]
+        assert sorted(t for t in seen if t is not None) == [0.1, 0.5, 0.9]
+        # Each run still saw the agent-level settings, and none of them wrote back.
+        for merged, _ in resolved:
+            assert (merged or {}).get("top_p") == 0.4
+        assert dict(model.settings or {}) == before
+
+
+class TestRequestConstruction:
+    """Assert the settings that reach a REQUEST, not just the model attribute."""
+
+    def test_a_portable_thinking_level_is_resolved_out_of_the_request_settings(self) -> None:
+        """prepare_request lifts `thinking` into request params and strips it."""
+        settings = EljaSettings(
+            model=ModelConfig(
+                provider="anthropic",
+                name="claude-sonnet-5",
+                api_key=SecretStr("k"),
+                settings={"thinking": "high"},
+            )
+        )
+        merged, params = build_model(settings).prepare_request(None, ModelRequestParameters())
+        assert "thinking" not in (merged or {})
+        assert params.thinking == "high"
+
+    def test_provider_specific_settings_survive_request_preparation(self) -> None:
+        settings = EljaSettings(
+            model=ModelConfig(provider="openai", settings={"openai_reasoning_effort": "high"})
+        )
+        merged, _ = build_model(settings).prepare_request(None, ModelRequestParameters())
+        assert (merged or {}).get("openai_reasoning_effort") == "high"
+        assert (merged or {}).get("max_tokens") == 4096
+
+    def test_an_omitted_temperature_is_absent_from_the_request(self) -> None:
+        settings = EljaSettings(model=ModelConfig(temperature=None))
+        merged, _ = build_model(settings).prepare_request(None, ModelRequestParameters())
+        assert "temperature" not in (merged or {})
+
+    def test_a_google_request_carries_its_own_dialect_settings(self) -> None:
+        settings = EljaSettings(
+            model=ModelConfig(
+                provider="google",
+                name="gemini-2.5-pro",
+                api_key=SecretStr("k"),
+                settings={"google_thinking_config": {"thinking_budget": 2048}},
+            )
+        )
+        merged, _ = build_model(settings).prepare_request(None, ModelRequestParameters())
+        assert (merged or {}).get("google_thinking_config") == {"thinking_budget": 2048}
