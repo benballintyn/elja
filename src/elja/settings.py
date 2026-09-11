@@ -14,7 +14,7 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 
 import importlib
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from functools import cache
 from pathlib import Path
@@ -76,9 +76,10 @@ def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> di
         ``"0.9"`` by the time it reaches a provider.
 
     Raises:
-        ValueError: If a key is not part of this dialect. A value that does not
-            match its annotation raises ``pydantic.ValidationError``, which is
-            also what a bad ``model.temperature`` raises.
+        ValueError: If any key is not part of this dialect, at any depth. A
+            value that does not match its annotation raises
+            ``pydantic.ValidationError``, which is also what a bad
+            ``model.temperature`` raises.
     """
     portable = frozenset(ModelSettings.__annotations__)
     module_name, class_name = _SETTINGS_CLASSES[provider]
@@ -89,22 +90,69 @@ def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> di
         # alone type-checked; accept its prefix and let build_model report the
         # missing extra, which is the error the user actually needs.
         prefix = f"{provider}_"
-        unknown = sorted(k for k in settings if k not in portable and not k.startswith(prefix))
-        _reject(provider, unknown)
+        _reject(provider, [k for k in settings if k not in portable and not k.startswith(prefix)])
         return dict(settings)
     dialect = getattr(module, class_name)
-    # Unknown keys must be rejected explicitly: pydantic silently DROPS extra
-    # keys from a TypedDict rather than complaining about them.
-    _reject(provider, sorted(set(settings) - portable - frozenset(dialect.__annotations__)))
-    validated = _value_validator(dialect)(settings=settings)
-    # create_model's product is dynamic, so mypy cannot see the field it defines.
-    return dict(validated.settings)  # type: ignore[attr-defined]
+    validated = _materialize(_value_validator(dialect)(settings=settings).settings)  # type: ignore[attr-defined]
+    # Pydantic DROPS keys a TypedDict does not declare rather than complaining,
+    # at every depth. One walk of what came back finds all of them, so a typo
+    # inside google_thinking_config is refused exactly like one beside it —
+    # rather than silently disabling the setting it was meant to configure.
+    _reject(provider, _dropped_keys(settings, validated))
+    return dict(validated)
+
+
+def _materialize(value: Any) -> Any:  # noqa: ANN401 - walks arbitrary settings values
+    """Force pydantic's lazy ``Iterable[...]`` validators into real containers.
+
+    Three leaves in the shipped dialects are annotated ``Iterable[...]``
+    (``anthropic_context_management.edits``, ``anthropic_container.skills``,
+    ``openai_prediction.content``), and pydantic validates those lazily into a
+    ``ValidatorIterator`` that can be consumed exactly once. The settings dict
+    is reused for every request of every run, so without this the first request
+    carries the value and every later one carries an empty list — a provider
+    feature that silently switches itself off after one turn.
+    """
+    if isinstance(value, Mapping):
+        return {key: _materialize(item) for key, item in value.items()}
+    if isinstance(value, str | bytes) or not isinstance(value, Iterable):
+        return value
+    return [_materialize(item) for item in value]
+
+
+def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:  # noqa: ANN401
+    """Dotted paths of mapping keys that validation discarded.
+
+    Walks the two trees together. Sequences are compared positionally and only
+    when they are the same length, so a coercion that changes a list's shape is
+    left to pydantic's own error rather than reported as a missing key.
+    """
+    dropped: list[str] = []
+    if isinstance(original, Mapping):
+        if not isinstance(validated, Mapping):
+            return dropped
+        for key, value in original.items():
+            path = f"{prefix}{key}"
+            if key not in validated:
+                dropped.append(path)
+            else:
+                dropped.extend(_dropped_keys(value, validated[key], f"{path}."))
+    elif (
+        isinstance(original, list)
+        and isinstance(validated, list)
+        and len(original) == len(validated)
+    ):
+        for index, (left, right) in enumerate(zip(original, validated, strict=True)):
+            dropped.extend(_dropped_keys(left, right, f"{prefix}{index}."))
+    return dropped
 
 
 def _reject(provider: str, unknown: list[str]) -> None:
     """Raise for settings keys this provider dialect does not have."""
     if unknown:
-        raise ValueError(f"unsupported model.settings key(s) for provider {provider!r}: {unknown}")
+        raise ValueError(
+            f"unsupported model.settings key(s) for provider {provider!r}: {sorted(unknown)}"
+        )
 
 
 class _Section(BaseModel):
@@ -168,8 +216,19 @@ class ModelConfig(_Section):
             return self
         # Two spellings of one parameter is a config bug, not a precedence
         # puzzle — but only when the convenience field was set on purpose.
+        # "Set on purpose" is a property of the VALUE, not of how the object was
+        # built: model_dump() emits every field, so keying this on
+        # model_fields_set would make a dump/reload round trip raise on a config
+        # that validated. Comparing against the default also subsumes
+        # model_fields_set — an unset field always holds its default — so there
+        # is one condition here rather than two that mask each other. The cost
+        # is that writing the default value explicitly beside a settings entry is
+        # no longer flagged.
         both = ("temperature", "max_tokens")
-        clash = sorted(k for k in both if k in self.settings and k in self.model_fields_set)
+        fields = type(self).model_fields
+        clash = sorted(
+            k for k in both if k in self.settings and getattr(self, k) != fields[k].default
+        )
         if clash:
             named = ", ".join(f"model.{k}" for k in clash)
             raise ValueError(f"model.settings duplicates {named}; set each in one place only")
@@ -372,19 +431,24 @@ class EljaSettings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_cross_section(self) -> "EljaSettings":
-        # Only anthropic and google implement Model.count_tokens; for every
-        # other dialect the base method raises NotImplementedError, so the flag
-        # would kill each run before its first request instead of capping it.
-        if self.limits.count_tokens_before_request and self.model.provider not in (
-            "anthropic",
-            "google",
-        ):
-            raise ValueError(
-                "limits.count_tokens_before_request needs a provider with a count-tokens "
-                f"API: model.provider {self.model.provider!r} has none, so every request "
-                "would fail. Use 'anthropic' or 'google', or drop the flag — "
-                "per_request_input_tokens_limit is still enforced without it."
-            )
+        if self.limits.count_tokens_before_request:
+            # Deferred import: elja.model imports this module. It also means the
+            # provider SDK is only touched by a config that sets this flag.
+            from elja.model import provider_implements_count_tokens
+
+            # Asked of the CLASS elja would build, not of a hardcoded provider
+            # list, so this stays true if upstream adds the method later.
+            if not provider_implements_count_tokens(self.model.provider):
+                raise ValueError(
+                    "limits.count_tokens_before_request needs a model that implements "
+                    f"count_tokens. model.provider {self.model.provider!r} builds "
+                    "OpenAIChatModel, which does not, so pydantic-ai would raise "
+                    "NotImplementedError before the first request. Use 'anthropic' or "
+                    "'google', or drop the flag — per_request_input_tokens_limit is "
+                    "enforced without it. A host injecting its own model should check "
+                    "elja.model.implements_count_tokens(model) instead: this setting "
+                    "describes the model elja would build, not the one you passed."
+                )
         return self
 
     @classmethod

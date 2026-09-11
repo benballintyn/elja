@@ -1,15 +1,18 @@
 """Tests for elja.settings."""
 
+import json
+import os
 import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 import pytest
 from pydantic import SecretStr, ValidationError
 from pytest_mock import MockerFixture
 
+import elja
 from elja.settings import (
     EljaSettings,
     LimitsConfig,
@@ -165,18 +168,38 @@ class TestModelSettingsValidation:
         )
         assert cfg.settings == {"google_thinking_config": {"thinking_budget": 1024}}
 
-    def test_an_unknown_key_nested_inside_a_value_is_dropped_not_refused(self) -> None:
-        """A documented limit: pydantic silently drops extras inside a TypedDict.
+    def test_an_unknown_key_nested_inside_a_value_is_refused_by_its_path(self) -> None:
+        """A typo one level down must not silently disable the setting.
 
-        Top-level keys are rejected by name because elja checks them itself;
-        one level down there is no hook to forbid them, so a typo vanishes
-        rather than raising. Pinned so the behavior is known, not discovered.
+        Pydantic drops undeclared TypedDict keys at every depth, and pydantic-ai
+        reads `if config := model_settings.get(...)`, so a misspelled budget
+        leaves an empty dict that reads as "reasoning off". Before this check the
+        provider SDK would at least have refused the request by name.
         """
-        cfg = ModelConfig(
-            provider="google",
-            settings={"google_thinking_config": {"thinking_budget": 8, "typo_here": 1}},
-        )
-        assert cfg.settings == {"google_thinking_config": {"thinking_budget": 8}}
+        with pytest.raises(ValidationError, match=r"google_thinking_config\.typo_here"):
+            ModelConfig(
+                provider="google",
+                settings={"google_thinking_config": {"thinking_budget": 8, "typo_here": 1}},
+            )
+
+    def test_a_typo_beside_a_valid_key_is_still_refused_at_the_top_level(self) -> None:
+        with pytest.raises(ValidationError, match=r"'nonsense'"):
+            ModelConfig(settings={"top_p": 0.5, "nonsense": 1})
+
+    def test_a_value_coerced_to_a_different_shape_is_left_to_pydantic(self) -> None:
+        """Walking two trees only reports MISSING keys, never a type change.
+
+        ``google_safety_settings`` promotes plain strings into enum objects, so
+        the validated value is no longer a mapping; the walk must say nothing
+        rather than invent a dropped key.
+        """
+        from elja.settings import _dropped_keys
+
+        assert _dropped_keys({"a": {"b": 1}}, {"a": "now-a-string"}) == []
+        assert _dropped_keys({"a": {"b": 1}}, {"a": {}}) == ["a.b"]
+        # Lists of differing length are pydantic's problem, not a missing key.
+        assert _dropped_keys({"a": [{"b": 1}]}, {"a": []}) == []
+        assert _dropped_keys({"a": [{"b": 1}]}, {"a": [{}]}) == ["a.0.b"]
 
     def test_portable_keys_are_accepted_for_every_provider(self) -> None:
         for provider in ("openai", "anthropic", "google"):
@@ -241,12 +264,18 @@ class TestImportWeight:
         into every `import elja` and defeated model.py's lazy provider imports.
         A subprocess, because this session has already imported plenty.
         """
+        # Point the subprocess at the tree under test. Without cwd/PYTHONPATH it
+        # imports whatever `elja` happens to be installed, so in a git worktree
+        # or against a built wheel the check silently measures a different file.
+        root = str(Path(elja.__file__).resolve().parent.parent)
         result = subprocess.run(
             [sys.executable, "-c", "import elja, sys; print('openai' in sys.modules)"],
             capture_output=True,
             text=True,
             check=True,
             timeout=120,
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": root},
         )
         assert result.stdout.strip() == "False"
 
@@ -280,6 +309,121 @@ class TestSettingsValuesAreValidatedToo:
         assert cfg.settings["anthropic_thinking"]["budget_tokens"] == 2048
 
 
+class TestLazyValidatorsAreMaterialized:
+    """A pydantic ``Iterable[...]`` leaf validates into a one-shot iterator.
+
+    The settings dict is reused for every request of every run, so an unforced
+    iterator means the first request carries the value and every later one
+    carries an empty list — a provider feature that switches itself off after
+    one turn, with no error anywhere.
+    """
+
+    def test_a_list_valued_nested_setting_can_be_consumed_twice(self) -> None:
+        cfg = ModelConfig(
+            provider="anthropic",
+            name="claude-sonnet-5",
+            settings={
+                "anthropic_context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]}
+            },
+        )
+        edits = cfg.settings["anthropic_context_management"]["edits"]
+        # Equality alone would pass against a fresh iterator; consume it twice.
+        assert list(edits) == [{"type": "clear_tool_uses_20250919"}]
+        assert list(edits) == [{"type": "clear_tool_uses_20250919"}]
+        assert isinstance(edits, list)
+
+    def test_the_resolved_config_stays_json_serializable(self) -> None:
+        """A host that logs or persists its resolved config must not break."""
+        cfg = ModelConfig(
+            provider="anthropic",
+            name="claude-sonnet-5",
+            settings={
+                "anthropic_context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]}
+            },
+        )
+        assert json.loads(json.dumps(cfg.model_dump()))["settings"][
+            "anthropic_context_management"
+        ]["edits"] == [{"type": "clear_tool_uses_20250919"}]
+
+    def test_the_built_model_carries_the_value_on_every_request(self) -> None:
+        from pydantic_ai.models import ModelRequestParameters
+
+        from elja.model import build_model
+
+        settings = EljaSettings(
+            model=ModelConfig(
+                provider="anthropic",
+                name="claude-sonnet-5",
+                api_key=SecretStr("k"),
+                settings={
+                    "anthropic_context_management": {
+                        "edits": [{"type": "clear_tool_uses_20250919"}]
+                    }
+                },
+            )
+        )
+        model = build_model(settings)
+        params = ModelRequestParameters()
+        first, _ = model.prepare_request(None, params)
+        second, _ = model.prepare_request(None, params)
+        for merged in (first, second):
+            # dict(...) so mypy does not read this as a ModelSettings key lookup;
+            # the dialect's own keys are not in the portable TypedDict.
+            management = cast("dict[str, Any]", dict(merged or {})["anthropic_context_management"])
+            assert list(management["edits"]) == [{"type": "clear_tool_uses_20250919"}]
+
+
+class TestValidationIsIdempotent:
+    """A resolved config must survive its own serialization round trip."""
+
+    def test_a_model_config_round_trip_does_not_raise(self) -> None:
+        cfg = ModelConfig(settings={"temperature": 0.7})
+        again = ModelConfig.model_validate(cfg.model_dump())
+        assert again.settings["temperature"] == 0.7
+
+    def test_a_whole_settings_round_trip_does_not_raise(self) -> None:
+        original = EljaSettings(model=ModelConfig(settings={"max_tokens": 100}))
+        again = EljaSettings.model_validate(original.model_dump())
+        assert again.model.settings["max_tokens"] == 100
+
+    def test_an_explicit_non_default_value_is_still_a_clash(self) -> None:
+        """The round-trip fix must not disarm the check it replaced."""
+        with pytest.raises(ValidationError, match=r"duplicates model\.temperature"):
+            ModelConfig(temperature=0.5, settings={"temperature": 0.7})
+
+
+class TestCountTokensSupportIsAskedOfTheModel:
+    def test_the_capability_is_read_from_the_class_not_a_provider_list(self) -> None:
+        from pydantic_ai.models import Model
+        from pydantic_ai.models.anthropic import AnthropicModel
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        from elja.model import implements_count_tokens
+
+        # `is Model.count_tokens` rather than a __dict__ check: a shared base
+        # class inserted upstream would fool the latter.
+        assert OpenAIChatModel.count_tokens is Model.count_tokens
+        assert not implements_count_tokens(OpenAIChatModel)
+        assert implements_count_tokens(AnthropicModel)
+        assert implements_count_tokens(GoogleModel)
+
+    def test_it_accepts_an_instance_as_well_as_a_class(self) -> None:
+        from pydantic_ai.models.function import FunctionModel
+
+        from elja.model import implements_count_tokens
+
+        model = FunctionModel(lambda m, i: None)  # type: ignore[arg-type,return-value]
+        assert not implements_count_tokens(model)
+
+    def test_a_missing_extra_does_not_block_the_flag(self, mocker: MockerFixture) -> None:
+        """build_model's "install the extra" error is the one the user needs."""
+        from elja.model import provider_implements_count_tokens
+
+        mocker.patch("elja.model.importlib.import_module", side_effect=ImportError("no google"))
+        assert provider_implements_count_tokens("google") is True
+
+
 class TestCountTokensBeforeRequestIsRefusedWhereUnsupported:
     """OpenAIChatModel has no count-tokens API; the base method raises."""
 
@@ -299,16 +443,6 @@ class TestCountTokensBeforeRequestIsRefusedWhereUnsupported:
 
     def test_the_flag_off_is_fine_everywhere(self) -> None:
         assert EljaSettings().limits.count_tokens_before_request is False
-
-    def test_only_anthropic_and_google_implement_count_tokens(self) -> None:
-        """The premise behind the refusal, pinned against the installed SDK."""
-        from pydantic_ai.models.anthropic import AnthropicModel
-        from pydantic_ai.models.google import GoogleModel
-        from pydantic_ai.models.openai import OpenAIChatModel
-
-        assert "count_tokens" not in OpenAIChatModel.__dict__
-        assert "count_tokens" in AnthropicModel.__dict__
-        assert "count_tokens" in GoogleModel.__dict__
 
 
 _COUNT_CEILINGS = [

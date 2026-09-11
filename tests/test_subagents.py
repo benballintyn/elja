@@ -263,6 +263,10 @@ class TestBudget:
         assert result.output == "handled"
         assert any("budget exhausted" in s for s in seen_result)
         assert any("Do not delegate this again" in s for s in seen_result)
+        # The child got its OWN request out of the budget. Without the
+        # ctx.usage.requests offset the limit would be absolute, already spent by
+        # the parent's first request, and the child would never be asked at all.
+        assert len(child_requests) == 1
 
     async def test_a_child_inherits_every_ceiling_but_request_limit(
         self, tmp_path: Path, mocker: MockerFixture

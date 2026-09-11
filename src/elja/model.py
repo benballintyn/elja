@@ -15,6 +15,7 @@ Everything above this factory operates on pydantic-ai's normalized types, so
 tools, skills, compaction, sessions, and sub-agents are provider-independent.
 """
 
+import importlib
 import os
 from typing import Any, cast
 
@@ -109,6 +110,53 @@ def _build_google(cfg: ModelConfig) -> Model:
         else GoogleProvider(api_key=key, base_url=cfg.base_url)
     )
     return GoogleModel(cfg.name, provider=provider, settings=_model_settings(cfg))
+
+
+# Which class each provider dialect builds. Used to answer capability
+# questions about a model elja has not built yet.
+_MODEL_CLASSES = {
+    "openai": ("pydantic_ai.models.openai", "OpenAIChatModel"),
+    "anthropic": ("pydantic_ai.models.anthropic", "AnthropicModel"),
+    "google": ("pydantic_ai.models.google", "GoogleModel"),
+}
+
+
+def implements_count_tokens(model: "Model | type[Model]") -> bool:
+    """Whether this model can count a request's tokens before sending it.
+
+    ``UsageLimits.count_tokens_before_request`` makes pydantic-ai call
+    ``Model.count_tokens`` before **every** request, and the base implementation
+    raises ``NotImplementedError``. So a model that does not override it turns
+    that flag from an ineffective setting into a run that dies on its first
+    request.
+
+    A host injecting its own model should check it here rather than inferring
+    support from a provider name: ``model.provider`` describes the model elja
+    *would build*, which on the application path is not the model being used.
+
+    Args:
+        model: A model instance or class.
+
+    Returns:
+        True if the class overrides ``count_tokens``.
+    """
+    klass = model if isinstance(model, type) else type(model)
+    return klass.count_tokens is not Model.count_tokens
+
+
+def provider_implements_count_tokens(provider: str) -> bool:
+    """Whether the model elja builds for this provider can count tokens.
+
+    Returns True when the provider's optional dependency is missing, because
+    the class cannot be inspected and :func:`build_model` will report the
+    missing extra first — a clearer error than a capability complaint.
+    """
+    module_name, class_name = _MODEL_CLASSES[provider]
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return True
+    return implements_count_tokens(getattr(module, class_name))
 
 
 def effective_endpoint(cfg: ModelConfig) -> str:

@@ -61,9 +61,9 @@ max_tokens = 4096        # (same: "" means "send no max_tokens"). Works in TOML
 # ANTHROPIC_API_KEY / GOOGLE_API_KEY from the environment.
 
 # Any other native pydantic-ai ModelSettings key. Keys AND values are checked
-# against the selected provider's own dialect, so an unsupported key or a
-# wrongly typed value is a config error rather than a 400 at request time.
-# (Unknown keys NESTED inside a value are dropped by pydantic, not refused.)
+# against the selected provider's own dialect, at every depth, so an unsupported
+# key or a wrongly typed value is a config error naming its path rather than a
+# 400 at request time (or, worse, a typo that silently disables a setting).
 [model.settings]
 top_p = 0.9
 # Reasoning controls are the provider's own — no elja-side enum:
