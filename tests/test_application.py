@@ -6,7 +6,9 @@ assembled behind its back, an explicit empty choice stays empty, and two
 agents cannot contaminate each other.
 """
 
+import ast
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_type
@@ -15,12 +17,22 @@ import pytest
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 from pytest_mock import MockerFixture
 
+import elja.application
 from elja.application import build_application_agent
 from elja.settings import EljaSettings
 
@@ -43,6 +55,39 @@ def _capture(seen: dict[str, Any]) -> FunctionModel:
         return ModelResponse(parts=[TextPart(content="ok")])
 
     return FunctionModel(script)
+
+
+# Long enough that a loaded machine does not flake, short enough that a test
+# which stops overlapping FAILS in seconds instead of hanging until the runner
+# gives up.
+_OVERLAP_TIMEOUT = 10.0
+
+
+def _capture_async(
+    seen: dict[str, Any], gate: asyncio.Barrier, both: asyncio.Event
+) -> FunctionModel:
+    """Like _capture, but each call waits for the other run to reach the model.
+
+    A sync FunctionModel script runs to completion with no await point, so
+    asyncio.gather would serialize the two runs and the test would observe no
+    concurrency at all.
+
+    The wait is BOUNDED: if the second run never arrives, the barrier times out,
+    ``both`` stays unset, and the caller's assertion fails. A test that can only
+    hang proves nothing about what it was supposed to catch.
+    """
+
+    async def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        with contextlib.suppress(TimeoutError, asyncio.BrokenBarrierError):
+            async with asyncio.timeout(_OVERLAP_TIMEOUT):
+                await gate.wait()
+            both.set()
+        seen["instructions"] = info.instructions
+        seen["tool_names"] = sorted(t.name for t in info.function_tools)
+        seen["model_settings"] = info.model_settings
+        return ModelResponse(parts=[TextPart(content="ok")])
+
+    return FunctionModel(function=script)
 
 
 def _household_toolset() -> FunctionToolset[HouseholdDeps]:
@@ -109,25 +154,49 @@ class TestCallerOwnedDependencies:
 class TestNothingImplicitHappens:
     """Acceptance 2: the application path assembles only what it was given."""
 
-    async def test_no_elja_builder_is_invoked(self, mocker: MockerFixture) -> None:
-        spies = {
-            name: mocker.patch(f"elja.{module}.{name}")
-            for module, name in (
-                ("tools", "build_toolset"),
-                ("skills", "load_skills"),
-                ("mcp", "build_mcp_toolsets"),
-                ("subagents", "build_subagent_toolset"),
-                ("permissions", "build_permission_gate"),
-                ("compaction", "build_compaction"),
-            )
-        }
+    def test_the_application_module_imports_nothing_from_elja(self) -> None:
+        """A from-import is how the machinery would creep back in.
+
+        Patching ``elja.<module>.<name>`` cannot detect it: elja's house style
+        binds imported symbols into the importing module before any test runs.
+        So pin it statically instead — this module must depend on pydantic-ai
+        alone.
+        """
+        tree = ast.parse(Path(elja.application.__file__).read_text(encoding="utf-8"))
+        offenders = [
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("elja")
+        ] + [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name.startswith("elja")
+        ]
+        assert offenders == []
+
+    async def test_no_process_is_spawned_and_no_directory_is_scanned(
+        self, mocker: MockerFixture
+    ) -> None:
+        """The scan and subprocess clauses of the acceptance criterion.
+
+        Patched at the primitives, not at elja's own functions, so any route to
+        them is caught — including one added by a future edit to this module.
+        """
+        popen = mocker.patch("subprocess.Popen")
+        run = mocker.patch("subprocess.run")
+        mkdir = mocker.patch("pathlib.Path.mkdir")
+        scandir = mocker.patch("os.scandir")
         seen: dict[str, Any] = {}
         agent = build_application_agent(
             _capture(seen), deps_type=HouseholdDeps, toolsets=[_household_toolset()]
         )
         await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
-        for name, spy in spies.items():
-            assert spy.call_count == 0, f"{name} ran on the application path"
+        assert popen.call_count == 0
+        assert run.call_count == 0
+        assert mkdir.call_count == 0
+        assert scandir.call_count == 0
 
     async def test_only_the_callers_tools_are_offered(self) -> None:
         """No read_file/write_file/list_dir/run_shell/web_search sneaks in."""
@@ -173,7 +242,7 @@ class TestEmptyStaysEmpty:
             _capture(seen), deps_type=HouseholdDeps, instructions=instructions
         )
         await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
-        assert not seen["instructions"]
+        assert seen["instructions"] is None
 
     async def test_the_convenience_path_still_defaults_its_prompt(self, tmp_path: Path) -> None:
         """The contrast that makes the distinction documented, not theoretical."""
@@ -205,15 +274,17 @@ class TestNoCrossAgentBleed:
         seen_b: dict[str, Any] = {}
         deps_a = HouseholdDeps(tenant="a", calls=[])
         deps_b = HouseholdDeps(tenant="b", calls=[])
+        gate = asyncio.Barrier(2)
+        both_in_flight = asyncio.Event()
         agent_a = build_application_agent(
-            _capture(seen_a),
+            _capture_async(seen_a, gate, both_in_flight),
             deps_type=HouseholdDeps,
             instructions="agent A",
             toolsets=[_household_toolset()],
             model_settings={"temperature": 0.1},
         )
         agent_b = build_application_agent(
-            _capture(seen_b),
+            _capture_async(seen_b, gate, both_in_flight),
             deps_type=HouseholdDeps,
             instructions="agent B",
             model_settings={"temperature": 0.9},
@@ -222,6 +293,7 @@ class TestNoCrossAgentBleed:
             agent_a.run("x", deps=deps_a),
             agent_b.run("y", deps=deps_b),
         )
+        assert both_in_flight.is_set(), "the two runs never actually overlapped"
         assert seen_a["instructions"] == "agent A"
         assert seen_b["instructions"] == "agent B"
         assert seen_a["tool_names"] == ["note_fact"]
@@ -295,7 +367,7 @@ class TestModelPassthrough:
 
     def test_a_model_name_string_is_accepted(self) -> None:
         agent = build_application_agent("test", deps_type=HouseholdDeps)
-        assert agent.model is not None
+        assert isinstance(agent.model, TestModel)
 
 
 class Reminder(BaseModel):
@@ -374,6 +446,88 @@ class TestStructuredOutputAndCapabilities:
         )
         result = await agent.run("hi", deps=HouseholdDeps(tenant="t", calls=[]))
         assert result.output == "ok"
+
+    async def test_the_default_cleared_placeholder_is_wrong_for_a_hosts_own_tools(
+        self,
+    ) -> None:
+        """Pins the caveat the module docstring carries, so it cannot go stale.
+
+        elja's placeholder invites the model to RE-RUN a cleared tool, which is
+        safe for the convenience path's idempotent reads and unsafe for a host
+        with side-effecting tools. It also names .elja/spill/, which this path
+        never creates. Until the placeholder is configurable here, the docstring
+        tells hosts to supply their own — and this test fails the moment the
+        text stops matching that advice.
+        """
+        from elja.compaction import CLEARED_PLACEHOLDER, build_compaction
+        from elja.settings import CompactionConfig
+
+        # A target masking alone can reach, so the placeholder is what the
+        # model sees; a tighter target escalates to summarization and replaces it.
+        settings = EljaSettings(
+            compaction=CompactionConfig(target_tokens=3000, keep_tool_pairs=1, keep_messages=2)
+        )
+        views: list[list[ModelMessage]] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                return ModelResponse(parts=[TextPart(content="## Intent\nwork")])
+            views.append(list(messages))
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        agent = build_application_agent(
+            FunctionModel(script),
+            deps_type=HouseholdDeps,
+            toolsets=[_household_toolset()],
+            capabilities=build_compaction(settings),
+        )
+        history: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content="keep the records")])
+        ]
+        for i in range(8):
+            history.append(
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name="note_fact", args={"fact": f"f{i}"}, tool_call_id=f"c{i}"
+                        )
+                    ]
+                )
+            )
+            history.append(
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name="note_fact",
+                            content=f"noted{i} " * 600,
+                            tool_call_id=f"c{i}",
+                        )
+                    ]
+                )
+            )
+        await agent.run(
+            "carry on", message_history=history, deps=HouseholdDeps(tenant="t", calls=[])
+        )
+        assert views, "the agent never ran"
+        rendered = str(views[0])
+        assert CLEARED_PLACEHOLDER in rendered
+        # The two claims the docstring warns about, pinned as present.
+        assert "re-run the tool" in CLEARED_PLACEHOLDER
+        assert ".elja/spill/" in CLEARED_PLACEHOLDER
+
+    async def test_the_widened_options_reach_the_agent(self) -> None:
+        """A host must not have to abandon this path for a standard option."""
+        agent = build_application_agent(
+            "test",
+            deps_type=HouseholdDeps,
+            name="household-agent",
+            retries=0,
+            end_strategy="exhaustive",
+            tool_timeout=12.5,
+            max_concurrency=3,
+        )
+        assert agent.name == "household-agent"
+        assert agent.end_strategy == "exhaustive"
 
 
 def test_overloads_infer_the_output_type() -> None:

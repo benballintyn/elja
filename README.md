@@ -51,9 +51,11 @@ dependencies and persistence wants the other door, which assembles **nothing
 you did not ask for**:
 
 ```python
+import asyncio
 from dataclasses import dataclass
 
 from pydantic_ai import RunContext
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.toolsets import FunctionToolset
 
 from elja import build_application_agent
@@ -62,7 +64,7 @@ from elja import build_application_agent
 @dataclass
 class AppDeps:            # your own type — no EljaDeps, no workspace
     tenant: str
-    repo: "Repository"
+    records: list[str]
 
 
 toolset: FunctionToolset[AppDeps] = FunctionToolset()
@@ -71,25 +73,42 @@ toolset: FunctionToolset[AppDeps] = FunctionToolset()
 @toolset.tool
 async def record_fact(ctx: RunContext[AppDeps], fact: str) -> str:
     """A domain tool: it gets your deps object, untouched."""
-    return await ctx.deps.repo.add(ctx.deps.tenant, fact)
+    ctx.deps.records.append(fact)
+    return f"recorded for {ctx.deps.tenant}"
 
 
 agent = build_application_agent(
-    my_model,                     # a Model instance, passed through untouched
+    AnthropicModel("claude-sonnet-5"),   # your Model, passed through untouched
     deps_type=AppDeps,
     instructions="You keep a household's records.",
     toolsets=[toolset],
 )
-result = await agent.run("remember the vet is tuesday", deps=AppDeps(...))
+
+
+async def main() -> None:
+    result = await agent.run(
+        "remember the vet is tuesday",
+        deps=AppDeps(tenant="acme", records=[]),
+    )
+    print(result.output)
+
+
+asyncio.run(main())
 ```
 
 No file/shell/web-search tools, no skills directory scan, no MCP subprocess, no
 `.elja` writes, no workspace. The return value is a native `pydantic_ai.Agent`,
 so `run_stream_events`, `message_history`, `output_type`, per-run
-`model_settings`, `usage` and `usage_limits` all behave as they do upstream.
+`model_settings`, `usage` and `usage_limits` all behave as they do upstream, and
+the standard agent options (`name`, `retries`, `end_strategy`, `tool_timeout`,
+`max_concurrency`) are all reachable.
+
 elja's own capabilities stay available by opting in, e.g.
-`capabilities=build_compaction(settings)`. See `elja/application.py` for the
-full contract, including how `None` and empty differ between the two paths.
+`capabilities=build_compaction(settings)` — but read `elja/application.py`
+first: the default compaction placeholder tells the model to *re-run* a cleared
+tool and names `.elja/spill/`, and neither is right for a host with
+side-effecting tools and no workspace. That docstring also covers how `None` and
+empty differ between the two paths.
 
 Configuration lives in `elja.toml` (all keys optional; `ELJA_*` env vars
 override, e.g. `ELJA_MODEL__BASE_URL`):
