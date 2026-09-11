@@ -29,6 +29,7 @@ import inspect
 from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.models import KnownModelName, Model
 from pydantic_ai_harness.compaction import (
     ClearToolResults,
     SummarizingCompaction,
@@ -55,11 +56,23 @@ _SUMMARY_PROMPT: str = str(
 )
 
 
-def build_compaction(settings: EljaSettings) -> list[AbstractCapability[Any]]:
+def build_compaction(
+    settings: EljaSettings,
+    *,
+    summarizer_model: Model | KnownModelName | str | None = None,
+) -> list[AbstractCapability[Any]]:
     """Build the compaction capability from settings (empty list if disabled).
 
     Args:
         settings: Resolved elja settings.
+        summarizer_model: The model the summarization tier writes summaries
+            with. ``None`` (the default, and the behavior before this argument
+            existed) inherits the running agent's own model *object*, so a
+            wrapper that meters or gates requests governs summarization too —
+            verified in ``tests/test_metering.py``. Pass a model explicitly when
+            summarization should use a different provider, a cheaper model, or
+            its own separately-attributed guard. An instance is handed to the
+            summarizer untouched, never rebuilt from its display name.
 
     Returns:
         A single tiered compaction capability, or ``[]`` when disabled.
@@ -80,6 +93,7 @@ def build_compaction(settings: EljaSettings) -> list[AbstractCapability[Any]]:
                     placeholder=CLEARED_PLACEHOLDER,
                 ),
                 SummarizingCompaction(
+                    model=summarizer_model,
                     max_messages=1,
                     keep_messages=cfg.keep_messages,
                     # Token-bound the verbatim tail so the target is always

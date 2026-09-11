@@ -111,7 +111,9 @@ elja's own capabilities stay available by opting in, e.g.
 first: the default compaction placeholder tells the model to *re-run* a cleared
 tool and names `.elja/spill/`, and neither is right for a host with
 side-effecting tools and no workspace. That docstring also covers how `None` and
-empty differ between the two paths.
+empty differ between the two paths, and
+[docs/EMBEDDING.md](docs/EMBEDDING.md) covers metering, admission control and
+the limits of what elja enforces.
 
 Configuration lives in `elja.toml` (all keys optional; `ELJA_*` env vars
 override, e.g. `ELJA_MODEL__BASE_URL`):

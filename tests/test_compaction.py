@@ -192,6 +192,69 @@ class TestSummarizationTier:
         assert result2.output == "ok"
         assert len(summarizer_calls) == first_round
 
+    async def test_the_token_bounded_tail_is_what_stops_the_summarizer_refiring(
+        self, tmp_path: Path
+    ) -> None:
+        """keep_tokens, not keep_messages, is what makes the target reachable.
+
+        Starts from the state that can actually fail: keep_messages (30) exceeds
+        the whole transcript, so the verbatim tail is irreducible by message
+        count alone. Without the token bound the summarizer fires on EVERY
+        request (measured: S a S a S a S a); with it, exactly once (S a a a a).
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(target_tokens=1000, keep_tool_pairs=1, keep_messages=30),
+        )
+        summarizer_calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                summarizer_calls.append(1)
+                return ModelResponse(parts=[TextPart(content="## Intent\nshort summary")])
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(settings),
+        )
+        deps = EljaDeps.from_settings(settings)
+        history = _history_with_tool_pairs(20, result_size=600)
+        for turn in range(4):
+            result = await agent.run(f"turn{turn}", message_history=history, deps=deps)
+            history = list(result.all_messages())
+        assert result.output == "ok"
+        # One summarization for the whole conversation, not one per request.
+        assert len(summarizer_calls) == 1
+
+    async def test_the_first_user_message_survives_summarization(self, tmp_path: Path) -> None:
+        """Dropping the original task is the documented failure mode."""
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(target_tokens=1000, keep_tool_pairs=1, keep_messages=2),
+        )
+        agent_views: list[list[ModelMessage]] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                return ModelResponse(parts=[TextPart(content="## Intent\naudit files")])
+            agent_views.append(list(messages))
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(settings),
+        )
+        await agent.run(
+            "continue",
+            message_history=_history_with_tool_pairs(8, result_size=600),
+            deps=EljaDeps.from_settings(settings),
+        )
+        assert agent_views, "the agent never ran"
+        assert "original task: audit the files" in str(agent_views[0])
+
     async def test_streaming_path_persists_compacted_session(self, tmp_path: Path) -> None:
         """The CLI's run_turn (event streaming) saves the compacted history."""
         from collections.abc import AsyncIterator
