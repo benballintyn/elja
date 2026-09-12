@@ -7,6 +7,7 @@ from pytest_mock import MockerFixture
 
 from elja.settings import EljaSettings, SkillsConfig, WorkspaceConfig
 from elja.skills import SkillError, load_skills
+from tests.conftest import narrow_terminal
 
 
 def write_skill(path: Path, skill_id: str = "greeting", body: str = "Always say hello.") -> None:
@@ -242,18 +243,83 @@ class TestAgentIntegration:
 
 class TestReplSkillErrors:
     async def test_startup_skill_error_is_clean(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
     ) -> None:
         from elja.cli import repl
 
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
         (skills_dir / "broken.md").write_text("no frontmatter at all")
+        narrow_terminal(mocker, str(skills_dir / "broken.md"))
         settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
         await repl(settings, "s", once="hi")  # must not raise
         out = capsys.readouterr().out
         assert "cannot start agent" in out
-        assert "broken.md" in out
+        # The WHOLE path, not just the filename. Asserting "broke\nn.md" not in
+        # out can never fail: it is only false when "broken.md" in out is already
+        # false, and pytest stops at the first failure. And "broken.md" alone is
+        # tuned to one path length — the original flake was $TMPDIR, not terminal
+        # width, so a short TMPDIR moved rich's break offset into the filename
+        # while a normal one left the bug live and the assertion passing.
+        assert str(skills_dir / "broken.md") in out
+
+    async def test_a_midsession_skill_break_names_the_whole_path(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """The likelier scenario: you edit a skill while the REPL is running.
+
+        This goes through the agent-rebuild warning, a different door from the
+        startup error, and one the first version of this fix missed.
+        """
+        from elja.cli import repl
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        good = "---\nid: greeting\ndescription: says hello\n---\nsay hello\n"
+        (skills_dir / "greeting.md").write_text(good)
+        mocker.patch.dict("os.environ", {"FORCE_COLOR": "1"})
+        narrow_terminal(mocker, str(skills_dir / "greeting.md"))
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+
+        calls: list[int] = []
+
+        def break_the_skill_then_fail(*args: object, **kwargs: object) -> None:
+            calls.append(1)
+            (skills_dir / "greeting.md").write_text("no frontmatter at all")
+            raise RuntimeError("turn blew up")
+
+        mocker.patch("elja.cli.run_turn", side_effect=break_the_skill_then_fail)
+        await repl(settings, "s", once="hi")
+        out = capsys.readouterr().out
+        assert calls, "the turn never ran"
+        assert "agent rebuild failed" in out
+        assert str(skills_dir / "greeting.md") in out
+        # Yellow, not red: the REPL kept going on the current agent. This was the
+        # seventh and last unasserted style literal — in the same message pair whose
+        # TEXT is asserted two lines up, which is how the colour slipped through.
+        warning = next(line for line in out.splitlines() if "agent rebuild failed" in line)
+        assert "\x1b[33m" in warning
+
+    async def test_a_diagnostic_does_not_interpret_its_own_filename(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """markup and emoji in a FILENAME must survive to the reader.
+
+        ``[bold]`` would be eaten and applied as styling; ``:100:`` would become
+        an emoji, naming a file that does not exist.
+        """
+        from elja.cli import repl
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        name = "[bold]notes:100:.md"
+        (skills_dir / name).write_text("no frontmatter at all")
+        narrow_terminal(mocker, str(skills_dir / name))
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        await repl(settings, "s", once="hi")
+        out = capsys.readouterr().out
+        assert str(skills_dir / name) in out
+        assert "💯" not in out
 
     async def test_rebuild_failure_keeps_current_agent(
         self,

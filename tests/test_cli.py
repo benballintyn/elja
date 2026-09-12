@@ -269,10 +269,16 @@ def test_main_wires_everything(tmp_path: Path, mocker: MockerFixture) -> None:
 def test_main_handles_keyboard_interrupt(
     tmp_path: Path, mocker: MockerFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    mocker.patch.dict("os.environ", {"FORCE_COLOR": "1"})
     mocker.patch("elja.cli.repl", side_effect=KeyboardInterrupt)
     mocker.patch("sys.argv", ["elja", "chat"])
     main()
-    assert "interrupted" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "interrupted" in out
+    # Through `show_on` like every other diagnostic, not a bare `print`. The text is
+    # fixed so the flags cannot bite today; the style is what makes the routing
+    # observable, and this is the site where a future edit interpolates a path.
+    assert "\x1b[33m" in out
 
 
 class TestABrokenStatusSinkCannotKillATurn:
@@ -387,3 +393,261 @@ class TestTheDeltaSinkIsDeliberatelyNotSuppressed:
         # History is saved only on success, so a dead output sink loses the turn —
         # which is the documented trade, not an accident.
         assert session.load() == []
+
+
+class TestShowOn:
+    """Every flag on the diagnostic printer, pinned on a forced terminal.
+
+    A captured non-tty emits no colour, so `style` and `highlight` are invisible
+    through capsys — which is why both went unpinned until this helper moved to
+    module level.
+    """
+
+    @staticmethod
+    def _render(message: str, style: str | None = None, width: int = 40) -> str:
+        """Render through `show_on`. `style=None` exercises its own default."""
+        from io import StringIO
+
+        from rich.console import Console
+
+        from elja.cli import show_on
+
+        buffer = StringIO()
+        # `color_system="standard"` rather than leaving it to detection:
+        # `force_terminal=True` is what makes rich consult `TERM`, and a `dumb`
+        # or `unknown` one then reports no colour system, so these assertions
+        # would pass or fail on the developer's shell.
+        console = Console(file=buffer, force_terminal=True, width=width, color_system="standard")
+        if style is None:
+            show_on(console, message)
+        else:
+            show_on(console, message, style)
+        return buffer.getvalue()
+
+    def test_a_long_path_is_not_broken_mid_token(self) -> None:
+        path = "/private/var/folders/6h/tmpqjz2q66_/skills/broken.md"
+        assert path in self._render(f"cannot start agent: invalid skill file {path}", "red")
+
+    def test_markup_in_the_message_is_not_interpreted(self) -> None:
+        out = self._render("invalid skill file [bold]notes.md", "red")
+        assert "[bold]notes.md" in out
+
+    def test_emoji_shortcodes_are_not_interpreted(self) -> None:
+        out = self._render("bad image: :camera:.png is not a file", "red")
+        assert ":camera:.png" in out
+        assert "📷" not in out
+
+    def test_the_style_reaches_the_terminal(self) -> None:
+        """Red for an error, yellow for a warning — distinguishable, not decorative."""
+        red = self._render("boom", "red")
+        yellow = self._render("boom", "yellow")
+        assert "\x1b[31m" in red
+        assert "\x1b[33m" in yellow
+        assert red != yellow
+
+    def test_the_default_style_is_the_error_one(self) -> None:
+        """Every call site that passes no style is reporting a failure.
+
+        Pinned separately because passing `"red"` explicitly, as the test above
+        does, leaves the default free to be anything.
+        """
+        assert "\x1b[31m" in self._render("boom")
+
+    def test_numbers_and_quotes_are_not_separately_highlighted(self) -> None:
+        """highlight=False keeps one colour instead of fragmenting the message."""
+        out = self._render("read 42 bytes from 'a.md'", "red")
+        # One style-open sequence for the whole line, not one per token.
+        assert out.count("\x1b[") == 2, out
+
+
+class TestTheReplsOwnDiagnosticsReachTheTerminal:
+    """Style and width at repl's call sites, not only on the helper.
+
+    `TestShowOn` pins every flag on `show_on` itself. Nothing pinned that repl's
+    own sites pass the right style or go through the door at all: five mutants
+    that dropped a `"yellow"` argument — or the `style` parameter from the helper
+    call — survived the whole suite, which would make every warning
+    indistinguishable from a fatal error.
+
+    A captured non-tty emits no colour, which is why those mutants were invisible.
+    `FORCE_COLOR` makes rich emit SGR through a plain file while `COLUMNS` still
+    decides the width, so both are observable through capsys.
+    """
+
+    @staticmethod
+    def _forced(mocker: MockerFixture, width: str = "40") -> None:
+        mocker.patch.dict("os.environ", {"FORCE_COLOR": "1", "COLUMNS": width})
+
+    @staticmethod
+    def _line(out: str, needle: str) -> str:
+        match = [line for line in out.splitlines() if needle in line]
+        assert match, f"{needle!r} never printed:\n{out}"
+        return match[0]
+
+    async def test_a_warning_is_yellow_and_an_error_is_red(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """The distinction the style exists to make, driven through the REPL."""
+        self._forced(mocker)
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        prompts = iter(["/img x", f"/img {tmp_path / 'nope.png'} describe", "exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        out = capsys.readouterr().out
+        assert "\x1b[33m" in self._line(out, "usage: /img")
+        assert "\x1b[31m" in self._line(out, "image not found")
+
+    async def test_a_status_label_is_not_broken_mid_token(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """A status label carries a tool name, and a sub-agent's carries a config name.
+
+        Long MCP tool names exceed a narrow pane easily, and the status sink used to
+        print around `show_on` with neither `soft_wrap` nor `emoji=False`.
+        """
+        from tests.conftest import narrow_terminal
+
+        self._forced(mocker)
+        long_tool = "filesystem_read_multiple_text_files_with_encoding"
+        narrow_terminal(mocker, long_tool)
+        calls: list[int] = []
+
+        async def stream(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            calls.append(1)
+            if len(calls) == 1:
+                yield {1: DeltaToolCall(name=long_tool, json_args="{}")}
+            else:
+                yield "done"
+
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(stream_function=stream),
+            deps_type=EljaDeps,
+            toolsets=[build_toolset(settings)],
+        )
+        mocker.patch("elja.cli.build_agent", return_value=agent)
+        await repl(settings, "s", once="go")
+        out = capsys.readouterr().out
+        assert long_tool in out
+        # Dim, not the helper's default red. Dropping the style here left the suite
+        # green while every ordinary tool call printed in error red — a user watching
+        # a normal turn would read it as a failed one.
+        assert "\x1b[2m" in self._line(out, "⚙")
+
+    async def test_an_emoji_shortcode_in_a_status_label_stays_literal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """A sub-agent label is `f"{name} → {tool}"`, and `name` comes from elja.toml."""
+        self._forced(mocker, width="200")
+        calls: list[int] = []
+
+        async def stream(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            calls.append(1)
+            if len(calls) == 1:
+                yield {1: DeltaToolCall(name="ops:fire:_reader", json_args="{}")}
+            else:
+                yield "done"
+
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(stream_function=stream),
+            deps_type=EljaDeps,
+            toolsets=[build_toolset(settings)],
+        )
+        mocker.patch("elja.cli.build_agent", return_value=agent)
+        await repl(settings, "s", once="go")
+        out = capsys.readouterr().out
+        assert "ops:fire:_reader" in out
+        assert "🔥" not in out
+
+    async def test_model_output_is_neither_wrapped_nor_interpreted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """Streamed deltas are data too, and a path in one breaks the same way."""
+        self._forced(mocker)
+        path = "/private/var/folders/6h/tmpqjz2q66_/skills/broken.md"
+
+        async def stream(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            yield f"I read the skill at {path} and [bold]notes.md too"
+
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(stream_function=stream), deps_type=EljaDeps
+        )
+        mocker.patch("elja.cli.build_agent", return_value=agent)
+        await repl(settings, "s", once="go")
+        out = capsys.readouterr().out
+        assert path in out
+        assert "[bold]notes.md" in out
+
+
+class TestTheBannerDoesNotInterpretConfigValues:
+    """The banner is the one line that legitimately uses markup, over config values.
+
+    Four lines after a comment promising no tracebacks, a model name containing a
+    closing tag raised an uncaught `MarkupError` on REPL start, and an IPv6
+    `base_url` had its bracketed host eaten — showing an endpoint that was not the
+    one in use to someone debugging connectivity.
+    """
+
+    async def test_a_model_name_carrying_a_tag_does_not_crash_the_repl(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            model={"name": "model[/bold]x"},  # type: ignore[arg-type]
+        )
+        prompts = iter(["exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))  # must not raise
+        assert "model[/bold]x" in capsys.readouterr().out
+
+    async def test_an_ipv6_endpoint_is_shown_as_configured(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """rich ate the bracketed host, so the banner named a different endpoint."""
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            model={"base_url": "http://[fe80::1]:1234/v1"},  # type: ignore[arg-type]
+        )
+        prompts = iter(["exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        assert "[fe80::1]:1234" in capsys.readouterr().out
+
+    async def test_an_emoji_shortcode_in_a_model_name_stays_literal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`ModelConfig.name` is a bare string, and this is the line that shows it.
+
+        Markup is deliberately on here, which is why the values are escaped — but
+        escaping does not stop shortcode expansion, and a banner reading
+        `qwen3💯instruct` names a model that does not exist to the person reading it
+        precisely to check which model they are on.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            model={"name": "qwen3:100:instruct"},  # type: ignore[arg-type]
+        )
+        prompts = iter(["exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        out = capsys.readouterr().out
+        assert "qwen3:100:instruct" in out
+        assert "💯" not in out
+
+    async def test_a_long_endpoint_is_not_folded_mid_token(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        """Same hazard as every other diagnostic, on the one line markup still runs on."""
+        endpoint = "http://ml-inference-gateway.internal-hostname.corp.example.com:11434/v1"
+        mocker.patch.dict("os.environ", {"COLUMNS": "40"})
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            model={"base_url": endpoint},  # type: ignore[arg-type]
+        )
+        prompts = iter(["exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        assert endpoint in capsys.readouterr().out

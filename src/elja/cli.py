@@ -21,6 +21,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
 )
 from rich.console import Console
+from rich.markup import escape
 
 from elja.agent import build_agent, build_usage_limits
 from elja.deps import EljaDeps, notify
@@ -91,6 +92,37 @@ def attach_image(prompt: str, image: Path) -> list[str | BinaryContent]:
     if media_type is None:
         raise ValueError(f"not a supported image (png/jpeg/gif/webp): {image}")
     return [prompt, BinaryContent(data=image.read_bytes(), media_type=media_type)]
+
+
+def show_on(console: Console, message: str, style: str = "red") -> None:
+    """Print a diagnostic verbatim: no markup, no highlight, no emoji, no wrap.
+
+    Every one of those flags is load-bearing for text carrying a path or an
+    exception. ``soft_wrap`` stops rich breaking a path at the terminal width,
+    which splits "broken.md" into "broke" + "n.md" exactly where a reader most
+    needs it whole. ``markup=False`` stops a filename like ``[bold]notes.md``
+    having its prefix eaten and applied as styling. ``emoji=False`` stops
+    ``:camera:.png`` becoming a filename that does not exist. ``highlight=False``
+    keeps the message one colour instead of fragmenting it, and ``style`` is what
+    distinguishes an error from a warning.
+
+    Module level rather than a closure so a test can drive it with a forced
+    terminal: ``style`` and ``highlight`` produce no observable difference
+    through a captured non-tty, and both went unpinned until this moved.
+
+    Args:
+        console: The console to print on.
+        message: The diagnostic. Printed as data, never interpreted.
+        style: A rich style name; red for errors, yellow for warnings.
+    """
+    console.print(
+        message,
+        style=style,
+        markup=False,
+        highlight=False,
+        emoji=False,
+        soft_wrap=True,
+    )
 
 
 async def run_turn(
@@ -168,15 +200,18 @@ async def repl(
 ) -> None:
     """Interactive chat loop (or a single turn when ``once`` is given)."""
     console = Console()
+
+    def show(message: str, style: str = "red") -> None:
+        """Print a diagnostic through the module-level helper, on this console."""
+        show_on(console, message, style)
+
     session = Session.for_name(settings, session_name)
     # Connect MCP servers up front: failures are named and dropped so one bad
     # entry can't poison every turn.
     mcp_toolsets = await preflight_mcp_toolsets(
         build_mcp_toolsets(settings),
-        lambda name, err: console.print(
-            f"warning: MCP server {name!r} unavailable, skipping: {err}",
-            style="yellow",
-            markup=False,
+        lambda name, err: show(
+            f"warning: MCP server {name!r} unavailable, skipping: {err}", "yellow"
         ),
     )
     alive = {toolset_name(t) for t in mcp_toolsets}
@@ -195,21 +230,30 @@ async def repl(
         agent = build_agent(settings, mcp_toolsets=mcp_toolsets)
     except Exception as exc:
         # A malformed skill file or bad config must not dump a traceback.
-        console.print(f"cannot start agent: {str(exc) or exc!r}", style="red", markup=False)
+        show(f"cannot start agent: {str(exc) or exc!r}")
         return
 
     def show_delta(delta: str) -> None:
-        # Model output is data: never let rich interpret [brackets] as markup.
-        console.print(delta, end="", markup=False, highlight=False, emoji=False)
+        # Model output is data: never let rich interpret [brackets] as markup, and
+        # never let it wrap — a path in a streamed chunk breaks mid-token at the
+        # terminal width exactly like one in a diagnostic. `end=""` is why this is
+        # not show_on: deltas concatenate into one line.
+        console.print(delta, end="", markup=False, highlight=False, emoji=False, soft_wrap=True)
 
     def show_status(label: str) -> None:
-        console.print(f"\n⚙ {label}", style="dim", markup=False, highlight=False)
+        # A status label is a diagnostic and goes through the same door. It carries
+        # a tool name, and a sub-agent's label carries a name from elja.toml — both
+        # break mid-token without soft_wrap, and `ops:fire:` became `ops🔥` without
+        # emoji=False.
+        show_on(console, f"\n⚙ {label}", "dim")
 
     def confirm(description: str) -> bool:
         # Runs in a worker thread; EOF declines. (A real Ctrl+C is delivered
         # to the main thread and won't interrupt this read — press Enter/EOF
         # to decline.)
-        console.print(f"\napprove {description}?", style="yellow", markup=False)
+        # The user approves what they see, and the description carries the tool's
+        # own arguments — a path broken mid-token is a real hazard here.
+        show(f"\napprove {description}?", "yellow")
         try:
             return input_fn("[y/N] ").strip().lower() in {"y", "yes"}
         except (EOFError, KeyboardInterrupt):
@@ -222,24 +266,19 @@ async def repl(
         try:
             await run_turn(agent, settings, session, prompt, show_delta, show_status, confirm)
         except UsageLimitExceeded as exc:
-            console.print(
+            show(
                 f"\nerror: {exc} — raise limits.request_limit in elja.toml to allow "
-                "longer runs (turn not saved)",
-                style="red",
-                markup=False,
+                "longer runs (turn not saved)"
             )
         except Exception as exc:
-            console.print(
-                f"\nerror: {str(exc) or exc!r} (turn not saved)", style="red", markup=False
-            )
+            show(f"\nerror: {str(exc) or exc!r} (turn not saved)")
             try:
                 agent = fresh_agent()
             except Exception as rebuild_exc:
-                console.print(
+                show(
                     f"warning: agent rebuild failed ({str(rebuild_exc) or rebuild_exc!r}); "
                     "keeping current agent",
-                    style="yellow",
-                    markup=False,
+                    "yellow",
                 )
         console.print()
 
@@ -248,15 +287,31 @@ async def repl(
             try:
                 prompt = attach_image(once, image) if image is not None else once
             except ValueError as exc:
-                console.print(str(exc), style="red", markup=False)
+                show(str(exc))
                 return
             await do_turn(prompt)
         return
+    # The model name and the endpoint come from elja.toml, so the banner cannot
+    # run with markup on: `model[/bold]x` raised an uncaught MarkupError on REPL
+    # start, and an IPv6 base_url had its bracketed host eaten, showing an endpoint
+    # that was not the one in use. Style the fixed parts, escape the values.
+    # This is the one line that prints config-derived text WITH markup on, so it
+    # needs the other flags `show_on` carries for the same reasons: `emoji=False` so
+    # a model named `qwen3:100:instruct` is not shown as `qwen3💯instruct` — naming a
+    # model that does not exist, to the person reading the banner to check which
+    # model they are on — and `soft_wrap=True` so a long HF id or a remote endpoint
+    # is not folded mid-token in a narrow pane. `highlight=False` is cosmetic (it
+    # stops rich tri-colouring the name and the URL) and is deliberately unpinned;
+    # the escaping and the other two flags are pinned.
     console.print(
-        f"[bold]elja[/bold] — model [cyan]{settings.model.name}[/cyan] at "
-        f"{effective_endpoint(settings.model)} (session: {session_name}; "
-        "/img <path> <prompt> to attach "
-        "an image; exit/quit to leave)"
+        "[bold]elja[/bold] — model [cyan]"
+        f"{escape(settings.model.name)}[/cyan] at "
+        f"{escape(effective_endpoint(settings.model))} (session: "
+        f"{escape(session_name)}; /img <path> <prompt> to attach "
+        "an image; exit/quit to leave)",
+        highlight=False,
+        emoji=False,
+        soft_wrap=True,
     )
     while True:
         try:
@@ -273,15 +328,12 @@ async def repl(
             except ValueError:
                 tokens = []
             if len(tokens) < 3:
-                console.print(
-                    "usage: /img <path> <prompt> (quote paths containing spaces)",
-                    style="yellow",
-                )
+                show("usage: /img <path> <prompt> (quote paths containing spaces)", "yellow")
                 continue
             try:
                 await do_turn(attach_image(" ".join(tokens[2:]), Path(tokens[1])))
             except ValueError as exc:
-                console.print(str(exc), style="red", markup=False)
+                show(str(exc))
             continue
         await do_turn(prompt)
 
@@ -296,7 +348,9 @@ def main() -> None:
     try:
         asyncio.run(repl(settings, args.session, once=args.once, image=args.image))
     except KeyboardInterrupt:
-        print("\ninterrupted")
+        # Through the door like every other diagnostic. Fixed text today, so no
+        # hazard — but this is the site where a future edit interpolates a path.
+        show_on(Console(), "\ninterrupted", "yellow")
 
 
 if __name__ == "__main__":  # pragma: no cover

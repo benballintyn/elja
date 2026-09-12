@@ -34,6 +34,15 @@ poetry run pytest -m "not integration"   # unit tests (CI-safe)
 poetry run pytest -m integration          # requires LM Studio running locally
 ```
 
+**Coverage is a hard 100% in CI.** The floor lives on the CI command line, not in
+`addopts`, because in `addopts` it reddens every subset run — one file, any `-k`,
+`--lf`, an IDE's run-this-test button. So a local `pytest` will not tell you that a
+new line is uncovered; CI will. To check before pushing, run the CI gate verbatim:
+
+```bash
+poetry run pytest -m "not integration" --cov=src/elja --cov-fail-under=100
+```
+
 ## Conventions
 
 - Git flow: feature branches (`feat/`, `fix/`, ...), PRs squash-merged into main.

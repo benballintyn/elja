@@ -58,7 +58,16 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "A", "SIM", "ANN"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=elja --cov-report=term-missing -m 'not integration'"
+# The 100% floor lives on the CI command line, NOT here: in addopts it reddens
+# every subset run — a single file, any -k, --lf, an IDE's run-this-test button,
+# and the `pytest -m integration` command AGENTS.md documents — because a subset
+# cannot reach 100%. CI is where it has to hold.
+# If you ever need to exempt a line pattern, use `exclude_also` under
+# [tool.coverage.report] — `exclude_lines` REPLACES coverage's defaults and would
+# silently disable every `# pragma: no cover` in the tree, which matters now the
+# 100% floor is enforced. There is nothing to exempt today: `if TYPE_CHECKING:` is
+# already a coverage default and no `raise NotImplementedError` exists in src/.
+addopts = "--cov=src/elja --cov-report=term-missing -m 'not integration'"
 asyncio_mode = "auto"
 markers = [
     "integration: tests that need a live external service - LLM endpoint or internet (deselected in CI)",

@@ -3,6 +3,7 @@
 import contextlib
 from pathlib import Path
 
+import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
@@ -441,3 +442,65 @@ class TestApprovalConcurrency:
         task_a.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task_a
+
+
+class TestTheApprovalPromptShowsWhatIsBeingApproved:
+    """The user approves what they can read, so the prompt's content is the contract.
+
+    This line was 100% covered and 0% asserted: replacing it outright with `pass`
+    left all 227 tests green, and so did dropping the description while keeping the
+    prompt. A refactor could have left a bare `[y/N] ` with no tool name, no
+    arguments and no path, and the mandatory 100% floor would still have been met.
+    """
+
+    async def test_the_description_and_its_whole_path_survive_a_narrow_terminal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
+    ) -> None:
+        from collections.abc import AsyncIterator
+
+        from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+        from elja.cli import repl
+        from tests.conftest import narrow_terminal
+
+        mocker.patch.dict("os.environ", {"FORCE_COLOR": "1"})
+        target = tmp_path / "quarterly_reconciliation_ledger.csv"
+        target.write_text("row\n")
+        # The relation, not the constant: this path only breaks mid-token because it
+        # is longer than the terminal, and $TMPDIR's length is not a guarantee.
+        narrow_terminal(mocker, str(target))
+        command = f"rm {target}"
+        stream_calls: list[int] = []
+
+        async def sf(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[str | DeltaToolCalls]:
+            stream_calls.append(1)
+            if len(stream_calls) == 1:
+                yield {1: DeltaToolCall(name="run_shell", json_args=f'{{"command": "{command}"}}')}
+            else:
+                yield "removed"
+
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(stream_function=sf),
+            deps_type=EljaDeps,
+            toolsets=[build_toolset(settings)],
+            capabilities=[build_permission_gate(settings)],
+        )
+        mocker.patch("elja.cli.build_agent", return_value=agent)
+        prompts = iter(["clean up", "y", "exit"])
+        await repl(settings, "s", input_fn=lambda _: next(prompts))
+        out = capsys.readouterr().out
+        prompt_line = next(line for line in out.splitlines() if "approve " in line)
+        # Yellow: a question, not a failure. Dropping the style here left the suite
+        # green, and every warning would then be indistinguishable from an error.
+        assert "\x1b[33m" in prompt_line
+        # The tool being approved is named...
+        assert "run_shell" in out
+        # ...and its argument is legible in full. `str(target)` is far longer than
+        # the 40-column terminal, so a wrapped prompt breaks it mid-token and the
+        # user approves a path they cannot actually read.
+        assert str(target) in out
+        # And the approval really was the thing that ran.
+        assert not target.exists()
