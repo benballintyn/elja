@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0](https://github.com/benballintyn/elja/compare/v0.4.0...v0.5.0) (2026-09-12)
+
+
+### Features
+
+* a server-shaped host example, and the contracts it relies on ([#28](https://github.com/benballintyn/elja/issues/28)) ([72e42f3](https://github.com/benballintyn/elja/commit/72e42f3232e150ff34ed2b2292ac8dc10fff5793))
+* an application construction path with no implicit elja machinery ([#24](https://github.com/benballintyn/elja/issues/24)) ([464630f](https://github.com/benballintyn/elja/commit/464630f1483437574d075497c535eec6e24b4470))
+* compaction a host can compose, with reporting order pinned ([#26](https://github.com/benballintyn/elja/issues/26)) ([01ace7b](https://github.com/benballintyn/elja/commit/01ace7b2a178a66b3792cd2b4ae49fb7c80d9c58))
+* guarded-model contracts, and a summarizer model a host can meter ([#25](https://github.com/benballintyn/elja/issues/25)) ([674634a](https://github.com/benballintyn/elja/commit/674634a8f297cb067f46f14a30d9bbf07ceacd59))
+* native model settings and the full UsageLimits surface ([#23](https://github.com/benballintyn/elja/issues/23)) ([05ba2dd](https://github.com/benballintyn/elja/commit/05ba2dd8f15595d8da0afb0c8681421c0240a3c7))
+
+
+### Bug Fixes
+
+* four holes the merge-round reviews found, and six claims that were not true ([#30](https://github.com/benballintyn/elja/issues/30)) ([845d6b7](https://github.com/benballintyn/elja/commit/845d6b79f11907fdd29f637c00abc6e1d3893456))
+
 ## [0.4.0](https://github.com/benballintyn/elja/compare/v0.3.0...v0.4.0) (2026-08-31)
 
 
