@@ -8,11 +8,15 @@ from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, cast
 
 import pytest
 from pydantic import BaseModel, SecretStr, ValidationError
 from pytest_mock import MockerFixture
+
+# typing_extensions, not typing: pydantic refuses a `typing.TypedDict` below 3.12,
+# and CI runs 3.11.
+from typing_extensions import TypedDict
 
 import elja
 from elja.settings import (
