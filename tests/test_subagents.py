@@ -1,6 +1,9 @@
 """Tests for elja.subagents."""
 
+from dataclasses import fields
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -14,10 +17,12 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.usage import UsageLimits
 from pytest_mock import MockerFixture
 
+from elja.agent import build_usage_limits
 from elja.deps import EljaDeps
-from elja.settings import EljaSettings, SubagentConfig, WorkspaceConfig
+from elja.settings import EljaSettings, LimitsConfig, SubagentConfig, WorkspaceConfig
 from elja.subagents import build_subagent_toolset
 from elja.tools import build_toolset
 
@@ -259,6 +264,124 @@ class TestBudget:
         assert result.output == "handled"
         assert any("budget exhausted" in s for s in seen_result)
         assert any("Do not delegate this again" in s for s in seen_result)
+        # The child got its OWN request out of the budget. Without the
+        # ctx.usage.requests offset the limit would be absolute, already spent by
+        # the parent's first request, and the child would never be asked at all.
+        assert len(child_requests) == 1
+
+    async def test_a_child_inherits_every_ceiling_but_request_limit(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        """A configured tool-call ceiling binds the child too, not just the parent.
+
+        Without inheritance the child runs with request_limit alone and keeps
+        calling tools until it burns the whole request budget.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            limits=LimitsConfig(tool_calls_limit=1),
+            subagents={
+                "helper": SubagentConfig(description="d", instructions="i", tools=["list_dir"])
+            },
+        )
+        child_requests: list[int] = []
+
+        def child_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            child_requests.append(1)
+            return ModelResponse(parts=[ToolCallPart(tool_name="list_dir", args={"path": "."})])
+
+        mocker.patch("elja.subagents.build_model", return_value=FunctionModel(child_script))
+        calls: list[int] = []
+        seen_result: list[str] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_helper", args={"task": "t"})]
+                )
+            seen_result.append(str(messages[-1]))
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        result = await parent.run("go", deps=EljaDeps.from_settings(settings))
+        assert result.output == "handled"
+        assert any("budget exhausted" in s for s in seen_result)
+        # One tool call is allowed, so the child's SECOND request is refused.
+        # Uninherited, the ceiling would not apply and the child would loop
+        # against request_limit (25) instead.
+        assert len(child_requests) == 2
+
+    async def test_the_child_receives_the_parents_entire_limits_object(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        """Field-by-field, so dropping any one ceiling fails the test.
+
+        The behavioral test above proves a ceiling binds; this one proves that
+        nothing silently stops being inherited.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            limits=LimitsConfig(
+                request_limit=9,
+                total_tokens_limit=5000,
+                cost_limit=Decimal("1.25"),
+                tool_calls_limit=7,
+                input_tokens_limit=4000,
+                output_tokens_limit=900,
+                per_request_input_tokens_limit=1200,
+            ),
+            subagents={
+                "helper": SubagentConfig(description="d", instructions="i", tools=["list_dir"])
+            },
+        )
+        mocker.patch(
+            "elja.subagents.build_model",
+            return_value=FunctionModel(
+                lambda messages, info: ModelResponse(parts=[TextPart(content="child done")])
+            ),
+        )
+        captured: list[UsageLimits] = []
+        real_run = Agent.run
+
+        async def spy(
+            self: Agent[Any, Any],
+            *args: Any,  # noqa: ANN401 - wraps an upstream signature
+            **kwargs: Any,  # noqa: ANN401 - wraps an upstream signature
+        ) -> Any:  # noqa: ANN401 - wraps an upstream signature
+            if "usage_limits" in kwargs and kwargs["usage_limits"] is not None:
+                captured.append(kwargs["usage_limits"])
+            return await real_run(self, *args, **kwargs)
+
+        mocker.patch.object(Agent, "run", spy)
+
+        calls: list[int] = []
+
+        def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(
+                    parts=[ToolCallPart(tool_name="delegate_helper", args={"task": "t"})]
+                )
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        toolset = build_subagent_toolset(settings)
+        assert toolset is not None
+        parent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(parent_script), deps_type=EljaDeps, toolsets=[toolset]
+        )
+        await parent.run("go", deps=EljaDeps.from_settings(settings))
+        assert captured, "the child run never received usage limits"
+        child_limits = captured[-1]
+        expected = build_usage_limits(settings)
+        for field in fields(UsageLimits):
+            if field.name == "request_limit":
+                continue  # deliberately overridden per delegation
+            assert getattr(child_limits, field.name) == getattr(expected, field.name), field.name
 
 
 class TestAgentWiring:

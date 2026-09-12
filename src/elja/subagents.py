@@ -11,13 +11,13 @@ policy as the parent.
 
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 
 from pydantic_ai import Agent, AgentRunResult, AgentRunResultEvent, ModelRetry, RunContext
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import FunctionToolCallEvent
 from pydantic_ai.tools import ToolFuncEither
 from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai.usage import UsageLimits
 
 from elja.application import build_application_agent
 from elja.compaction import build_compaction
@@ -117,17 +117,20 @@ def _make_delegate(
 
     async def delegate(ctx: RunContext[EljaDeps], task: str) -> str:
         """Run the subagent on a self-contained task and return its answer."""
+        # Deferred import: elja.agent imports this module.
+        from elja.agent import build_usage_limits
+
         # cfg.request_limit is a per-delegation budget; usage is shared with
         # the parent, so offset by what's already spent. Without a per-agent
-        # limit the parent's overall request limit still applies.
-        if cfg.request_limit is not None:
-            limit = ctx.usage.requests + cfg.request_limit
-        else:
-            limit = settings.limits.request_limit
-        limits = UsageLimits(
-            request_limit=limit,
-            total_tokens_limit=settings.limits.total_tokens_limit,
+        # limit the parent's overall request limit still applies. Every OTHER
+        # configured ceiling (tokens, cost, tool calls) is inherited verbatim
+        # via replace(), so a child cannot spend past a cap the parent honors.
+        limit = (
+            ctx.usage.requests + cfg.request_limit
+            if cfg.request_limit is not None
+            else settings.limits.request_limit
         )
+        limits = replace(build_usage_limits(settings), request_limit=limit)
         result: AgentRunResult[str] | None = None
         try:
             if ctx.deps.on_status is None:

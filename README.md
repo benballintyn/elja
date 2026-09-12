@@ -125,13 +125,43 @@ provider = "openai"      # "openai" (any OpenAI-compatible endpoint — the defa
                          # aimed at LM Studio), "anthropic", or "google".
                          # Native providers need: pip install 'elja[anthropic]' / 'elja[google]'
 name = "qwen/qwen3.8-27b"
-base_url = "http://localhost:1234/v1"   # unset with provider="openai" = local LM Studio
-temperature = 0.2
+base_url = "http://localhost:1234/v1"   # unset with provider="openai" = local LM Studio.
+                         # provider="openai" NEVER means api.openai.com on its own —
+                         # a hosted app must name the endpoint and model it intends.
+temperature = 0.2        # omit the parameter entirely with temperature = ""
+max_tokens = 4096        # (same: "" means "send no max_tokens"). Works in TOML
+                         # and as ELJA_MODEL__TEMPERATURE="" in the environment.
 # api_key: set for cloud endpoints; native providers also honor
 # ANTHROPIC_API_KEY / GOOGLE_API_KEY from the environment.
 
-[limits]
+# Any other native pydantic-ai ModelSettings key. Keys AND values are checked
+# against the selected provider's own dialect, at every depth, so an unsupported
+# key or a wrongly typed value is a config error naming its path rather than a
+# 400 at request time (or, worse, a typo that silently disables a setting).
+[model.settings]
+top_p = 0.9
+# Reasoning controls are the provider's own — no elja-side enum:
+#   openai_reasoning_effort / anthropic_thinking / google_thinking_config,
+#   or the portable `thinking` (true/false or "minimal".."xhigh").
+# NB: pair a reasoning setting with temperature = "" rather than a value.
+# anthropic DROPS temperature/top_p when reasoning is on, with a warning; openai
+# and google send them and the API rejects the request with a 400.
+
+[limits]                 # every field maps to pydantic-ai's UsageLimits
 request_limit = 25
+total_tokens_limit = 120000
+cost_limit = 2.50        # USD, and only for models pydantic-ai can price —
+                         # on an unpriced model (the local default included) it
+                         # is unenforced and warns. The warning is raised every
+                         # request; Python's default filter shows it once.
+tool_calls_limit = 40
+input_tokens_limit = 100000
+output_tokens_limit = 20000
+per_request_input_tokens_limit = 30000   # enforced on every provider
+count_tokens_before_request = false   # an extra count-tokens round trip, and
+                         # ONLY supported by provider "anthropic" or "google";
+                         # elja refuses it with "openai" rather than letting
+                         # every request fail with NotImplementedError.
 
 [workspace]
 root = "."

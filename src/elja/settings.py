@@ -12,17 +12,171 @@ Note: programmatic overrides merge per-key only in dict form —
 keys, while passing a ``ModelConfig`` instance replaces the whole section.
 """
 
+import importlib
 import re
+from collections.abc import Iterable, Mapping, Sequence
+from decimal import Decimal
+from functools import cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    create_model,
+    field_validator,
+    model_validator,
+)
+from pydantic_ai.settings import ModelSettings
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+# Settings each provider dialect understands, on top of the portable
+# ``ModelSettings`` ones. Imported lazily because anthropic/google live behind
+# extras — and only when a config actually sets ``[model.settings]``, so the
+# common case never drags a provider SDK into an ``import elja``.
+_SETTINGS_CLASSES = {
+    "openai": ("pydantic_ai.models.openai", "OpenAIChatModelSettings"),
+    "anthropic": ("pydantic_ai.models.anthropic", "AnthropicModelSettings"),
+    "google": ("pydantic_ai.models.google", "GoogleModelSettings"),
+}
+
+
+@cache
+def _value_validator(dialect: type) -> type[BaseModel]:
+    """A model that validates one dialect's setting VALUES, not just its keys.
+
+    ``TypeAdapter`` cannot be configured for a ``TypedDict`` directly, and these
+    dialects annotate ``timeout`` as ``float | httpx.Timeout``, which needs
+    ``arbitrary_types_allowed``. A generated wrapper model supplies both.
+    """
+    return create_model(
+        f"_{dialect.__name__}Values",
+        __config__=ConfigDict(arbitrary_types_allowed=True),
+        settings=(dialect, ...),
+    )
+
+
+def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Check ``model.settings`` against one provider dialect, keys and values.
+
+    Args:
+        provider: A ``ModelConfig.provider`` value.
+        settings: The settings a config supplies.
+
+    Returns:
+        The settings with values coerced to their annotated types — which is
+        also how ``ELJA_MODEL__SETTINGS__TOP_P=0.9`` stops being the string
+        ``"0.9"`` by the time it reaches a provider.
+
+    Raises:
+        ValueError: If any key is not part of this dialect, at any depth. A
+            value that does not match its annotation raises
+            ``pydantic.ValidationError``, which is also what a bad
+            ``model.temperature`` raises.
+    """
+    portable = frozenset(ModelSettings.__annotations__)
+    module_name, class_name = _SETTINGS_CLASSES[provider]
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        # Without the extra the dialect's own keys cannot be enumerated, let
+        # alone type-checked; accept its prefix and let build_model report the
+        # missing extra, which is the error the user actually needs.
+        prefix = f"{provider}_"
+        _reject(provider, [k for k in settings if k not in portable and not k.startswith(prefix)])
+        return dict(settings)
+    dialect = getattr(module, class_name)
+    # Snapshot the CALLER's structure before validating it. Pydantic consumes an
+    # iterator while validating, so by the time the dropped-key walk runs there is
+    # nothing left on the original side to compare — and the three leaves this
+    # matters for are annotated `Iterable[...]`, which is exactly the annotation
+    # that invites a caller to pass a generator. Widening the walk's type test
+    # cannot fix that; only snapshotting first can.
+    settings = _materialize(settings)
+    validated = _materialize(_value_validator(dialect)(settings=settings).settings)  # type: ignore[attr-defined]
+    # Pydantic DROPS keys a TypedDict does not declare rather than complaining,
+    # at every depth. One walk of what came back finds all of them, so a typo
+    # inside google_thinking_config is refused exactly like one beside it —
+    # rather than silently disabling the setting it was meant to configure.
+    # One gap remains, and it is unreachable rather than merely unlikely: a leaf
+    # that validates into a non-Mapping OBJECT rather than a dict ends the walk, so
+    # a typo beside a correctly-spelled field of `tool_choice` (which becomes a
+    # `ToolOrOutput` dataclass) is dropped in silence. `ToolOrOutput` has exactly
+    # one field, so you cannot get there without also spelling it right — and it
+    # becomes real the moment upstream adds a second.
+    _reject(provider, _dropped_keys(settings, validated))
+    return dict(validated)
+
+
+def _materialize(value: Any) -> Any:  # noqa: ANN401 - walks arbitrary settings values
+    """Force pydantic's lazy ``Iterable[...]`` validators into real containers.
+
+    Three leaves in the shipped dialects are annotated ``Iterable[...]``
+    (``anthropic_context_management.edits``, ``anthropic_container.skills``,
+    ``openai_prediction.content``), and pydantic validates those lazily into a
+    ``ValidatorIterator`` that can be consumed exactly once. The settings dict
+    is reused for every request of every run, so without this the first request
+    carries the value and every later one carries an empty list — a provider
+    feature that silently switches itself off after one turn.
+    """
+    if isinstance(value, Mapping):
+        return {key: _materialize(item) for key, item in value.items()}
+    if isinstance(value, str | bytes) or not isinstance(value, Iterable):
+        return value
+    return [_materialize(item) for item in value]
+
+
+def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:  # noqa: ANN401
+    """Dotted paths of mapping keys that validation discarded.
+
+    Walks the two trees together. Sequences are compared positionally and only
+    when they are the same length, so a coercion that changes a list's shape is
+    left to pydantic's own error rather than reported as a missing key.
+
+    Both sides are materialized before this runs, so both are lists and the
+    ``Sequence`` test is belt-and-braces rather than load-bearing — a mutant
+    narrowing it back to ``list`` is equivalent today. It is kept, and the
+    ``[list, tuple, generator]`` parametrization in the tests is kept as the
+    regression record, because this walk has already been skipped twice: once for a
+    tuple literal, and once for a generator, each dropping a misspelled nested key
+    in silence while the same config written with square brackets raised. TOML and
+    env can only produce lists; this is the programmatic surface, which is the one
+    every test here uses.
+    """
+    dropped: list[str] = []
+    if isinstance(original, Mapping):
+        if not isinstance(validated, Mapping):
+            return dropped
+        for key, value in original.items():
+            path = f"{prefix}{key}"
+            if key not in validated:
+                dropped.append(path)
+            else:
+                dropped.extend(_dropped_keys(value, validated[key], f"{path}."))
+    elif (
+        isinstance(original, Sequence)
+        and not isinstance(original, str | bytes)
+        and isinstance(validated, list)
+        and len(original) == len(validated)
+    ):
+        for index, (left, right) in enumerate(zip(original, validated, strict=True)):
+            dropped.extend(_dropped_keys(left, right, f"{prefix}{index}."))
+    return dropped
+
+
+def _reject(provider: str, unknown: list[str]) -> None:
+    """Raise for settings keys this provider dialect does not have."""
+    if unknown:
+        raise ValueError(
+            f"unsupported model.settings key(s) for provider {provider!r}: {sorted(unknown)}"
+        )
 
 
 class _Section(BaseModel):
@@ -37,9 +191,19 @@ class ModelConfig(_Section):
     ``provider`` selects the API dialect: ``openai`` (default — any
     OpenAI-compatible endpoint, incl. LM Studio/Ollama/vLLM/OpenRouter),
     ``anthropic``, or ``google``. With ``provider = "openai"``, an unset
-    ``base_url``/``api_key`` defaults to a local LM Studio server; for the
-    native providers an unset ``api_key`` falls back to the SDK's standard
-    environment variable (ANTHROPIC_API_KEY / GOOGLE_API_KEY).
+    ``base_url``/``api_key`` defaults to a **local LM Studio server**
+    (``http://localhost:1234/v1``) — ``provider = "openai"`` alone never means
+    api.openai.com, so a hosted application must name the endpoint and model it
+    intends. For the native providers an unset ``api_key`` falls back to the
+    SDK's standard environment variable (ANTHROPIC_API_KEY / GOOGLE_API_KEY).
+
+    ``temperature``/``max_tokens`` are convenience fields for the two settings
+    nearly every config sets; ``None`` omits the parameter entirely, for models
+    that reject it. Anything else native goes in ``settings``, which is checked
+    against the selected provider's own ``ModelSettings`` keys — so
+    provider-specific reasoning controls (``openai_reasoning_effort``,
+    ``anthropic_thinking``, ``google_thinking_config``, and the portable
+    ``thinking``) pass through without elja defining a dialect of its own.
     """
 
     provider: Literal["openai", "anthropic", "google"] = "openai"
@@ -47,25 +211,90 @@ class ModelConfig(_Section):
     base_url: str | None = None
     api_key: SecretStr | None = None
 
-    @field_validator("base_url", "api_key", mode="before")
-    @classmethod
-    def _empty_env_means_unset(cls, v: object) -> object:
-        # ELJA_MODEL__BASE_URL='' is the natural env spelling of "back to
-        # default"; an empty string would otherwise reach the SDKs verbatim.
-        return None if v == "" else v
-
-    temperature: float = 0.2
-    max_tokens: int = 4096
+    # ``None`` means "omit this parameter from the request" — some reasoning
+    # models reject an explicit temperature. The defaults are unchanged.
+    temperature: float | None = 0.2
+    max_tokens: int | None = 4096
+    # Native ModelSettings passed through verbatim, validated against the
+    # selected provider's own keys (see _check_settings). Deliberately not a
+    # free-form **kwargs bag: an unsupported key is an error, not a silent no-op.
+    settings: dict[str, Any] = {}
     # Most local OpenAI-compatible servers (LM Studio included) don't implement
     # strict tool schemas; flip this on for backends that do. (openai provider only.)
     supports_strict_tool_definition: bool = False
 
+    @field_validator("base_url", "api_key", "temperature", "max_tokens", mode="before")
+    @classmethod
+    def _empty_env_means_unset(cls, v: object) -> object:
+        # ELJA_MODEL__BASE_URL='' is the natural env spelling of "back to
+        # default"; an empty string would otherwise reach the SDKs verbatim.
+        # For temperature/max_tokens it is the only way env can say "omit".
+        return None if v == "" else v
+
+    @model_validator(mode="after")
+    def _check_settings(self) -> "ModelConfig":
+        # The overwhelmingly common case, and the one that runs when this class
+        # is constructed for EljaSettings' own default: nothing to check, and no
+        # provider SDK imported.
+        if not self.settings:
+            return self
+        # Two spellings of one parameter is a config bug, not a precedence
+        # puzzle — but only when the convenience field was set on purpose.
+        # "Set on purpose" is a property of the VALUE, not of how the object was
+        # built: model_dump() emits every field, so keying this on
+        # model_fields_set would make a dump/reload round trip raise on a config
+        # that validated. Comparing against the default also subsumes
+        # model_fields_set — an unset field always holds its default — so there
+        # is one condition here rather than two that mask each other. The cost
+        # is that writing the default value explicitly beside a settings entry is
+        # no longer flagged.
+        both = ("temperature", "max_tokens")
+        fields = type(self).model_fields
+        clash = sorted(
+            k for k in both if k in self.settings and getattr(self, k) != fields[k].default
+        )
+        if clash:
+            named = ", ".join(f"model.{k}" for k in clash)
+            raise ValueError(f"model.settings duplicates {named}; set each in one place only")
+        self.settings = validate_provider_settings(self.provider, self.settings)
+        return self
+
 
 class LimitsConfig(_Section):
-    """Caps on a single agent run, to bound runaway tool loops."""
+    """Caps on a single agent run, to bound runaway tool loops.
 
-    request_limit: int = 25
-    total_tokens_limit: int | None = None
+    Every field maps to the same-named ``pydantic_ai.usage.UsageLimits``
+    argument. ``request_limit`` keeps elja's own lower default (25 rather than
+    upstream's 50); the rest default to ``None``, i.e. uncapped, so an existing
+    config resolves exactly as before.
+
+    Two fields come with conditions worth knowing before relying on them:
+
+    - ``cost_limit`` is in **USD** and is only enforced for models pydantic-ai
+      can price. On an unpriced model (the local default among them) the run's
+      cost is ``None``, the limit does nothing, and pydantic-ai raises a
+      ``CostNotFoundWarning`` on every request — which Python's default filter
+      dedupes, so an operator sees it once per process, not once per request.
+    - ``count_tokens_before_request`` needs a provider that offers a
+      count-tokens call. Only ``anthropic`` and ``google`` do, so
+      :class:`EljaSettings` refuses it together with ``provider = "openai"``
+      rather than letting every request fail with ``NotImplementedError``.
+      ``per_request_input_tokens_limit`` works on every provider without it,
+      checked against the usage a response reports.
+    """
+
+    # ge=1 on every ceiling: zero or less refuses the first request rather than
+    # capping anything, which is a config error wearing a valid-looking value.
+    request_limit: int | None = Field(default=25, ge=1)
+    total_tokens_limit: int | None = Field(default=None, ge=1)
+    cost_limit: Decimal | None = Field(default=None, ge=0)
+    tool_calls_limit: int | None = Field(default=None, ge=1)
+    input_tokens_limit: int | None = Field(default=None, ge=1)
+    output_tokens_limit: int | None = Field(default=None, ge=1)
+    per_request_input_tokens_limit: int | None = Field(default=None, ge=1)
+    # Costs an extra count-tokens round trip per request on providers that
+    # offer one; lets per_request_input_tokens_limit refuse before dispatch.
+    count_tokens_before_request: bool = False
 
 
 class WorkspaceConfig(_Section):
@@ -234,6 +463,32 @@ class EljaSettings(BaseSettings):
     compaction: CompactionConfig = CompactionConfig()
     skills: SkillsConfig = SkillsConfig()
     session: SessionConfig = SessionConfig()
+
+    @model_validator(mode="after")
+    def _check_cross_section(self) -> "EljaSettings":
+        if self.limits.count_tokens_before_request:
+            # Deferred import: elja.model imports this module. It also means the
+            # provider SDK is only touched by a config that sets this flag.
+            from elja.model import model_class_name, provider_implements_count_tokens
+
+            # Asked of the CLASS elja would build, not of a hardcoded provider
+            # list, so this stays true if upstream adds the method later. The class
+            # is named from the same table for the same reason.
+            if not provider_implements_count_tokens(self.model.provider):
+                raise ValueError(
+                    "limits.count_tokens_before_request needs a model that implements "
+                    f"count_tokens. model.provider {self.model.provider!r} builds "
+                    f"{model_class_name(self.model.provider)}, which does not, so "
+                    "pydantic-ai would raise "
+                    "NotImplementedError before the first request. Use 'anthropic' or "
+                    "'google', or drop the flag — per_request_input_tokens_limit is "
+                    "enforced without it. A host injecting its own model should check "
+                    "elja.model.implements_count_tokens(model) instead: this setting "
+                    "describes the model elja would build, not the one you passed — "
+                    "and this config field stays closed to them, so build your own "
+                    "UsageLimits rather than setting it here."
+                )
+        return self
 
     @classmethod
     def settings_customise_sources(

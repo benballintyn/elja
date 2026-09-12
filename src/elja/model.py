@@ -15,9 +15,12 @@ Everything above this factory operates on pydantic-ai's normalized types, so
 tools, skills, compaction, sessions, and sub-agents are provider-independent.
 """
 
+import importlib
 import os
+from typing import Any, cast
 
 from pydantic_ai.models import Model
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 
 from elja.settings import EljaSettings, ModelConfig
@@ -32,7 +35,19 @@ class ModelProviderError(Exception):
 
 
 def _model_settings(cfg: ModelConfig) -> ModelSettings:
-    return ModelSettings(temperature=cfg.temperature, max_tokens=cfg.max_tokens)
+    """Native settings for this config: ``settings`` plus the two shortcuts.
+
+    ``temperature``/``max_tokens`` are omitted entirely when ``None`` (some
+    reasoning models reject them). ``ModelConfig`` already refuses a key
+    spelled in both places, so the merge order cannot hide a conflict.
+    """
+    merged: dict[str, Any] = dict(cfg.settings)
+    for key, value in (("temperature", cfg.temperature), ("max_tokens", cfg.max_tokens)):
+        if value is not None and key not in merged:
+            merged[key] = value
+    # ModelSettings is a total=False TypedDict; a dict of validated keys is the
+    # only way to build one with a dynamic key set.
+    return cast(ModelSettings, merged)
 
 
 def _build_openai(cfg: ModelConfig) -> Model:
@@ -96,6 +111,87 @@ def _build_google(cfg: ModelConfig) -> Model:
         else GoogleProvider(api_key=key, base_url=cfg.base_url)
     )
     return GoogleModel(cfg.name, provider=provider, settings=_model_settings(cfg))
+
+
+# Which class each provider dialect builds. Used to answer capability
+# questions about a model elja has not built yet.
+_MODEL_CLASSES = {
+    "openai": ("pydantic_ai.models.openai", "OpenAIChatModel"),
+    "anthropic": ("pydantic_ai.models.anthropic", "AnthropicModel"),
+    "google": ("pydantic_ai.models.google", "GoogleModel"),
+}
+
+
+def implements_count_tokens(model: "Model | type[Model]") -> bool:
+    """Whether this model can count a request's tokens before sending it.
+
+    ``UsageLimits.count_tokens_before_request`` makes pydantic-ai call
+    ``Model.count_tokens`` before **every** request, and the base implementation
+    raises ``NotImplementedError``. So a model that does not override it turns
+    that flag from an ineffective setting into a run that dies on its first
+    request.
+
+    A host injecting its own model should check it here rather than inferring
+    support from a provider name: ``model.provider`` describes the model elja
+    *would build*, which on the application path is not the model being used.
+
+    Wrappers are unwrapped to the **bottom** of the chain, because
+    ``WrapperModel`` *defines* ``count_tokens`` in order to delegate it — so the
+    plain override test answers True for every wrapper regardless of what it wraps.
+    ``InstrumentedModel`` is a ``WrapperModel``, and it is what pydantic-ai puts
+    around a model whenever instrumentation is on (``instrument=True``,
+    ``Agent.instrument_all()``, Logfire). Measured: an instrumented
+    ``OpenAIChatModel`` answered True and then raised ``NotImplementedError`` on the
+    first request — the exact failure this function exists to prevent.
+
+    Unwrapping to the bottom rather than stopping at the first wrapper that defines
+    the method is deliberate: ``ConcurrencyLimitedModel`` is a shipped
+    ``WrapperModel`` that defines ``count_tokens`` *solely* to delegate it under a
+    semaphore, so a top-down test would report True for
+    ``ConcurrencyLimitedModel(OpenAIChatModel)``. The cost is the mirror case — a
+    host's own wrapper that supplies a real implementation is reported False even
+    though the call would have worked. That is the safe direction: the host declines
+    a feature rather than shipping a run that dies.
+
+    A wrapper *class* has no instance to look through, so it answers False rather
+    than guessing at what it would wrap.
+
+    Args:
+        model: A model instance or class.
+
+    Returns:
+        True if the model at the BOTTOM of the wrapper chain overrides
+        ``count_tokens``. A wrapper supplying its own implementation reads False.
+    """
+    if isinstance(model, type):
+        return not issubclass(model, WrapperModel) and model.count_tokens is not Model.count_tokens
+    while isinstance(model, WrapperModel):
+        model = model.wrapped
+    return type(model).count_tokens is not Model.count_tokens
+
+
+def model_class_name(provider: str) -> str:
+    """The name of the model class elja builds for this provider.
+
+    Read from the same table the builders use, so a diagnostic naming the class
+    cannot drift from the class actually constructed.
+    """
+    return _MODEL_CLASSES[provider][1]
+
+
+def provider_implements_count_tokens(provider: str) -> bool:
+    """Whether the model elja builds for this provider can count tokens.
+
+    Returns True when the provider's optional dependency is missing, because
+    the class cannot be inspected and :func:`build_model` will report the
+    missing extra first — a clearer error than a capability complaint.
+    """
+    module_name, class_name = _MODEL_CLASSES[provider]
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError:
+        return True
+    return implements_count_tokens(getattr(module, class_name))
 
 
 def effective_endpoint(cfg: ModelConfig) -> str:
