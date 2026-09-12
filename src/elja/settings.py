@@ -194,7 +194,7 @@ class CompactionConfig(_Section):
     # which an irreducible tail re-fires the summarizer every request), and the
     # tail is whichever bound binds first. Measured across three regimes, the
     # token bound always won — so raising this alone does not lengthen the tail.
-    # Pinned by test_the_token_bound_dominates_keep_messages.
+    # Pinned by test_keep_messages_cannot_bind_because_of_two_settings_elja_chooses.
     keep_messages: int = Field(default=20, ge=1)
 
 

@@ -46,8 +46,10 @@ a server:
 **Ordering matters, and it is list order.** None of these capabilities declare
 an ordering, so ``ReportContextUsage`` measures whatever the capabilities before
 it produced. Placed *after* compaction it reports the request that was actually
-sent; placed before, it reports one that never existed — measured at 1177 versus
-7239 tokens for the same run. Put reporting last.
+sent; placed before, it reports one that never existed. Measured on the
+reporting-order test's own config: reporting after compaction read ~1k tokens,
+before it ~6k, for the same run — a six-fold difference in what the host is
+shown. Put reporting last.
 
 **What survives, verified rather than assumed.** Pinned parts
 (``pydantic_ai_harness.compaction.pin``) survive every tier, because
@@ -98,6 +100,9 @@ _SKILLS_WARNING = (
 )
 _ANCHOR = "<messages>"
 _PLACEHOLDER = "{messages}"
+# Substituted in to prove the placeholder is a placeholder. Alphanumeric on
+# purpose, so `{messages!r}` — which works at format time — still renders it.
+_SENTINEL = "eljatranscriptsentinel"
 
 
 def extend_summary_prompt(harness_default: str) -> str:
@@ -136,10 +141,22 @@ def default_summary_prompt() -> str:
     fails the caller who needs compaction instead of making ``import elja`` fail
     for a host that never touches it. The harness pin is a range, so a patch
     release can trigger it.
+
+    Checked the same way a caller's prompt is. ``extend_summary_prompt`` guards the
+    ``<messages>`` anchor it needs to insert the warning, which is a different
+    string from the ``{messages}`` placeholder the summarizer substitutes — a
+    patch release could keep the anchor and rename the variable, and then every
+    convenience-path user would get a default prompt that substitutes nothing.
+
+    Raises:
+        ValueError: If the harness default no longer substitutes a transcript.
+        RuntimeError: If it no longer carries the anchor.
     """
-    return extend_summary_prompt(
+    prompt = extend_summary_prompt(
         str(inspect.signature(SummarizingCompaction.__init__).parameters["summary_prompt"].default)
     )
+    check_summary_prompt(prompt)
+    return prompt
 
 
 def check_summary_prompt(summary_prompt: str) -> None:
@@ -147,32 +164,52 @@ def check_summary_prompt(summary_prompt: str) -> None:
 
     ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)``
     and nothing else. ``str.format`` no-ops on a string with no placeholder, so a
-    prompt without ``{messages}`` hands the summarizer an instruction with no
+    prompt that does not *substitute* hands the summarizer an instruction with no
     transcript — and its output still **replaces every message before the
     cutoff**. The run completes, nothing logs, and the history is gone. A stray
     single brace raises ``KeyError`` instead, at the first summarization, deep in
     a conversation.
 
+    So this substitutes a sentinel and checks the sentinel came out, rather than
+    looking for ``{messages}`` in the text. The two are not the same, and the
+    difference is a hole this function used to have: ``{messages}`` is a substring
+    of ``{{messages}}``, which is an escaped brace that renders as the literal
+    text and substitutes nothing. A caller reaches that by obeying this very
+    function's advice to double their literal braces — doubling all of them takes
+    the placeholder with it. Rendering is also the more permissive test, and
+    rightly: ``{messages!r}`` and ``{messages:>10}`` both work at format time and
+    are now accepted.
+
     Args:
         summary_prompt: The caller's prompt.
 
     Raises:
-        ValueError: If the placeholder is missing, or a brace cannot be resolved.
+        ValueError: If the prompt does not substitute the transcript, or a brace
+            cannot be resolved.
     """
-    if _PLACEHOLDER not in summary_prompt:
-        raise ValueError(
-            f"summary_prompt must contain the {_PLACEHOLDER!r} placeholder; without it the "
-            "summarizer is handed an instruction with no transcript, and the summarized "
-            "history is replaced by a summary written from nothing"
-        )
     try:
-        summary_prompt.format(messages="")
-    except (KeyError, IndexError) as exc:
+        rendered = summary_prompt.format(messages=_SENTINEL)
+    except (KeyError, IndexError, ValueError) as exc:
         raise ValueError(
             f"summary_prompt contains a brace str.format cannot resolve ({exc!r}); "
-            "double any literal braces as {{ }}. Unchecked this raises at the first "
-            "summarization, deep in a conversation."
+            "double any literal braces as {{ }} — but leave the "
+            f"{_PLACEHOLDER!r} placeholder single. Unchecked this raises at the "
+            "first summarization, deep in a conversation."
         ) from exc
+    if _SENTINEL in rendered:
+        return
+    if _PLACEHOLDER in summary_prompt:
+        raise ValueError(
+            f"summary_prompt contains {_PLACEHOLDER!r} only as literal text: a doubled "
+            "{{messages}} is an escaped brace, not a placeholder. Leave this one single "
+            "even when doubling the rest. Unchecked, the summarizer is handed an "
+            "instruction with no transcript and its output still replaces the history."
+        )
+    raise ValueError(
+        f"summary_prompt must substitute the {_PLACEHOLDER!r} placeholder; without it the "
+        "summarizer is handed an instruction with no transcript, and the summarized "
+        "history is replaced by a summary written from nothing"
+    )
 
 
 def build_compaction(

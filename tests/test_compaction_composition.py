@@ -7,6 +7,7 @@ solicited, pins survive, call/result pairing is valid, an unfittable protected
 floor does not silently drop it, and the summarizer is bounded.
 """
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -23,10 +24,15 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.toolsets import FunctionToolset
-from pydantic_ai_harness.compaction import ReportContextUsage, is_pinned, pin
+from pydantic_ai_harness.compaction import (
+    ReportContextUsage,
+    SummarizingCompaction,
+    is_pinned,
+    pin,
+)
 from pydantic_ai_harness.compaction._receipts import is_receipt_part
 
-from elja.compaction import CLEARED_PLACEHOLDER, build_compaction
+from elja.compaction import CLEARED_PLACEHOLDER, build_compaction, default_summary_prompt
 from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
 
@@ -140,6 +146,12 @@ def _assert_compaction_fired(views: list[list[ModelMessage]], history: list[Mode
     )
 
 
+# A pin this size exceeds every target used here, which forces the summarizing
+# tier to run while leaving the recent tool tail in place. It is the only regime
+# in which the summarizing tier can be asked about tool pairing at all.
+_GIANT_PIN = "IRREDUCIBLE CONSTRAINT " * 500
+
+
 class TestThePlaceholderIsTheHosts:
     async def test_a_custom_placeholder_replaces_the_rerun_guidance(self, tmp_path: Path) -> None:
         """E4: never require the application to accept 're-run the tool'."""
@@ -161,13 +173,15 @@ class TestThePlaceholderIsTheHosts:
         assert CLEARED_PLACEHOLDER in rendered
         assert HOST_PLACEHOLDER not in rendered
 
-    async def test_write_outcomes_are_masked_but_their_calls_remain_auditable(
+    async def test_masking_keeps_a_write_call_auditable_after_clearing_its_outcome(
         self, tmp_path: Path
     ) -> None:
-        """The action survives even when the observation is cleared.
+        """Under MASKING, the action survives even when the observation is cleared.
 
         That is what makes a host's receipt lookup possible: the tool_call_id is
-        still in history, so the host can find its own record of the write.
+        still in history, so the host can find its own record of the write. Scoped
+        to masking in the name deliberately — see the test below for what the
+        summarizing tier does to the same claim.
         """
         settings = _settings(tmp_path)
         views, _ = await _drive(
@@ -185,17 +199,81 @@ class TestThePlaceholderIsTheHosts:
         assert write_ids, "every write call was dropped, so no receipt is findable"
         assert HOST_PLACEHOLDER in _rendered(views)
 
+    async def test_summarizing_past_a_write_takes_its_call_id_with_it(
+        self, tmp_path: Path
+    ) -> None:
+        """And the host must not read the claim above as unconditional.
+
+        Masking rewrites a result in place, so the call stays. Summarization
+        replaces everything before the cutoff, so a write whose call sits back
+        there loses its tool_call_id entirely — the receipt is findable only in the
+        host's own store, never by walking the history it gets back. Measured: 4
+        write ids survive where masking alone runs, and 0 once the summarizing tier
+        reaches past them.
+
+        This is not a defect to fix in elja: there is nowhere for the id to go once
+        the message holding it is gone. It is a fact a host has to persist against,
+        which is why the example writes its receipt to its own store at tool time.
+
+        Twelve pairs rather than eight because `target_tokens` floors at 1000 and
+        the host's short placeholder reclaims enough at eight to keep the whole run
+        inside the masking tier — the boundary moves with the placeholder's own
+        length, which is itself worth knowing.
+        """
+        settings = _settings(tmp_path, target=1000)
+        history = _mixed_history(12)
+        views, roles = await _drive(
+            settings,
+            list(build_compaction(settings, cleared_placeholder=HOST_PLACEHOLDER)),
+            history,
+        )
+        assert "summarizer" in roles, "the summarizing tier never ran; the case is the wrong one"
+        write_ids = [
+            part.tool_call_id
+            for message in views[0]
+            for part in getattr(message, "parts", [])
+            if isinstance(part, ToolCallPart) and part.tool_name == "write_row"
+        ]
+        assert write_ids == []
+
 
 class TestStructuralInvariants:
-    @pytest.mark.parametrize("target", [1000, 3000])
+    @pytest.mark.parametrize(
+        ("target", "pinned", "summarizes", "pairs_survive"),
+        [
+            (3000, None, False, True),
+            (1000, None, True, False),
+            (3000, _GIANT_PIN, True, True),
+        ],
+        ids=["masking-only", "summarizing-empties-the-tail", "summarizing-keeps-a-tail"],
+    )
     async def test_tool_call_and_result_pairing_stays_valid(
-        self, tmp_path: Path, target: int
+        self,
+        tmp_path: Path,
+        target: int,
+        pinned: str | None,
+        summarizes: bool,
+        pairs_survive: bool,
     ) -> None:
-        """Both tiers, and neither leaves an orphaned call or return."""
+        """Neither tier leaves an orphaned call or return.
+
+        Three regimes, because two of them cannot see the invariant. Under
+        summarization alone the tool tail is emptied — 0 calls and 0 returns — and
+        ``set() - set() == set()`` holds for every possible implementation, so that
+        case certifies nothing about the summarizing tier. The third regime is the
+        one that asks it the question: a pin larger than the target forces
+        summarization AND leaves the recent pairs standing. Measured across the
+        three: 8/8 pairs, 0/0, 7/7.
+
+        The canary says *something* compacted; ``pairs_survive`` says whether there
+        was anything left to pair. Both are needed, because round 1 of this PR's
+        review found exactly this disease one layer up.
+        """
         settings = _settings(tmp_path, target=target)
-        history = _mixed_history(8)
-        views, _ = await _drive(settings, list(build_compaction(settings)), history)
+        history = _mixed_history(8, pinned=pinned)
+        views, roles = await _drive(settings, list(build_compaction(settings)), history)
         _assert_compaction_fired(views, history)
+        assert ("summarizer" in roles) is summarizes, "this regime is not the one named"
         call_ids = set()
         return_ids = set()
         for message in views[0]:
@@ -204,15 +282,36 @@ class TestStructuralInvariants:
                     call_ids.add(part.tool_call_id)
                 elif isinstance(part, ToolReturnPart):
                     return_ids.add(part.tool_call_id)
+        assert bool(call_ids) is pairs_survive, (
+            "the regime did not leave what it is supposed to leave, so the "
+            "pairing assertions below may be vacuous"
+        )
         assert call_ids - return_ids == set()
         assert return_ids - call_ids == set()
 
-    @pytest.mark.parametrize("target", [1000, 3000])
-    async def test_a_pinned_part_survives_every_tier(self, tmp_path: Path, target: int) -> None:
+    @pytest.mark.parametrize(
+        ("target", "pin_text", "summarizes"),
+        [
+            (3000, "NEVER DROP: tenant=acme, currency=USD", False),
+            (1000, "NEVER DROP: tenant=acme, currency=USD", True),
+            (3000, f"NEVER DROP: tenant=acme, currency=USD {_GIANT_PIN}", True),
+        ],
+        ids=["masking-only", "summarizing", "summarizing-with-a-tail"],
+    )
+    async def test_a_pinned_part_survives_whichever_tiers_run(
+        self, tmp_path: Path, target: int, pin_text: str, summarizes: bool
+    ) -> None:
+        """ "Every tier" is a claim about the pair of cases, not about each one.
+
+        A small pin at target=3000 never reaches the summarizing tier at all, so
+        ``summarizes`` is asserted per case: it is what stops the parametrization
+        quietly collapsing to one regime after an estimator change upstream.
+        """
         settings = _settings(tmp_path, target=target)
-        history = _mixed_history(8, pinned="NEVER DROP: tenant=acme, currency=USD")
-        views, _ = await _drive(settings, list(build_compaction(settings)), history)
+        history = _mixed_history(8, pinned=pin_text)
+        views, roles = await _drive(settings, list(build_compaction(settings)), history)
         _assert_compaction_fired(views, history)
+        assert ("summarizer" in roles) is summarizes, "this regime is not the one named"
         pinned = [
             part
             for message in views[0]
@@ -524,7 +623,7 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     def test_a_prompt_without_the_placeholder_is_refused(self, tmp_path: Path) -> None:
         """Otherwise the summary is written from nothing and replaces history."""
-        with pytest.raises(ValueError, match=r"must contain the '\{messages\}' placeholder"):
+        with pytest.raises(ValueError, match=r"must substitute the '\{messages\}' placeholder"):
             build_compaction(_settings(tmp_path), summary_prompt="Summarize concisely.")
 
     def test_an_unresolvable_brace_is_refused(self, tmp_path: Path) -> None:
@@ -542,6 +641,126 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             summary_prompt='Output JSON like {{"intent": "x"}}\n\n{messages}',
         )
         assert capabilities
+
+    @pytest.mark.parametrize(
+        "unresolvable",
+        ['Output JSON like {"intent": "x"}\n\n{messages}', "{messages} then {0}", "a { brace"],
+        ids=["stray-open-brace-pair", "positional-field", "lone-open-brace"],
+    )
+    def test_every_kind_of_unresolvable_brace_is_refused_with_guidance(
+        self, tmp_path: Path, unresolvable: str
+    ) -> None:
+        """str.format raises three different exception types on these.
+
+        A literal-brace pair raises `KeyError`, a positional field `IndexError`, a
+        lone brace `ValueError` from the parser. All three have to arrive as the
+        same `ValueError` carrying the escape instructions, or a caller gets a bare
+        parser complaint — and narrowing the caught set is invisible to a suite that
+        only tries one of them.
+        """
+        with pytest.raises(ValueError, match=r"double any literal braces"):
+            build_compaction(_settings(tmp_path), summary_prompt=unresolvable)
+
+    @pytest.mark.parametrize(
+        "doubled",
+        [
+            "Summarize.\n\n{{messages}}",
+            'Output JSON like {{"intent": "x"}}\n\n{{messages}}',
+        ],
+        ids=["placeholder-alone", "everything-doubled"],
+    )
+    def test_a_doubled_placeholder_is_refused_despite_containing_the_text(
+        self, tmp_path: Path, doubled: str
+    ) -> None:
+        """The hole a substring test leaves, and the route a caller takes into it.
+
+        `{messages}` is a substring of `{{messages}}`, so looking for the
+        placeholder in the text accepts an escaped brace that renders as literal
+        text and substitutes nothing — the summarizer is then handed an instruction
+        with no transcript and its output replaces the history anyway. The caller
+        gets there by obeying this module's own advice to double their literal
+        braces: doubling all of them takes the placeholder with it.
+        """
+        with pytest.raises(ValueError, match=r"only as literal text"):
+            build_compaction(_settings(tmp_path), summary_prompt=doubled)
+
+    @pytest.mark.parametrize(
+        "accepted",
+        ["Summarize.\n\n{messages}", "{messages!r}", "{messages:>10}", "{{{messages}}}"],
+        ids=["plain", "repr-conversion", "format-spec", "braced-placeholder"],
+    )
+    def test_a_prompt_that_substitutes_is_accepted(self, tmp_path: Path, accepted: str) -> None:
+        """Rendering is the more permissive test, and correctly so.
+
+        A conversion and a format spec both substitute at format time, so refusing
+        them would be the guard over-reaching. `{{{messages}}}` is a literal brace
+        either side of a real placeholder.
+        """
+        assert build_compaction(_settings(tmp_path), summary_prompt=accepted)
+
+    def test_the_prompt_is_checked_even_when_compaction_is_disabled(self, tmp_path: Path) -> None:
+        """`enabled` comes from settings, so the error must not depend on it.
+
+        A host with `compaction.enabled = false` in dev and `true` in prod would
+        otherwise meet its broken prompt for the first time in prod. Validating
+        before honoring the flag is deliberate, and moving the check below the early
+        return leaves the whole suite green without this.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(enabled=False, target_tokens=3000),
+        )
+        with pytest.raises(ValueError, match=r"must substitute"):
+            build_compaction(settings, summary_prompt="Summarize concisely.")
+        # And the disabled path still returns nothing for a prompt that is fine.
+        assert build_compaction(settings, summary_prompt="Summarize.\n\n{messages}") == []
+
+    @pytest.mark.parametrize(
+        ("substitute", "refusal"),
+        [("{transcript}", r"cannot resolve"), ("", r"must substitute")],
+        ids=["variable-renamed", "substitution-dropped"],
+    )
+    def test_eljas_own_default_prompt_is_checked_the_same_way(
+        self, substitute: str, refusal: str
+    ) -> None:
+        """The anchor guard and the placeholder guard are different strings.
+
+        `extend_summary_prompt` needs `<messages>` to insert the skills warning; the
+        summarizer substitutes `{messages}`. The harness pin is a range, so a patch
+        release could keep the anchor and rename the variable — and then every
+        convenience-path caller would silently get a prompt that substitutes
+        nothing, on the one path no caller can override.
+
+        Fabricated by editing the upstream default in place, which is the only way
+        to reach the state a future release would put us in. Two shapes of drift: a
+        renamed variable, which `str.format` refuses outright, and a dropped
+        substitution, which it silently no-ops. Both must be refused, and only one
+        of them announces itself.
+        """
+        function = SummarizingCompaction.__init__
+        defaulted = [
+            parameter.name
+            for parameter in inspect.signature(function).parameters.values()
+            if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and parameter.default is not inspect.Parameter.empty
+        ]
+        original = function.__defaults__
+        assert original is not None and len(original) == len(defaulted)
+        index = defaulted.index("summary_prompt")
+        drifted = str(original[index]).replace("{messages}", substitute)
+        assert "<messages>" in drifted, "the fabricated prompt must keep the anchor"
+        assert "{messages}" not in drifted
+
+        default_summary_prompt.cache_clear()
+        function.__defaults__ = (*original[:index], drifted, *original[index + 1 :])
+        try:
+            with pytest.raises(ValueError, match=refusal):
+                default_summary_prompt()
+        finally:
+            function.__defaults__ = original
+            default_summary_prompt.cache_clear()
+        # And the real default passes the same check it is now subject to.
+        assert "{messages}" in default_summary_prompt()
 
     def test_a_valid_prompt_is_accepted(self, tmp_path: Path) -> None:
         assert build_compaction(_settings(tmp_path), summary_prompt="Summarize.\n\n{messages}")

@@ -249,9 +249,11 @@ Replacing the policy wholesale is always available: build your own
 `TieredCompaction` and pass it as a capability instead of calling the factory.
 
 **Put `ReportContextUsage` last.** None of these capabilities declare an
-ordering, so list order decides what reporting measures. On one measured run the
-same turn reported 1177 tokens with reporting after compaction and 7239 with it
-before — the second number describes a request that was never sent.
+ordering, so list order decides what reporting measures. Measured on the same
+turn: ~1k tokens with reporting after compaction, ~6k with it before, where the
+second number describes a request that was never sent. Exact figures move with
+the harness's estimator, so treat the six-fold gap as the finding, not the
+numbers.
 
 **What survives, measured not assumed.** Pinned parts
 (`pydantic_ai_harness.compaction.pin`) survive every tier. Tool call/result
