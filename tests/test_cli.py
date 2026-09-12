@@ -272,3 +272,64 @@ def test_main_handles_keyboard_interrupt(
     mocker.patch("sys.argv", ["elja", "chat"])
     main()
     assert "interrupted" in capsys.readouterr().out
+
+
+class TestABrokenStatusSinkCannotKillATurn:
+    """Status is display telemetry; enforcement belongs in a model wrapper.
+
+    Before this, a sink that raised aborted `run_turn` *and* took the turn's
+    history with it, because the exception escaped before the session was saved.
+    """
+
+    async def test_a_raising_sink_neither_aborts_the_run_nor_loses_the_history(
+        self, tmp_path: Path
+    ) -> None:
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+        (tmp_path / "a.txt").write_text("hello")
+        turns: list[int] = []
+
+        async def sf(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[StreamItem]:
+            turns.append(1)
+            if len(turns) == 1:
+                # A streamed tool call, so the status sink actually fires.
+                yield {1: DeltaToolCall(name="list_dir", json_args='{"path": "."}')}
+            else:
+                yield "done"
+
+        labels: list[str] = []
+
+        def broken_sink(label: str) -> None:
+            labels.append(label)
+            raise RuntimeError(f"sink died on {label!r}")
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(stream_function=sf),
+            deps_type=EljaDeps,
+            toolsets=[build_toolset(settings)],
+        )
+        session = Session(tmp_path / "s.json")
+        answer = await run_turn(
+            agent,
+            settings,
+            session,
+            "go",
+            on_delta=lambda _d: None,
+            on_status=broken_sink,
+        )
+        assert answer == "done"
+        # The sink really was reached, and raised, and neither killed the turn
+        # nor took its history with it.
+        assert labels == ["list_dir"]
+        assert session.load(), "the turn's history was lost with the sink"
+
+    def test_notify_tolerates_no_sink_at_all(self) -> None:
+        from elja.deps import notify
+
+        notify(None, "label")  # must not raise
+
+    def test_notify_passes_the_label_through_when_the_sink_works(self) -> None:
+        from elja.deps import notify
+
+        seen: list[str] = []
+        notify(seen.append, "thinking…")
+        assert seen == ["thinking…"]

@@ -23,7 +23,7 @@ from pydantic_ai.messages import (
 from rich.console import Console
 
 from elja.agent import build_agent, build_usage_limits
-from elja.deps import EljaDeps
+from elja.deps import EljaDeps, notify
 from elja.mcp import build_mcp_toolsets, preflight_mcp_toolsets, toolset_name
 from elja.model import effective_endpoint
 from elja.session import Session
@@ -148,11 +148,9 @@ async def run_turn(
             elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                 emit(event.delta.content_delta)
             elif isinstance(event, PartStartEvent) and isinstance(event.part, ThinkingPart):
-                if on_status is not None:
-                    on_status("thinking…")
+                notify(on_status, "thinking…")
             elif isinstance(event, FunctionToolCallEvent):
-                if on_status is not None:
-                    on_status(event.part.tool_name)
+                notify(on_status, event.part.tool_name)
             elif isinstance(event, AgentRunResultEvent):
                 result = event.result
     if result is None:  # pragma: no cover - failures re-raise from the iterator

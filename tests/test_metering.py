@@ -18,7 +18,7 @@ What elja does NOT provide is a spend ledger. See ``docs/EMBEDDING.md``.
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic_ai import Agent, ModelRetry, RunContext
@@ -36,6 +36,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from elja.compaction import build_compaction
 from elja.deps import EljaDeps
@@ -80,6 +81,23 @@ class GuardedModel(WrapperModel):
         self._admit()
         self.dispatches.append(self.tag)
         return await super().request(messages, model_settings, model_request_parameters)
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """A third provider-reaching hook, and a real call on every provider.
+
+        pydantic-ai invokes this before EVERY request when
+        ``UsageLimits.count_tokens_before_request`` is set, and routes it through
+        ``check_allow_model_requests()`` like any other model request. A guard on
+        ``request``/``request_stream`` alone never sees it.
+        """
+        self._admit()
+        self.dispatches.append(f"{self.tag}:count_tokens")
+        return await super().count_tokens(messages, model_settings, model_request_parameters)
 
     @asynccontextmanager
     async def request_stream(
@@ -152,6 +170,22 @@ def _streamable() -> FunctionModel:
     return FunctionModel(stream_function=stream)
 
 
+def _counting_model() -> FunctionModel:
+    """A model that implements count_tokens, which FunctionModel does not."""
+
+    class Counting(WrapperModel):
+        async def count_tokens(
+            self,
+            messages: list[ModelMessage],
+            model_settings: ModelSettings | None,
+            model_request_parameters: ModelRequestParameters,
+        ) -> RequestUsage:
+            """Answer without a network call, as a provider would with one."""
+            return RequestUsage(input_tokens=11)
+
+    return cast("FunctionModel", Counting(_script([])))
+
+
 def _compacting_settings(tmp_path: Path) -> EljaSettings:
     return EljaSettings(
         workspace=WorkspaceConfig(root=tmp_path),
@@ -214,6 +248,83 @@ class TestAdmissionRunsBeforeEveryRequest:
         (cap,) = build_compaction(_compacting_settings(tmp_path))
         tiers = cap.tiers  # type: ignore[attr-defined]
         assert tiers[1].model is None
+
+
+class TestCountTokensIsGuardedToo:
+    """The hook a two-method guard misses entirely."""
+
+    async def test_admission_fires_for_the_count_tokens_dispatch(self, tmp_path: Path) -> None:
+        settings = _compacting_settings(tmp_path)
+        admissions: list[str] = []
+        guarded = GuardedModel(_counting_model(), "main", admissions)
+        agent: Agent[EljaDeps, str] = Agent(guarded, deps_type=EljaDeps)
+        await agent.run(
+            "go",
+            deps=EljaDeps.from_settings(settings),
+            usage_limits=UsageLimits(request_limit=5, count_tokens_before_request=True),
+        )
+        # Counted first, then the request itself — both through the guard.
+        assert guarded.dispatches == ["main:count_tokens", "main"]
+        assert admissions == ["main", "main"]
+
+    async def test_a_denial_stops_the_count_tokens_dispatch(self, tmp_path: Path) -> None:
+        settings = _compacting_settings(tmp_path)
+        admissions: list[str] = []
+        guarded = GuardedModel(_counting_model(), "main", admissions, deny=True)
+        agent: Agent[EljaDeps, str] = Agent(guarded, deps_type=EljaDeps)
+        with pytest.raises(BudgetDeniedError):
+            await agent.run(
+                "go",
+                deps=EljaDeps.from_settings(settings),
+                usage_limits=UsageLimits(request_limit=5, count_tokens_before_request=True),
+            )
+        assert admissions == ["main"]
+        assert guarded.dispatches == []
+
+    async def test_without_the_flag_count_tokens_is_never_reached(self, tmp_path: Path) -> None:
+        """So the assertions above are about the flag, not about every run."""
+        settings = _compacting_settings(tmp_path)
+        admissions: list[str] = []
+        guarded = GuardedModel(_counting_model(), "main", admissions)
+        agent: Agent[EljaDeps, str] = Agent(guarded, deps_type=EljaDeps)
+        await agent.run("go", deps=EljaDeps.from_settings(settings))
+        assert guarded.dispatches == ["main"]
+
+
+class TestSummarizerAttribution:
+    async def test_model_settings_distinguish_compaction_from_a_main_request(
+        self, tmp_path: Path
+    ) -> None:
+        """One guard instance, two phases — no upstream patch needed."""
+        settings = _compacting_settings(tmp_path)
+        phases: list[str | None] = []
+
+        class PhaseReadingGuard(WrapperModel):
+            async def request(
+                self,
+                messages: list[ModelMessage],
+                model_settings: ModelSettings | None,
+                model_request_parameters: ModelRequestParameters,
+            ) -> ModelResponse:
+                """Record the phase tag the settings carried."""
+                headers = (model_settings or {}).get("extra_headers") or {}
+                phases.append(headers.get("x-phase"))
+                return await super().request(messages, model_settings, model_request_parameters)
+
+        agent: Agent[EljaDeps, str] = Agent(
+            PhaseReadingGuard(_script([])),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(
+                settings,
+                summarizer_model_settings={"extra_headers": {"x-phase": "compaction"}},
+            ),
+        )
+        await agent.run(
+            "continue",
+            message_history=_bulky_history(8),
+            deps=EljaDeps.from_settings(settings),
+        )
+        assert phases == ["compaction", None]
 
 
 class TestDenialIsTerminal:
@@ -319,12 +430,32 @@ class TestDenialIsTerminal:
 
 
 class TestUsageAttribution:
-    async def test_the_summary_attempt_is_counted_once(self, tmp_path: Path) -> None:
-        """Parent totals roll the summary up; they do not post it twice."""
+    async def test_the_summary_attempt_is_billed_exactly_once(self, tmp_path: Path) -> None:
+        """Parent totals roll the summary up; they do not post it twice.
+
+        ``usage.requests`` counts committed request STEPS, not provider
+        dispatches, so a double-posted attempt would be invisible in it. The
+        claim has to be made against the tokens: give the two phases distinct
+        usage and assert the parent total is the sum, once.
+        """
         settings = _compacting_settings(tmp_path)
         roles: list[str] = []
         admissions: list[str] = []
-        guarded = GuardedModel(_script(roles), "main", admissions)
+
+        def billed(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                roles.append("summarizer")
+                return ModelResponse(
+                    parts=[TextPart(content="## Intent\naudit the files")],
+                    usage=RequestUsage(input_tokens=1000, output_tokens=7),
+                )
+            roles.append("agent")
+            return ModelResponse(
+                parts=[TextPart(content="done")],
+                usage=RequestUsage(input_tokens=30, output_tokens=3),
+            )
+
+        guarded = GuardedModel(FunctionModel(billed), "main", admissions)
         agent: Agent[EljaDeps, str] = Agent(
             guarded, deps_type=EljaDeps, capabilities=build_compaction(settings)
         )
@@ -334,6 +465,8 @@ class TestUsageAttribution:
             deps=EljaDeps.from_settings(settings),
         )
         assert roles == ["summarizer", "agent"]
-        # One summarizer request + one agent request, each counted exactly once.
+        assert result.usage.input_tokens == 1030
+        assert result.usage.output_tokens == 10
+        # Companion, not the claim: two committed steps, two admissions.
         assert result.usage.requests == 2
         assert len(admissions) == 2

@@ -29,7 +29,8 @@ import inspect
 from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.models import KnownModelName, Model
+from pydantic_ai.models import Model
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai_harness.compaction import (
     ClearToolResults,
     SummarizingCompaction,
@@ -46,20 +47,51 @@ CLEARED_PLACEHOLDER = (
 # The harness's structured summary prompt, extended with a skills warning:
 # loaded skill bodies travel inside history as tool returns, so a summary
 # that drops the load silently unloads the skill.
-_SUMMARY_PROMPT: str = str(
-    inspect.signature(SummarizingCompaction.__init__).parameters["summary_prompt"].default
-).replace(
-    "<messages>",
+_SKILLS_WARNING = (
     "If any skills were loaded via load_capability in the conversation, state under "
     "'## Open questions' that they are no longer loaded and must be re-loaded via "
-    "load_capability before use.\n\n<messages>",
+    "load_capability before use.\n\n"
+)
+_ANCHOR = "<messages>"
+
+
+def extend_summary_prompt(harness_default: str) -> str:
+    """Insert elja's skills warning into the harness's summary prompt.
+
+    Loaded skill bodies travel as tool returns inside history, so a summary that
+    drops the load silently unloads the skill. The catalog survives, so the model
+    can re-load it — if it is told.
+
+    Args:
+        harness_default: The harness's own ``summary_prompt`` default.
+
+    Returns:
+        The prompt with the warning inserted before the transcript.
+
+    Raises:
+        RuntimeError: If the anchor is absent. A plain ``str.replace`` would
+            no-op silently and drop the warning, and the harness pin is a range,
+            so a patch release could reword the prompt. Failing loudly at import
+            beats shipping a prompt that quietly lost its warning.
+    """
+    if _ANCHOR not in harness_default:
+        raise RuntimeError(
+            f"the harness summary prompt no longer contains the {_ANCHOR!r} anchor, "
+            "so elja's skills warning cannot be inserted; update elja.compaction"
+        )
+    return harness_default.replace(_ANCHOR, f"{_SKILLS_WARNING}{_ANCHOR}")
+
+
+_SUMMARY_PROMPT: str = extend_summary_prompt(
+    str(inspect.signature(SummarizingCompaction.__init__).parameters["summary_prompt"].default)
 )
 
 
 def build_compaction(
     settings: EljaSettings,
     *,
-    summarizer_model: Model | KnownModelName | str | None = None,
+    summarizer_model: Model | None = None,
+    summarizer_model_settings: ModelSettings | None = None,
 ) -> list[AbstractCapability[Any]]:
     """Build the compaction capability from settings (empty list if disabled).
 
@@ -73,6 +105,18 @@ def build_compaction(
             summarization should use a different provider, a cheaper model, or
             its own separately-attributed guard. An instance is handed to the
             summarizer untouched, never rebuilt from its display name.
+
+            Deliberately a ``Model``, not a model *name*: a name makes the
+            summarizer build a fresh provider client from environment
+            credentials, ignoring this config's ``base_url`` and bypassing
+            anything the host wrapped — and an unknown one fails at the first
+            summarization, deep in a long conversation.
+        summarizer_model_settings: Agent-level settings for the summarizer's own
+            request. These reach ``Model.request``/``request_stream`` as the
+            ``model_settings`` argument, which is how **one** guard instance can
+            tell a compaction request from a main one without a second model
+            object: tag it, e.g.
+            ``{"extra_headers": {"x-phase": "compaction"}}``.
 
     Returns:
         A single tiered compaction capability, or ``[]`` when disabled.
@@ -102,6 +146,7 @@ def build_compaction(
                     keep_tokens=cfg.target_tokens // 3,
                     preserve_first_user_message=True,
                     incremental=True,
+                    model_settings=summarizer_model_settings,
                     summary_prompt=_SUMMARY_PROMPT,
                 ),
             ],

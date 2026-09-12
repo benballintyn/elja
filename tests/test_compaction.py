@@ -15,7 +15,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from elja.compaction import build_compaction
+from elja.compaction import _SUMMARY_PROMPT, build_compaction, extend_summary_prompt
 from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
 
@@ -64,6 +64,25 @@ class TestConfig:
     def test_enabled_builds_one_tiered_capability(self) -> None:
         (cap,) = build_compaction(EljaSettings())
         assert type(cap).__name__ == "TieredCompaction"
+
+
+class TestSummaryPromptExtension:
+    """The warning must be inserted, or its absence must be loud."""
+
+    def test_the_warning_is_inserted_before_the_transcript(self) -> None:
+        out = extend_summary_prompt("preamble\n\n<messages>\n{messages}\n</messages>")
+        assert "load_capability" in out
+        assert out.index("load_capability") < out.index("<messages>")
+
+    def test_a_reworded_harness_prompt_fails_loudly_instead_of_silently(self) -> None:
+        """A plain str.replace would no-op and drop the warning with no signal."""
+        with pytest.raises(RuntimeError, match=r"no longer contains the '<messages>' anchor"):
+            extend_summary_prompt("a prompt upstream reworded without the anchor")
+
+    def test_the_installed_harness_prompt_still_carries_the_anchor(self) -> None:
+        """Pins the dependency contract itself, not just the helper."""
+        assert "load_capability" in _SUMMARY_PROMPT
+        assert "## Key decisions" in _SUMMARY_PROMPT
 
 
 class TestMaskingBehavior:
@@ -227,6 +246,40 @@ class TestSummarizationTier:
         assert result.output == "ok"
         # One summarization for the whole conversation, not one per request.
         assert len(summarizer_calls) == 1
+
+    async def test_eljas_skills_warning_reaches_the_summarizer(self, tmp_path: Path) -> None:
+        """The module docstring promises it; a silent .replace no-op would drop it.
+
+        The harness pin is a range, so a patch release that rewords its prompt
+        would have removed the warning with no test failure at all.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(target_tokens=1000, keep_tool_pairs=1, keep_messages=2),
+        )
+        prompts: list[str] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                prompts.append(str(messages))
+                return ModelResponse(parts=[TextPart(content="## Intent\nshort")])
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(settings),
+        )
+        await agent.run(
+            "continue",
+            message_history=_history_with_tool_pairs(8, result_size=600),
+            deps=EljaDeps.from_settings(settings),
+        )
+        assert prompts, "the summarizer never ran"
+        assert "load_capability" in prompts[0]
+        # And the harness's own structure is still there, i.e. we extended it
+        # rather than replacing it.
+        assert "## Key decisions" in prompts[0]
 
     async def test_the_first_user_message_survives_summarization(self, tmp_path: Path) -> None:
         """Dropping the original task is the documented failure mode."""

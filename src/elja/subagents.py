@@ -9,7 +9,6 @@ into the parent run's usage and limits, and children get the same compaction
 policy as the parent.
 """
 
-import contextlib
 import re
 from collections.abc import Awaitable, Callable
 
@@ -22,7 +21,7 @@ from pydantic_ai.usage import UsageLimits
 
 from elja.application import build_application_agent
 from elja.compaction import build_compaction
-from elja.deps import EljaDeps
+from elja.deps import EljaDeps, notify
 from elja.model import build_model
 from elja.permissions import build_permission_gate
 from elja.settings import EljaSettings, SubagentConfig
@@ -145,10 +144,9 @@ def _make_delegate(
                 ) as events:
                     async for event in events:
                         if isinstance(event, FunctionToolCallEvent):
-                            # Status is best-effort telemetry: a broken sink
-                            # must never abort or misattribute the delegation.
-                            with contextlib.suppress(Exception):
-                                ctx.deps.on_status(f"{name} → {event.part.tool_name}")
+                            # Status is best-effort telemetry: one shared helper,
+                            # so the CLI and this path cannot diverge.
+                            notify(ctx.deps.on_status, f"{name} → {event.part.tool_name}")
                         elif isinstance(event, AgentRunResultEvent):
                             result = event.result
             if result is None:  # pragma: no cover - failures re-raise from the iterator
