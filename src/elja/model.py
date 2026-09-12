@@ -20,6 +20,7 @@ import os
 from typing import Any, cast
 
 from pydantic_ai.models import Model
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 
 from elja.settings import EljaSettings, ModelConfig
@@ -134,14 +135,39 @@ def implements_count_tokens(model: "Model | type[Model]") -> bool:
     support from a provider name: ``model.provider`` describes the model elja
     *would build*, which on the application path is not the model being used.
 
+    Wrappers are unwrapped first, because ``WrapperModel`` *defines*
+    ``count_tokens`` in order to delegate it — so the plain override test answers
+    True for every wrapper regardless of what it wraps. ``InstrumentedModel`` is a
+    ``WrapperModel``, and it is what pydantic-ai puts around a model whenever
+    instrumentation is on (``instrument=True``, ``Agent.instrument_all()``,
+    Logfire). Measured: an instrumented ``OpenAIChatModel`` answered True and then
+    raised ``NotImplementedError`` on the first request — the exact failure this
+    function exists to prevent.
+
+    A wrapper *class* has no instance to look through, so it answers False rather
+    than guessing at what it would wrap.
+
     Args:
         model: A model instance or class.
 
     Returns:
-        True if the class overrides ``count_tokens``.
+        True if the model that will actually receive the call overrides
+        ``count_tokens``.
     """
-    klass = model if isinstance(model, type) else type(model)
-    return klass.count_tokens is not Model.count_tokens
+    if isinstance(model, type):
+        return not issubclass(model, WrapperModel) and model.count_tokens is not Model.count_tokens
+    while isinstance(model, WrapperModel):
+        model = model.wrapped
+    return type(model).count_tokens is not Model.count_tokens
+
+
+def model_class_name(provider: str) -> str:
+    """The name of the model class elja builds for this provider.
+
+    Read from the same table the builders use, so a diagnostic naming the class
+    cannot drift from the class actually constructed.
+    """
+    return _MODEL_CLASSES[provider][1]
 
 
 def provider_implements_count_tokens(provider: str) -> bool:

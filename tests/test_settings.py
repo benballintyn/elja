@@ -495,3 +495,104 @@ class TestOmittingSamplingParameters:
     def test_env_value_still_parses(self, mocker: MockerFixture) -> None:
         mocker.patch.dict("os.environ", {"ELJA_MODEL__TEMPERATURE": "0.75"})
         assert EljaSettings().model.temperature == 0.75
+
+
+class TestATypoBehindALazyLeafIsStillRefused:
+    """The one place where the order of two steps decides a silent drop.
+
+    `anthropic_container.skills` is annotated `Iterable[...]`, so pydantic
+    validates it into a once-consumable `ValidatorIterator`. Two things then have
+    to happen in order: materialize it into a real list, *then* walk the two trees
+    for dropped keys. Swap them and the walk sees an iterator where it expects a
+    sequence, gives up, and a misspelled key nested inside is accepted in silence —
+    with 289 tests green, because nothing else puts a typo behind a lazy leaf.
+
+    Parametrized over the container type because that is a second, independent
+    skip: the walk used to require the ORIGINAL side be a `list`, so the same
+    config written with a tuple literal skipped it too. TOML and env can only
+    produce lists; this is the programmatic surface every test here uses.
+    """
+
+    @staticmethod
+    def _skill(**extra: object) -> dict[str, object]:
+        return {"skill_id": "s", "type": "custom", **extra}
+
+    @pytest.mark.parametrize("container", [list, tuple], ids=["list", "tuple"])
+    def test_a_nested_typo_is_refused_by_its_dotted_path(
+        self, container: type[list[object]] | type[tuple[object, ...]]
+    ) -> None:
+        with pytest.raises(ValidationError, match=r"anthropic_container\.skills\.0\.bogus"):
+            ModelConfig(
+                provider="anthropic",
+                settings={
+                    "anthropic_container": {
+                        "id": "c",
+                        "skills": container([self._skill(bogus=1)]),
+                    }
+                },
+            )
+
+    @pytest.mark.parametrize("container", [list, tuple], ids=["list", "tuple"])
+    def test_the_same_config_spelled_correctly_is_accepted_and_materialized(
+        self, container: type[list[object]] | type[tuple[object, ...]]
+    ) -> None:
+        """The positive control: the walk must not refuse a correct nested value.
+
+        And the materialization still has to hold — the value survives being read
+        twice, which is what the lazy iterator broke.
+        """
+        cfg = ModelConfig(
+            provider="anthropic",
+            settings={"anthropic_container": {"id": "c", "skills": container([self._skill()])}},
+        )
+        skills = cfg.settings["anthropic_container"]["skills"]
+        assert isinstance(skills, list)
+        assert [dict(s) for s in skills] == [dict(s) for s in skills], "consumed after one read"
+        assert len(skills) == 1
+
+
+class TestEveryUsageLimitsFieldIsReachableFromConfig:
+    """E3 asked for the *full* surface, so the surface itself is the assertion.
+
+    Both forwarding tests hand-list the eight fields, and the inheritance test
+    compares against `build_usage_limits(settings)` — so a field pydantic-ai adds
+    in a 2.x minor is absent from both sides, silently takes the upstream default,
+    and every test still passes. `AGENTS.md` says "Pin-watch: 2.x moves fast", and
+    this is what makes the next bump announce itself instead of quietly narrowing
+    what a host can configure.
+    """
+
+    def test_the_config_covers_exactly_the_upstream_dataclass(self) -> None:
+        from dataclasses import fields
+
+        from pydantic_ai.usage import UsageLimits
+
+        from elja.settings import LimitsConfig
+
+        assert {f.name for f in fields(UsageLimits)} == set(LimitsConfig.model_fields)
+
+
+class TestACeilingOfZeroIsAConfigError:
+    """Zero refuses the first request rather than capping anything.
+
+    Every other ceiling in this section carries `ge=1`; these two were widened from
+    `int` to `int | None` in the same change and missed it, so `request_limit = 0`
+    validated and then refused every run. `SubagentConfig.request_limit` already had
+    the guard, which is the inconsistency that makes it a bug rather than a choice.
+    """
+
+    @pytest.mark.parametrize("field", ["request_limit", "total_tokens_limit"])
+    @pytest.mark.parametrize("value", [0, -3])
+    def test_zero_or_negative_is_refused(self, field: str, value: int) -> None:
+        from elja.settings import LimitsConfig
+
+        with pytest.raises(ValidationError, match="greater than or equal to 1"):
+            LimitsConfig(**{field: value})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("field", ["request_limit", "total_tokens_limit"])
+    def test_one_and_none_are_both_still_accepted(self, field: str) -> None:
+        """A ceiling of one is a real choice, and None means unlimited."""
+        from elja.settings import LimitsConfig
+
+        assert getattr(LimitsConfig(**{field: 1}), field) == 1  # type: ignore[arg-type]
+        assert getattr(LimitsConfig(**{field: None}), field) is None  # type: ignore[arg-type]

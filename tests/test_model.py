@@ -342,3 +342,77 @@ class TestRequestConstruction:
         )
         merged, _ = build_model(settings).prepare_request(None, ModelRequestParameters())
         assert (merged or {}).get("google_thinking_config") == {"thinking_budget": 2048}
+
+
+class TestImplementsCountTokensSeesThroughWrappers:
+    """A wrapper DEFINES count_tokens in order to delegate it.
+
+    So the plain "does the class override the base method" test answers True for
+    every wrapper regardless of what it wraps — and `InstrumentedModel` is a
+    `WrapperModel`, put around a model whenever instrumentation is on
+    (`instrument=True`, `Agent.instrument_all()`, Logfire). A host with Logfire
+    enabled would have been told its OpenAI-compatible endpoint supports
+    count-tokens, turned the flag on, and failed every request: the exact failure
+    this helper exists to prevent. `settings.py` directs hosts here by name.
+    """
+
+    def test_an_instrumented_model_reports_what_it_wraps(self) -> None:
+        from pydantic_ai.models.instrumented import InstrumentedModel
+
+        from elja.model import build_model, implements_count_tokens
+
+        inner = build_model(EljaSettings())
+        assert type(inner).__name__ == "OpenAIChatModel"
+        # Both directions: the wrapper must not invent support...
+        assert implements_count_tokens(inner) is False
+        assert implements_count_tokens(InstrumentedModel(inner)) is False
+
+    def test_a_wrapper_does_not_hide_real_support_either(self) -> None:
+        """...nor mask it. Unwrapping that always answered False would be as wrong."""
+        from pydantic_ai.models.instrumented import InstrumentedModel
+
+        from elja.model import build_model, implements_count_tokens
+
+        inner = build_model(EljaSettings(model={"provider": "anthropic", "api_key": "x"}))  # type: ignore[arg-type]
+        assert implements_count_tokens(inner) is True
+        assert implements_count_tokens(InstrumentedModel(inner)) is True
+
+    def test_nested_wrappers_are_unwrapped_to_the_bottom(self) -> None:
+        from pydantic_ai.models.instrumented import InstrumentedModel
+
+        from elja.model import build_model, implements_count_tokens
+
+        inner = build_model(EljaSettings())
+        assert implements_count_tokens(InstrumentedModel(InstrumentedModel(inner))) is False
+
+    def test_a_wrapper_class_answers_false_rather_than_guessing(self) -> None:
+        """There is no instance to look through, so there is nothing to report."""
+        from pydantic_ai.models.wrapper import WrapperModel
+
+        from elja.model import implements_count_tokens
+
+        assert implements_count_tokens(WrapperModel) is False
+
+    def test_a_plain_class_is_still_answered_from_the_class(self) -> None:
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        from elja.model import implements_count_tokens
+
+        assert implements_count_tokens(OpenAIChatModel) is False
+
+
+def test_model_class_name_reads_the_builders_own_table() -> None:
+    """A diagnostic that names a class must read it where the class is chosen.
+
+    Only `openai` currently fails the count-tokens check, and its class really is
+    `OpenAIChatModel`, so hardcoding that string in the error message is an
+    equivalent mutant today — there is no provider for which the table and the
+    literal differ. The table lookup is still the right call: it is what keeps the
+    message true if a provider ever drops `count_tokens` upstream. Pinned here
+    directly, since the message cannot distinguish it.
+    """
+    from elja.model import model_class_name
+
+    assert model_class_name("openai") == "OpenAIChatModel"
+    assert model_class_name("anthropic") == "AnthropicModel"
+    assert model_class_name("google") == "GoogleModel"

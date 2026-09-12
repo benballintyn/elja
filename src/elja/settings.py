@@ -14,7 +14,7 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 
 import importlib
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from decimal import Decimal
 from functools import cache
 from pathlib import Path
@@ -98,6 +98,12 @@ def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> di
     # at every depth. One walk of what came back finds all of them, so a typo
     # inside google_thinking_config is refused exactly like one beside it —
     # rather than silently disabling the setting it was meant to configure.
+    # One gap, bounded: a leaf that validates into a non-Mapping OBJECT rather
+    # than a dict ends the walk, so a typo beside a correctly-spelled field of
+    # `tool_choice` (which becomes a `ToolOrOutput` dataclass) is dropped in
+    # silence. Unreachable today — ToolOrOutput has exactly one field, so you
+    # cannot get there without also spelling it right — and real the moment
+    # upstream adds a second.
     _reject(provider, _dropped_keys(settings, validated))
     return dict(validated)
 
@@ -126,6 +132,13 @@ def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:
     Walks the two trees together. Sequences are compared positionally and only
     when they are the same length, so a coercion that changes a list's shape is
     left to pydantic's own error rather than reported as a missing key.
+
+    The original side is tested as a ``Sequence``, not a ``list``. ``_materialize``
+    makes the validated side a list either way, but the original is whatever the
+    caller wrote — and a tuple literal used to skip the positional walk entirely,
+    so a misspelled key nested inside one was dropped in silence while the same
+    config with square brackets raised. TOML and env can only produce lists; this
+    is the programmatic surface, which is the one every test here uses.
     """
     dropped: list[str] = []
     if isinstance(original, Mapping):
@@ -138,7 +151,8 @@ def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:
             else:
                 dropped.extend(_dropped_keys(value, validated[key], f"{path}."))
     elif (
-        isinstance(original, list)
+        isinstance(original, Sequence)
+        and not isinstance(original, str | bytes)
         and isinstance(validated, list)
         and len(original) == len(validated)
     ):
@@ -258,8 +272,10 @@ class LimitsConfig(_Section):
       checked against the usage a response reports.
     """
 
-    request_limit: int | None = 25
-    total_tokens_limit: int | None = None
+    # ge=1 on every ceiling: zero or less refuses the first request rather than
+    # capping anything, which is a config error wearing a valid-looking value.
+    request_limit: int | None = Field(default=25, ge=1)
+    total_tokens_limit: int | None = Field(default=None, ge=1)
     cost_limit: Decimal | None = Field(default=None, ge=0)
     tool_calls_limit: int | None = Field(default=None, ge=1)
     input_tokens_limit: int | None = Field(default=None, ge=1)
@@ -434,15 +450,17 @@ class EljaSettings(BaseSettings):
         if self.limits.count_tokens_before_request:
             # Deferred import: elja.model imports this module. It also means the
             # provider SDK is only touched by a config that sets this flag.
-            from elja.model import provider_implements_count_tokens
+            from elja.model import model_class_name, provider_implements_count_tokens
 
             # Asked of the CLASS elja would build, not of a hardcoded provider
-            # list, so this stays true if upstream adds the method later.
+            # list, so this stays true if upstream adds the method later. The class
+            # is named from the same table for the same reason.
             if not provider_implements_count_tokens(self.model.provider):
                 raise ValueError(
                     "limits.count_tokens_before_request needs a model that implements "
                     f"count_tokens. model.provider {self.model.provider!r} builds "
-                    "OpenAIChatModel, which does not, so pydantic-ai would raise "
+                    f"{model_class_name(self.model.provider)}, which does not, so "
+                    "pydantic-ai would raise "
                     "NotImplementedError before the first request. Use 'anthropic' or "
                     "'google', or drop the flag — per_request_input_tokens_limit is "
                     "enforced without it. A host injecting its own model should check "
