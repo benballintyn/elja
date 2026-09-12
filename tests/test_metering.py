@@ -89,12 +89,17 @@ class GuardedModel(WrapperModel):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters,
     ) -> RequestUsage:
-        """A third provider-reaching hook, and a real call on every provider.
+        """A third provider-reaching hook, and a real call where it is implemented.
 
         pydantic-ai invokes this before EVERY request when
         ``UsageLimits.count_tokens_before_request`` is set, and routes it through
         ``check_allow_model_requests()`` like any other model request. A guard on
         ``request``/``request_stream`` alone never sees it.
+
+        Not every provider implements it: ``Model.count_tokens`` raises
+        ``NotImplementedError`` and ``OpenAIChatModel`` — elja's default — does not
+        override it, which is why this class supplies its own rather than relying on
+        a wrapped model to have one.
         """
         self._admit("count_tokens")
         self.dispatches.append(f"{self.tag}:count_tokens")
@@ -473,3 +478,38 @@ class TestUsageAttribution:
         # Companion, not the claim: two committed steps, two admissions.
         assert result.usage.requests == 2
         assert len(admissions) == 2
+
+
+class TestCountTokensBeforeRequestIsNotSafeToTurnOn:
+    """The doc claim this guards used to read as benign-where-unsupported.
+
+    It is the opposite. `Model.count_tokens` raises `NotImplementedError`, and the
+    model class elja builds for its own default provider does not override it — so
+    a host that reads "it only does something on providers that implement it",
+    turns the flag on over an LM Studio endpoint, and ships, fails every request.
+    """
+
+    def test_eljas_default_model_does_not_implement_it(self) -> None:
+        from elja.model import build_model
+
+        model = build_model(EljaSettings())
+        assert type(model).__name__ == "OpenAIChatModel"
+        assert type(model).count_tokens is Model.count_tokens
+
+    async def test_the_flag_raises_rather_than_no_opping(self) -> None:
+        """Driven through a model that inherits the base method, as OpenAIChatModel does."""
+
+        class NoCountTokens(WrapperModel):
+            """Wraps a working model but leaves count_tokens to the base class."""
+
+        agent: Agent[None, str] = Agent(NoCountTokens(_streamable()))
+        with pytest.raises(NotImplementedError, match="Token counting ahead of the request"):
+            await agent.run("go", usage_limits=UsageLimits(count_tokens_before_request=True))
+
+    def test_the_two_providers_that_do_implement_it(self) -> None:
+        """Named in the doc, so a provider dropping its implementation shows up here."""
+        from elja.model import build_model
+
+        for provider in ("anthropic", "google"):
+            model = build_model(EljaSettings(model={"provider": provider, "api_key": "x"}))  # type: ignore[arg-type]
+            assert type(model).count_tokens is not Model.count_tokens, provider

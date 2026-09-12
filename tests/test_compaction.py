@@ -92,21 +92,49 @@ class TestSummaryPromptExtension:
         assert "load_capability" in default_summary_prompt()
         assert "## Key decisions" in default_summary_prompt()
 
-    def test_importing_elja_does_not_compute_the_prompt(self) -> None:
+    def test_importing_elja_does_not_compute_the_prompt(self, tmp_path: Path) -> None:
         """A reworded harness prompt must not break ``import elja``.
 
         The anchor check raises, so computing it at import turned a cosmetic
         upstream string change into a total outage for a host that never touches
         compaction. A subprocess, because this session has already computed it.
+
+        The canary is the *outage itself*, not the cache counter. `currsize == 0`
+        is fakeable: any module-level computation that does not go through the
+        cached function leaves it at zero, so reintroducing exactly the eager call
+        this test exists to forbid passes it. Here the anchor is removed from the
+        upstream default first — so an eager elja would fail to import — and the
+        test asserts the import survives *and* that the error still arrives at
+        first use. Nothing can satisfy both with the laziness removed.
         """
         root = str(Path(elja.__file__).resolve().parent.parent)
-        probe = (
-            "import elja;"
-            "from elja.compaction import default_summary_prompt as f;"
-            "print(f.cache_info().currsize)"
+        probe = tmp_path / "probe.py"
+        probe.write_text(
+            "import inspect\n"
+            "from pydantic_ai_harness.compaction import SummarizingCompaction as S\n"
+            "init = S.__init__\n"
+            "named = [\n"
+            "    p.name\n"
+            "    for p in inspect.signature(init).parameters.values()\n"
+            "    if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD\n"
+            "    and p.default is not inspect.Parameter.empty\n"
+            "]\n"
+            "defaults = init.__defaults__\n"
+            "assert defaults is not None and len(defaults) == len(named)\n"
+            "i = named.index('summary_prompt')\n"
+            "reworded = str(defaults[i]).replace('<messages>', '<TRANSCRIPT>')\n"
+            "assert '<messages>' not in reworded\n"
+            "init.__defaults__ = (*defaults[:i], reworded, *defaults[i + 1 :])\n"
+            "import elja\n"
+            "print('IMPORT SURVIVED')\n"
+            "from elja.compaction import default_summary_prompt\n"
+            "try:\n"
+            "    default_summary_prompt()\n"
+            "except RuntimeError:\n"
+            "    print('RAISED AT FIRST USE')\n"
         )
         result = subprocess.run(
-            [sys.executable, "-c", probe],
+            [sys.executable, str(probe)],
             capture_output=True,
             text=True,
             check=True,
@@ -114,7 +142,10 @@ class TestSummaryPromptExtension:
             cwd=root,
             env={**os.environ, "PYTHONPATH": root},
         )
-        assert result.stdout.strip() == "0"
+        assert result.stdout.split() == ["IMPORT", "SURVIVED", "RAISED", "AT", "FIRST", "USE"], (
+            result.stdout,
+            result.stderr,
+        )
 
 
 class TestMaskingBehavior:

@@ -292,7 +292,12 @@ class TestABrokenStatusSinkCannotKillATurn:
         async def sf(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[StreamItem]:
             turns.append(1)
             if len(turns) == 1:
-                # A streamed tool call, so the status sink actually fires.
+                # BOTH status sites, in order. There are two — a thinking part and a
+                # streamed tool call — and a test driving only the tool call leaves
+                # the other's guard unpinned: removing it survived the whole suite.
+                # A sink that raises on the FIRST label is what makes the thinking
+                # site's guard load-bearing.
+                yield {0: DeltaThinkingPart(content="which directory")}
                 yield {1: DeltaToolCall(name="list_dir", json_args='{"path": "."}')}
             else:
                 yield "done"
@@ -318,9 +323,9 @@ class TestABrokenStatusSinkCannotKillATurn:
             on_status=broken_sink,
         )
         assert answer == "done"
-        # The sink really was reached, and raised, and neither killed the turn
-        # nor took its history with it.
-        assert labels == ["list_dir"]
+        # The sink really was reached, and raised, at BOTH sites, and neither
+        # killed the turn nor took its history with it.
+        assert labels == ["thinking…", "list_dir"]
         assert session.load(), "the turn's history was lost with the sink"
 
     def test_notify_tolerates_no_sink_at_all(self) -> None:
@@ -349,3 +354,36 @@ class TestABrokenStatusSinkCannotKillATurn:
 
         with pytest.raises(escaping):
             notify(raising, "x")
+
+
+class TestTheDeltaSinkIsDeliberatelyNotSuppressed:
+    """The other half of an asymmetry the docs state as intentional.
+
+    `docs/EMBEDDING.md` says the status sink is suppressed and the text-delta sink
+    is not — "two sinks, two different answers, on purpose". Only the suppressed
+    half was tested. With `notify` now living in the same module, "make all the
+    sinks safe" is the obvious next refactor, and it would silently invert a
+    documented contract.
+    """
+
+    async def test_a_raising_delta_sink_aborts_the_turn_and_its_history_is_not_saved(
+        self, tmp_path: Path
+    ) -> None:
+        """Swallowing the model's own output would be worse than failing loudly."""
+        settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
+
+        async def sf(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[StreamItem]:
+            yield "the answer"
+
+        def broken_delta(_delta: str) -> None:
+            raise RuntimeError("stdout closed")
+
+        agent: Agent[EljaDeps, str] = Agent(FunctionModel(stream_function=sf), deps_type=EljaDeps)
+        session = Session(tmp_path / "s.json")
+        with pytest.raises(RuntimeError, match="stdout closed"):
+            await run_turn(
+                agent, settings, session, "go", on_delta=broken_delta, on_status=lambda _s: None
+            )
+        # History is saved only on success, so a dead output sink loses the turn —
+        # which is the documented trade, not an accident.
+        assert session.load() == []

@@ -73,7 +73,8 @@ def extend_summary_prompt(harness_default: str) -> str:
         RuntimeError: If the anchor is absent. A plain ``str.replace`` would
             no-op silently and drop the warning, and the harness pin is a range,
             so a patch release could reword the prompt. Failing loudly at import
-            beats shipping a prompt that quietly lost its warning.
+            beats shipping a prompt that quietly lost its warning. Loudly at
+            FIRST USE, not at import: see ``default_summary_prompt``.
     """
     if _ANCHOR not in harness_default:
         raise RuntimeError(

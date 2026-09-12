@@ -11,9 +11,18 @@ This document covers what elja guarantees for a host that meters paid
 requests, and — just as important — what it does not.
 
 Versions these statements were verified against: pydantic-ai-slim **2.36.0**,
-pydantic-ai-harness **0.27.0**, Python 3.12. The pins are ranges
-(`pydantic-ai-slim >=2.36,<3`, `pydantic-ai-harness >=0.27,<0.28`), so the
-behaviors below are pinned by `tests/test_metering.py` rather than assumed.
+pydantic-ai-harness **0.27.0**, Python 3.12. Every claim below was measured at
+those versions against the installed packages.
+
+The pins are ranges (`pydantic-ai-slim >=2.36,<3`, `pydantic-ai-harness
+>=0.27,<0.28`), so *measured* and *regression-guarded* are not the same thing and
+this document distinguishes them. `tests/test_metering.py` guards the subset named
+under "Metering and admission control" below — `request`, `request_stream` and
+`count_tokens`, each with a positive control. Everything else here is marked
+**measured, not guarded**: true at these versions, and a minor release could
+change it with the suite still green. `merge_model_settings`' own source carries
+`# Note: we may want merge recursively if/when we add non-primitive values`, which
+is exactly the kind of drift to expect.
 
 ## Metering and admission control
 
@@ -27,7 +36,7 @@ straight to the provider.** There are five, and the last one is the odd case:
 | --- | --- |
 | `request` | the ordinary non-streamed model call |
 | `request_stream` | the streamed call — `request` does **not** cover it |
-| `count_tokens` | before *every* request when `UsageLimits.count_tokens_before_request` is set. A real network call on the providers that implement it, routed through `check_allow_model_requests()` like any other model request |
+| `count_tokens` | before *every* request when `UsageLimits.count_tokens_before_request` is set. A real network call on the providers that implement it, routed through `check_allow_model_requests()` like any other model request. On one that does **not** implement it — `OpenAIChatModel`, elja's default — the flag raises `NotImplementedError` on every request rather than no-opping |
 | `compact_messages` | provider-side compaction, reachable if you attach a capability that uses it |
 | `cancel_suspended_response` | cancelling a suspended background response. On `OpenAIResponsesModel` this issues a real `responses.cancel` HTTP call, and it is reached from the ordinary agent path on the run's outermost model |
 
@@ -68,6 +77,12 @@ class GuardedModel(WrapperModel):
     async def count_tokens(self, messages, model_settings, model_request_parameters):
         await self.budget.reserve(self.attribution)
         return await super().count_tokens(messages, model_settings, model_request_parameters)
+
+    # compact_messages is NOT overridden here: nothing in pydantic-ai-harness calls
+    # Model.compact_messages (the name appears only as an OTel span), so no elja
+    # host reaches it today. That is a fact about the installed version, not a
+    # guarantee — the rule above still applies, so add it if you attach a
+    # capability that uses provider-side compaction.
 ```
 
 What elja guarantees:
@@ -171,9 +186,17 @@ above; recorded rather than pretended to be covered.
   outside your guard, so any genuine `ModelAPIError` from the first model
   produces an un-admitted dispatch to the second. Put the `FallbackModel` inside
   the guard, not the other way round.
-- **`count_tokens_before_request` is not self-evidently enforcement.** It only
-  does something on providers that implement a count-tokens call, and it is
-  itself a guarded dispatch (see the table above).
+- **`count_tokens_before_request` breaks the run on a provider that does not
+  implement it.** It does not degrade quietly. `Model.count_tokens` raises
+  `NotImplementedError`, and `OpenAIChatModel` — which is what `build_model`
+  returns, and what every LM Studio / OpenAI-compatible endpoint goes through —
+  does not override it, so **every request raises** with the flag on. Measured:
+  `NotImplementedError: Token counting ahead of the request is not supported by
+  OpenAIChatModel`. Turn it on only against a model you have confirmed implements
+  `count_tokens`: of the three elja builds, `AnthropicModel` and `GoogleModel` do,
+  `OpenAIChatModel` does not (`OpenAIResponsesModel` does, but elja's `openai`
+  dialect builds the chat model). Where it *is* supported it is a real network
+  call and a guarded dispatch, so it is also not free.
 - **`PermissionGate` is not usable on the embedded path.** It reads
   `ctx.deps.confirm` and is therefore typed to `EljaDeps`. A host with its own
   approval UX should gate inside its own toolset.
