@@ -280,6 +280,123 @@ your own tools that never arises; if you mix the two, that text is still there.
 ## Persistence
 
 History is caller-owned on the embedded path. Pass `message_history=` and
-serialize with pydantic-ai's own message adapter. elja's named JSON `Session`
-remains for CLI users and is not involved here; the embedded path writes no
-files at all.
+serialize with pydantic-ai's own message adapter (`ModelMessagesTypeAdapter`).
+elja's named JSON `Session` remains for CLI users and is not involved here; the
+embedded path writes no files at all.
+
+Use the adapter rather than a representation of your own. Opaque provider state —
+thinking signatures, provider ids, reasoning item ids — round-trips because the
+adapter owns the schema, and hand-rolling a second one is how that state gets
+dropped.
+
+**What `run_stream_events` hands back is the whole conversation**, history
+included, not just the messages this turn produced. Persist that; a host saving
+`new_messages()` alone drops every earlier turn on each save.
+
+**Switching providers mid-history is a decision, not a no-op.** pydantic-ai will
+not replay one provider's thinking *signature* to another. It does replay the
+reasoning *content*, on every mapping checked: OpenAI's Responses path sends a
+foreign thinking part either as an assistant message wrapped in the profile's
+thinking tags or as a reasoning summary with no encrypted content, and the Anthropic
+and Google mappings forward the content too. So a filter keyed on the signature
+hides exactly the parts that cross. Decide explicitly —
+log it, drop it, or start a fresh conversation. `foreign_thinking_parts` in the
+example shows what to look at, including the two things that make "foreign"
+subtle: a part carrying no `provider_name` inherits its message's, and provider
+families alias (`google`/`google-gla`, `google-vertex`/`google-cloud`).
+
+## Events, checkpoints and cancellation
+
+**The stream does not label the answer while it is arriving.**
+`FinalResultEvent` means "a part that could be the final output has started", so
+a turn that narrates and then calls a tool emits it too — twice in one turn,
+measured. Take the answer from `AgentRunResultEvent` and nowhere else. A host
+that accumulates text deltas into its answer ships the narration with it. For the
+same reason, a display sink fed from the stream sees the narration *and* the
+answer; nothing at that point can separate them.
+
+Two smaller facts a UI will meet: an empty (`""`) text delta is a real event
+rather than something the framework filters, and a thinking part can arrive as
+deltas like any other part.
+
+**A turn that dies still owes the host its completed work.** This is the one that
+bites: a tool that already ran has changed the host's world, so a failure that
+discards the run's messages leaves the host with an effect and no record of it —
+and the next turn, replaying a history with no trace of the write, writes again.
+Everything the run completed is reachable on the handle, synchronously, from
+inside the `except`:
+
+```python
+async with agent.run_stream_events(prompt, deps=deps, message_history=history) as events:
+    try:
+        async for event in events:
+            ...
+    except BaseException:
+        try:
+            # `all_messages()` is the run's own live list, so copy it — and copy it
+            # through a repair, or this history cannot be replayed (next paragraph).
+            partial = close_interrupted_calls(events.all_messages())
+            spent = events.usage
+        except UserError:
+            pass          # the run never bound: nothing completed, nothing to keep
+        raise
+```
+
+`except BaseException`, not `except Exception`: an external cancellation — a SIGTERM,
+an enclosing timeout — is a `BaseException`, and it is the case where losing the
+checkpoint costs the most. Both accessors raise `UserError` until the first
+iteration binds the run, and that window is real: the background run task is created
+but not awaited, so a cancellation landing in the few event-loop steps before the
+binding arrives here unbound. Nothing completed then, so the checkpoint is empty —
+and the guard is what stops a framework complaint about iteration order replacing
+the failure the host has to see.
+
+**A checkpoint with an unanswered tool call cannot be replayed, and that is exactly
+the case you are checkpointing for.** Providers refuse a history whose response
+carries a `ToolCallPart` with no result, and so does pydantic-ai: replaying one with
+a new user prompt raises `UserError('Cannot provide a new user prompt when the
+message history contains unprocessed tool calls.')`, and replaying it *without* a
+prompt re-executes the call — the duplicate side effect you were avoiding, one level
+down. pydantic-ai repairs dangling calls itself before sending, but deliberately
+skips the **last** response, whose calls are the live frontier that resumption and
+`deferred_tool_results` may still answer. A turn that dies *inside* a tool leaves its
+dangling call exactly there. The one shape that self-heals is a response with two
+calls where one returned, which is why a single-tool turn fails where a parallel one
+does not.
+
+So close the frontier yourself, the way pydantic-ai would — a `ToolReturnPart` with
+`outcome='interrupted'`, the response's own timestamp, and the synthesized marker so
+upstream's pass sees nothing left to do. `close_interrupted_calls` in
+`examples/server_agent.py` is twenty lines of exactly that, and the measured
+difference is a resumable conversation versus a wedged one.
+
+This is the host-selected checkpoint: where the save goes is the host's call, and the
+contract is that the evidence is neither thrown away nor handed back in a shape
+nothing will accept.
+
+**Cancellation is pydantic-ai's, not elja's.** Prefer
+`run_stream_events(cancellation_token=...)` or `AgentRunEvents.cancel()` over
+wrapping the call in `asyncio.timeout`:
+
+- A first-party cancellation arrives as `RunCancelled`, an ordinary catchable
+  outcome, and carries the run's history on the exception. But **that history is
+  not already resumable**: it closes out an interrupted call only where a sibling
+  call in the same response already returned, so a tool stopped inside its own body
+  leaves its call dangling there and replaying it with a new prompt raises
+  `UserError`. Measured. Persist the checkpoint you repaired, not
+  `RunCancelled.all_messages()`.
+- An external asyncio cancellation must keep propagating for the enclosing
+  timeout scope to unwind, so a host on that path has to re-raise and recover the
+  state from the exception chain with `RunCancelled.from_cancellation`.
+
+**Compaction tells the host nothing.** There is no "history was rewritten"
+callback: the only one the harness package offers is
+`ReportContextUsage.on_usage`, which carries a reading and no messages. A host
+that wants to surface "history compacted" infers it from a reading that drops, or
+from its own copy of the transcript. Related, and a trap for anything billing on
+it: readings are taken in `before_model_request`, which runs *upstream* of the
+usage-limit check, so a turn that trips its limit reports one more reading than
+it made requests.
+
+`examples/server_agent.py` is all of the above as running code, driven by
+`tests/test_server_contracts.py` so it cannot rot.
