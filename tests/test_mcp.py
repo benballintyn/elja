@@ -163,6 +163,11 @@ class TestPreflight:
         from elja.cli import repl
 
         assert isinstance(mocker, MockerFixture)
+        # A captured non-tty emits no colour, so the style on this warning went
+        # unpinned: dropping its "yellow" left the whole suite green, and a dropped
+        # server would then read as a fatal error. FORCE_COLOR makes rich emit SGR
+        # through capsys.
+        mocker.patch.dict("os.environ", {"FORCE_COLOR": "1"})
         settings = EljaSettings(
             workspace=WorkspaceConfig(root=tmp_path),
             mcp={"servers": {"bad": {"command": "definitely-missing-binary-xyz", "args": []}}},  # type: ignore[arg-type]
@@ -179,7 +184,10 @@ class TestPreflight:
         )
         await repl(settings, "s", once="hello")
         out = capsys.readouterr().out
-        assert "warning: MCP server 'bad'" in out
+        warning = next(line for line in out.splitlines() if "MCP server 'bad'" in line)
+        assert "warning:" in warning
+        # Yellow: a dropped server is a warning, not the fatal error red would imply.
+        assert "\x1b[33m" in warning
         assert "fine" in out
 
 

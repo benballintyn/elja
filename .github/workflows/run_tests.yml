@@ -50,4 +50,6 @@ jobs:
 
       - name: Run tests
         # The `integration` marker requires a live LLM endpoint — skip in CI.
-        run: poetry run pytest -m "not integration" --cov=elja --cov-report=xml --cov-report=term
+        run: >
+          poetry run pytest -m "not integration"
+          --cov=src/elja --cov-report=xml --cov-report=term --cov-fail-under=100
