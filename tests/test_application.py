@@ -10,6 +10,7 @@ import ast
 import asyncio
 import contextlib
 import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, assert_type
@@ -61,12 +62,20 @@ def _capture(seen: dict[str, Any]) -> FunctionModel:
 
 # Long enough that a loaded machine does not flake, short enough that a test
 # which stops overlapping FAILS in seconds instead of hanging until the runner
-# gives up.
+# gives up. Used where overlap is EXPECTED, so the wait is patience never paid.
 _OVERLAP_TIMEOUT = 10.0
+
+# Where overlap must NOT happen, the timeout is the expected path and is paid on
+# every run — twice, because asyncio.Barrier does not break on cancellation, so
+# each party waits out its own deadline. Short on purpose.
+_NO_OVERLAP_TIMEOUT = 0.5
 
 
 def _capture_async(
-    seen: dict[str, Any], gate: asyncio.Barrier, both: asyncio.Event
+    seen: dict[str, Any],
+    gate: asyncio.Barrier,
+    both: asyncio.Event,
+    timeout: float = _OVERLAP_TIMEOUT,
 ) -> FunctionModel:
     """Like _capture, but each call waits for the other run to reach the model.
 
@@ -81,7 +90,7 @@ def _capture_async(
 
     async def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         with contextlib.suppress(TimeoutError, asyncio.BrokenBarrierError):
-            async with asyncio.timeout(_OVERLAP_TIMEOUT):
+            async with asyncio.timeout(timeout):
                 await gate.wait()
             both.set()
         seen["instructions"] = info.instructions
@@ -185,13 +194,20 @@ class TestNothingImplicitHappens:
 
         Patching named primitives only catches the routes you thought of:
         ``os.listdir``, ``open``, ``os.system``, a raw socket and an
-        ``__import__``-ed scan all slip past them. An audit hook sees every one.
+        ``__import__``-ed scan all slip past them. An audit hook sees every route
+        that raises one of the events below — which is not literally everything,
+        so the set is written out rather than described as total.
 
-        The hook is installed BEFORE construction, because construction is where
-        an implicit side effect would live. Module loading also raises ``open``,
-        so source-file reads are filtered out by path — everything else is a
-        genuine touch.
+        The hook goes up BEFORE construction, because construction is where an
+        implicit side effect would live. Module loading also raises ``open``, so
+        reads from the interpreter's own library directories are filtered by
+        prefix; a read anywhere else, elja's own source included, counts.
         """
+        # A live trigger for the scan assertions: the autouse _hermetic fixture
+        # chdirs into this same tmp_path, and load_skills resolves its directory
+        # relative to the cwd. Without it an injected skills scan finds nothing
+        # and the mutation survives — measured, after removing it on the theory
+        # that it was dead setup.
         (tmp_path / "skills").mkdir()
         (tmp_path / "skills" / "a.md").write_text("---\nid: a\ndescription: d\n---\nbody\n")
         watched = {
@@ -199,24 +215,42 @@ class TestNothingImplicitHappens:
             "os.listdir",
             "os.scandir",
             "os.mkdir",
+            "os.rename",
+            "os.remove",
+            "os.chdir",
             "os.system",
+            "os.spawn",
+            "os.posix_spawn",
+            "os.exec",
+            "os.fork",
+            "os.forkpty",
             "subprocess.Popen",
             "socket.__new__",
             "socket.connect",
+            "socket.getaddrinfo",
+            "socket.gethostbyname",
             "glob.glob",
         }
-        # Only installed-package loads are filtered. A read of elja's own source
-        # stays visible, so a future edit that opens a file here is caught.
-        installed = ("site-packages", "lib/python", "/importlib/", ".pyc")
+        # The real library prefixes, not substrings: "site-packages" anywhere in a
+        # path used to hide a write to /tmp/anything.pyc.
+        library_prefixes = tuple(
+            str(Path(path).resolve())
+            for path in {
+                sysconfig.get_path("purelib"),
+                sysconfig.get_path("platlib"),
+                sysconfig.get_path("stdlib"),
+            }
+            if path
+        )
         touches: list[str] = []
         recording = False
 
         def audit(event: str, args: tuple[object, ...]) -> None:
             if not recording or event not in watched:
                 return
-            if event == "open":
-                target = str(args[0]) if args else ""
-                if any(marker in target for marker in installed):
+            if event == "open" and args:
+                target = str(args[0])
+                if target.startswith(library_prefixes):
                     return  # a module load, not a file this code chose to read
             touches.append(event)
 
@@ -390,18 +424,40 @@ class TestNoCrossAgentBleed:
 
 
 class TestEveryAgentComesThroughThisDoor:
-    def test_build_agent_constructs_through_the_factory(self, mocker: MockerFixture) -> None:
+    def test_the_package_constructs_an_agent_in_exactly_one_place(self) -> None:
+        """The docstring's claim is universal, so assert it as one.
+
+        A call-count spy only says "this caller used the door at least once"; it
+        cannot see a second, direct ``Agent(...)`` beside it. Walk the package
+        instead: the only construction site is elja/application.py.
+        """
+        package = Path(elja.__file__).parent
+        sites: list[str] = []
+        for module in sorted(package.glob("*.py")):
+            tree = ast.parse(module.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "Agent"
+                ):
+                    sites.append(f"{module.name}:{node.lineno}")
+        assert [site.split(":")[0] for site in sites] == ["application.py"], sites
+
+    def test_build_agent_constructs_through_the_factory(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
         from elja.agent import build_agent
         from elja.settings import WorkspaceConfig
 
         spy = mocker.patch(
             "elja.agent.build_application_agent", wraps=elja.application.build_application_agent
         )
-        build_agent(EljaSettings(workspace=WorkspaceConfig(root=Path.cwd())))
+        build_agent(EljaSettings(workspace=WorkspaceConfig(root=tmp_path)))
         assert spy.call_count == 1
 
     def test_a_configured_delegate_constructs_through_the_factory(
-        self, mocker: MockerFixture
+        self, tmp_path: Path, mocker: MockerFixture
     ) -> None:
         """Otherwise the docstring's claim is false for every sub-agent."""
         from elja.settings import SubagentConfig, WorkspaceConfig
@@ -412,7 +468,7 @@ class TestEveryAgentComesThroughThisDoor:
             wraps=elja.application.build_application_agent,
         )
         settings = EljaSettings(
-            workspace=WorkspaceConfig(root=Path.cwd()),
+            workspace=WorkspaceConfig(root=tmp_path),
             subagents={"helper": SubagentConfig(description="d", instructions="i")},
         )
         assert build_subagent_toolset(settings) is not None
@@ -584,6 +640,7 @@ class TestStructuredOutputAndCapabilities:
             name="household-agent",
             retries=0,
             end_strategy="exhaustive",
+            tool_timeout=12.5,
             max_concurrency=3,
         )
         assert agent.name == "household-agent"
@@ -618,13 +675,70 @@ class TestStructuredOutputAndCapabilities:
             await agent.run("go", deps=HouseholdDeps(tenant="t", calls=[]))
         assert len(turns) == 1
 
-    async def test_a_toolset_level_timeout_is_the_one_that_enforces(self) -> None:
-        """Why tool_timeout is absent from the signature.
+    async def test_tool_timeout_covers_a_tool_registered_on_the_agent(self) -> None:
+        """It reaches the agent's OWN function toolset, which @agent.tool fills."""
+        calls: list[int] = []
+        outcomes: list[str] = []
 
-        Upstream's Agent(tool_timeout=) is applied only to the agent's own
-        function toolset, which this path never populates, so it would be an
-        inert knob. This pins the mechanism the docstring points at instead.
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(parts=[ToolCallPart(tool_name="slow", args={})])
+            outcomes.append(str(messages[-1]))
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        agent = build_application_agent(
+            FunctionModel(script), deps_type=HouseholdDeps, tool_timeout=0.05
+        )
+
+        @agent.tool
+        async def slow(ctx: RunContext[HouseholdDeps]) -> str:
+            """Takes far longer than the configured cap."""
+            await asyncio.sleep(3)
+            return "finished"
+
+        result = await agent.run("go", deps=HouseholdDeps(tenant="t", calls=[]))
+        assert result.output == "handled"
+        assert outcomes and "Timed out" in outcomes[0]
+        assert "finished" not in outcomes[0]
+
+    async def test_tool_timeout_does_not_reach_a_toolset_you_pass_in(self) -> None:
+        """The other half, so the docstring's scoping is not taken on trust.
+
+        Upstream applies tool_timeout only to the toolset it builds itself, so a
+        host whose tools live in a passed-in toolset must put the cap there. Both
+        directions are pinned because getting this wrong leaves a worker pinned by
+        a hung tool while the config says otherwise.
         """
+        toolset: FunctionToolset[HouseholdDeps] = FunctionToolset()
+
+        @toolset.tool
+        async def slow(ctx: RunContext[HouseholdDeps]) -> str:
+            """Finishes despite the agent-level cap."""
+            await asyncio.sleep(0.3)
+            return "finished"
+
+        outcomes: list[str] = []
+        calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            calls.append(1)
+            if len(calls) == 1:
+                return ModelResponse(parts=[ToolCallPart(tool_name="slow", args={})])
+            outcomes.append(str(messages[-1]))
+            return ModelResponse(parts=[TextPart(content="handled")])
+
+        agent = build_application_agent(
+            FunctionModel(script),
+            deps_type=HouseholdDeps,
+            toolsets=[toolset],
+            tool_timeout=0.05,
+        )
+        await agent.run("go", deps=HouseholdDeps(tenant="t", calls=[]))
+        assert outcomes and "finished" in outcomes[0]
+
+    async def test_a_toolset_level_timeout_is_the_one_that_enforces_there(self) -> None:
+        """Which is why the docstring points a host at the toolset."""
         toolset: FunctionToolset[HouseholdDeps] = FunctionToolset(timeout=0.05)
 
         @toolset.tool
@@ -661,12 +775,12 @@ class TestStructuredOutputAndCapabilities:
         seen_b: dict[str, Any] = {}
         limiter = ConcurrencyLimiter(1)
         agent_a = build_application_agent(
-            _capture_async(seen_a, gate, both_in_flight),
+            _capture_async(seen_a, gate, both_in_flight, _NO_OVERLAP_TIMEOUT),
             deps_type=HouseholdDeps,
             max_concurrency=limiter,
         )
         agent_b = build_application_agent(
-            _capture_async(seen_b, gate, both_in_flight),
+            _capture_async(seen_b, gate, both_in_flight, _NO_OVERLAP_TIMEOUT),
             deps_type=HouseholdDeps,
             max_concurrency=limiter,
         )

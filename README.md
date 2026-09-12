@@ -76,8 +76,10 @@ async def record_fact(ctx: RunContext[AppDeps], fact: str) -> str:
     return f"recorded for {ctx.deps.tenant}"
 
 
+# Your Model, passed through untouched. build_model(load_settings()) is one way
+# to get one from elja.toml — that read is YOURS, not something this path does.
 agent = build_application_agent(
-    build_model(load_settings()),   # or your own Model — passed through untouched
+    build_model(load_settings()),
     deps_type=AppDeps,
     instructions="You keep a household's records.",
     toolsets=[toolset],
@@ -105,7 +107,7 @@ toolset (`FunctionToolset(timeout=...)`), not on the agent — see the module
 docstring for why.
 
 elja's own capabilities stay available by opting in, e.g.
-`capabilities=build_compaction(settings)` — but read `elja/application.py`
+`capabilities=build_compaction(load_settings())` — but read `elja/application.py`
 first: the default compaction placeholder tells the model to *re-run* a cleared
 tool and names `.elja/spill/`, and neither is right for a host with
 side-effecting tools and no workspace. That docstring also covers how `None` and

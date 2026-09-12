@@ -102,6 +102,7 @@ def build_application_agent(
     name: str | None = None,
     retries: int | AgentRetries | None = None,
     end_strategy: EndStrategy = "graceful",
+    tool_timeout: float | None = None,
     max_concurrency: AnyConcurrencyLimit = None,
 ) -> Agent[DepsT, str]: ...
 
@@ -119,6 +120,7 @@ def build_application_agent(
     name: str | None = None,
     retries: int | AgentRetries | None = None,
     end_strategy: EndStrategy = "graceful",
+    tool_timeout: float | None = None,
     max_concurrency: AnyConcurrencyLimit = None,
 ) -> Agent[DepsT, OutputT]: ...
 
@@ -135,6 +137,7 @@ def build_application_agent(
     name: str | None = None,
     retries: int | AgentRetries | None = None,
     end_strategy: EndStrategy = "graceful",
+    tool_timeout: float | None = None,
     max_concurrency: AnyConcurrencyLimit = None,
 ) -> Agent[DepsT, OutputT]:
     """Build an agent for a host application, with no implicit elja machinery.
@@ -167,16 +170,15 @@ def build_application_agent(
             as upstream defines them. ``None`` keeps upstream's default;
             pass ``0`` to own every attempt explicitly.
         end_strategy: Upstream's end strategy, unchanged.
+        tool_timeout: Default wall-clock cap for tools on the agent's **own**
+            function toolset — the one ``@agent.tool`` populates after this
+            returns. It does **not** reach tools inside a toolset passed as
+            ``toolsets=``; upstream only applies it to the toolset it builds
+            itself. Measured both ways. For a toolset you pass in, the cap goes
+            on the toolset (``FunctionToolset(timeout=...)``) or on the tool
+            (``@toolset.tool(timeout=...)``).
         max_concurrency: Upstream's cap on concurrent agent runs — an int, or
             one of its limiter objects.
-
-    Deliberately absent: ``tool_timeout``. Upstream applies it only to the
-    agent's *own* function toolset, which this path never populates, so
-    forwarding it would advertise an enforcement that never fires. Put a
-    wall-clock cap where it works — ``FunctionToolset(timeout=...)`` for a whole
-    toolset, or ``@toolset.tool(timeout=...)`` for one tool. Both were measured;
-    ``Agent(tool_timeout=...)`` against a tool in a passed-in toolset was not
-    enforced at all.
 
     Returns:
         A native ``Agent`` bound to ``deps_type`` and ``output_type``.
@@ -192,5 +194,6 @@ def build_application_agent(
         name=name,
         retries=retries,
         end_strategy=end_strategy,
+        tool_timeout=tool_timeout,
         max_concurrency=max_concurrency,
     )
