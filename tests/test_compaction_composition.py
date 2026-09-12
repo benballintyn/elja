@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -670,7 +671,7 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     def test_a_prompt_without_the_placeholder_is_refused(self, tmp_path: Path) -> None:
         """Otherwise the summary is written from nothing and replaces history."""
-        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
+        with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(_settings(tmp_path), summary_prompt="Summarize concisely.")
 
     def test_an_unresolvable_brace_is_refused(self, tmp_path: Path) -> None:
@@ -729,14 +730,22 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             'Output JSON like {{"intent": "x"}}\n\n{{messages}}',
             "{messages[0]}",
             "{messages:.5}",
-            "Summarize: eljatranscriptsentinelalpha",
+            "{messages:.23}",
+            "{messages:.2000}",
+            "{messages:.40000}",
+            "{messages.upper}",
+            "Summarize: elja-transcript-stand-in-alpha",
         ],
         ids=[
             "placeholder-alone",
             "everything-doubled",
             "first-character-only",
             "truncated-to-five",
-            "sentinel-text-but-no-placeholder",
+            "truncated-to-the-first-boundary",
+            "truncated-to-a-plausible-cap",
+            "truncated-past-the-stand-in",
+            "attribute-not-substitution",
+            "one-stand-ins-text-but-no-placeholder",
         ],
     )
     def test_a_prompt_that_does_not_substitute_is_refused_despite_the_text(
@@ -751,27 +760,60 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
         gets there by obeying this module's own advice to double their literal
         braces: doubling all of them takes the placeholder with it.
 
-        Three more shapes that substitute something useless rather than nothing:
-        `{messages[0]}` keeps one character and `{messages:.5}` keeps five, which is
-        a transcript in name only. And a prompt containing the sentinel's own text
-        with no placeholder at all used to be ACCEPTED, which is why the check now
-        renders twice with two different transcripts and requires the results to
-        differ rather than looking for a magic string.
+        The rest substitute something useless rather than nothing, and the widths are
+        the point. A check that compared two renderings for *difference* accepted
+        `{messages:.23}` — 23 being exactly where the two stand-ins stopped agreeing —
+        so a host could cap the transcript at any width above that and the summarizer
+        would rewrite the history from a fragment. `{messages:.2000}` is the plausible
+        shape of that mistake: someone capping cost. Requiring each rendering to
+        contain its whole stand-in refuses every width.
+
+        `{messages.upper}` is the same class from the other side: it renders a method
+        repr, which differs between the two stand-ins because the objects differ, so
+        difference accepted it and the spec read does not.
+
+        `{messages:.40000}` is the width that exposed the second relocation — containment
+        against a finite stand-in can only detect a truncation narrower than the stand-in
+        itself, so the boundary moved rather than closing. Width is now read from the spec.
+
+        The last one needs BOTH renderings checked, not either: a prompt quoting one
+        stand-in's text with no placeholder renders identically twice, so it contains
+        alpha and not beta. `any` would accept it.
         """
-        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
+        with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(_settings(tmp_path), summary_prompt=doubled)
 
     @pytest.mark.parametrize(
         "accepted",
-        ["Summarize.\n\n{messages}", "{messages!r}", "{messages:>10}", "{{{messages}}}"],
-        ids=["plain", "repr-conversion", "format-spec", "braced-placeholder"],
+        [
+            "Summarize.\n\n{messages}",
+            "{messages!r}",
+            "{messages!s}",
+            "{messages!a}",
+            "{messages:>10}",
+            "{messages:^50}",
+            "{{{messages}}}",
+            "{messages} and again {messages}",
+        ],
+        ids=[
+            "plain",
+            "repr-conversion",
+            "str-conversion",
+            "ascii-conversion",
+            "pad-right",
+            "centre",
+            "braced-placeholder",
+            "twice",
+        ],
     )
     def test_a_prompt_that_substitutes_is_accepted(self, tmp_path: Path, accepted: str) -> None:
         """Rendering is the more permissive test, and correctly so.
 
-        A conversion and a format spec both substitute at format time, so refusing
-        them would be the guard over-reaching. `{{{messages}}}` is a literal brace
-        either side of a real placeholder.
+        Every one of these substitutes the transcript in full — a conversion, padding,
+        centring, literal braces either side, or twice over — so refusing any of them
+        would be the guard over-reaching. Padding and centring matter: they change the
+        rendering's length without removing anything, which is the case a naive
+        length check would get wrong.
         """
         assert build_compaction(_settings(tmp_path), summary_prompt=accepted)
 
@@ -787,14 +829,14 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             workspace=WorkspaceConfig(root=tmp_path),
             compaction=CompactionConfig(enabled=False, target_tokens=3000),
         )
-        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
+        with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(settings, summary_prompt="Summarize concisely.")
         # And the disabled path still returns nothing for a prompt that is fine.
         assert build_compaction(settings, summary_prompt="Summarize.\n\n{messages}") == []
 
     @pytest.mark.parametrize(
         ("substitute", "refusal"),
-        [("{transcript}", r"cannot resolve"), ("", r"does not substitute the transcript")],
+        [("{transcript}", r"cannot resolve"), ("", r"does not substitute the whole transcript")],
         ids=["variable-renamed", "substitution-dropped"],
     )
     def test_eljas_own_default_prompt_is_checked_the_same_way(
@@ -844,3 +886,153 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     def test_nothing_is_checked_when_no_prompt_is_given(self, tmp_path: Path) -> None:
         assert build_compaction(_settings(tmp_path))
+
+
+class TestTheAdviceTextNamesTheRightPlaceholder:
+    """The error messages ARE the product of `check_summary_prompt`, so pin their content.
+
+    Changing `_PLACEHOLDER` to anything else left all tests green while both refusals
+    then told the caller to keep the wrong brace single — advice that would send them
+    round the exact loop the guard exists to end.
+    """
+
+    def test_both_refusals_name_the_placeholder_the_summarizer_substitutes(
+        self, tmp_path: Path
+    ) -> None:
+        with pytest.raises(ValueError, match=r"'\{messages\}' placeholder is missing"):
+            build_compaction(_settings(tmp_path), summary_prompt="Summarize concisely.")
+        with pytest.raises(ValueError, match=r"leave the '\{messages\}' placeholder single"):
+            build_compaction(_settings(tmp_path), summary_prompt="{messages} and {0}")
+
+
+class TestAnEmptyClearedPlaceholderIsRefused:
+    """The one caller-supplied string that was not validated at all.
+
+    `cleared_placeholder=""` was accepted and produced tool returns with literally empty
+    content — upstream assigns the string as given and does not fall back to its own
+    default — so the model lost every cue that anything had been cleared. Asymmetric
+    with the care taken over `summary_prompt`, and the same class of mistake: a host
+    string that reaches the model unchecked.
+    """
+
+    def test_an_empty_placeholder_is_refused_at_construction(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"cleared_placeholder must not be empty"):
+            build_compaction(_settings(tmp_path), cleared_placeholder="")
+
+    def test_whitespace_only_is_refused_too(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"cleared_placeholder must not be empty"):
+            build_compaction(_settings(tmp_path), cleared_placeholder="   \n")
+
+    def test_a_real_placeholder_is_accepted(self, tmp_path: Path) -> None:
+        assert build_compaction(_settings(tmp_path), cleared_placeholder="[cleared]")
+
+
+class TestTheFormatSpecReaderIsGeneralOnPurpose:
+    """`_substitutes_whole_transcript` is the width-independent half, tested directly.
+
+    `check_summary_prompt` only ever supplies one field, so a prompt naming any other
+    raises `KeyError` at render and never reaches the spec read. The reader is written to
+    ignore other fields anyway — a future prompt with a second substitution would
+    otherwise be refused for the wrong reason — and that branch is only reachable from
+    here.
+    """
+
+    @pytest.mark.parametrize(
+        ("prompt", "whole"),
+        [
+            ("{messages}", True),
+            ("{messages!r}", True),
+            ("{messages:>10}", True),
+            ("{messages:.<40}", True),
+            ("{messages} plus {other}", True),
+            ("{other} alone", True),
+            ("{messages:.5}", False),
+            ("{messages:.40000}", False),
+            ("{messages:>10.50}", False),
+            ("{messages[0]}", False),
+            ("{messages.upper}", False),
+        ],
+        ids=[
+            "plain",
+            "repr",
+            "pad",
+            "dot-as-fill",
+            "another-field-alongside",
+            "another-field-alone",
+            "precision-small",
+            "precision-huge",
+            "width-and-precision",
+            "index",
+            "attribute",
+        ],
+    )
+    def test_it_reads_the_spec_rather_than_sampling_a_rendering(
+        self, prompt: str, whole: bool
+    ) -> None:
+        from elja.compaction import _substitutes_whole_transcript
+
+        assert _substitutes_whole_transcript(prompt) is whole
+
+
+class TestASystemPromptInHistoryGrowsWithEachCompaction:
+    """The third irreducible source, pinned by its direction rather than a figure.
+
+    `Agent(system_prompt=...)` puts a `SystemPromptPart` *into* the first request, i.e.
+    into history — unlike `instructions=`, which lives outside it. The harness then copies
+    every leading system part into the summary message on each compaction while
+    `preserve_first_user_message` keeps the original request carrying it too, so copies
+    accumulate. The *rate* is configuration-dependent (one per compaction in this setup,
+    two in others), which is exactly why this asserts the direction: a policy that starts
+    under `target_tokens` reaches the unbounded-summarizer regime by growth alone.
+    """
+
+    POLICY = "POLICY: never disclose tenant ids. " * 10
+
+    async def _copies_per_turn(self, tmp_path: Path, *, preserve: bool) -> tuple[list[int], int]:
+        settings = _settings(tmp_path, target=1000)
+        summarizations = 0
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal summarizations
+            if "summarization assistant" in (info.instructions or ""):
+                summarizations += 1
+                return ModelResponse(parts=[TextPart(content="## Intent\nledger")])
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            system_prompt=self.POLICY,
+            capabilities=build_compaction(settings, preserve_first_user_message=preserve),
+        )
+        deps = EljaDeps.from_settings(settings)
+        history: list[ModelMessage] | None = None
+        counts: list[int] = []
+        for _ in range(4):
+            result = await agent.run("carry on", message_history=history, deps=deps)
+            messages = result.all_messages()
+            counts.append(
+                sum(
+                    1
+                    for message in messages
+                    for part in message.parts
+                    if isinstance(part, SystemPromptPart) and part.content.startswith("POLICY")
+                )
+            )
+            history = [*messages, *_mixed_history(8)]
+        return counts, summarizations
+
+    async def test_copies_accumulate_while_compaction_fires(self, tmp_path: Path) -> None:
+        counts, summarizations = await self._copies_per_turn(tmp_path, preserve=True)
+        assert summarizations >= 2, "compaction did not fire; the measurement is the wrong one"
+        # Strictly increasing, which is the unbounded part. The rate is not asserted
+        # because it moves with target_tokens and the history's shape.
+        assert counts == sorted(counts)
+        assert counts[-1] > counts[0]
+
+    async def test_turning_off_first_message_preservation_stops_the_growth(
+        self, tmp_path: Path
+    ) -> None:
+        counts, summarizations = await self._copies_per_turn(tmp_path, preserve=False)
+        assert summarizations >= 2, "compaction did not fire; the measurement is the wrong one"
+        assert counts[-1] == counts[0], counts

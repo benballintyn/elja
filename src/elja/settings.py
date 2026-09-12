@@ -14,7 +14,8 @@ keys, while passing a ``ModelConfig`` instance replaces the whole section.
 
 import importlib
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Iterator, Mapping
 from decimal import Decimal
 from functools import cache
 from pathlib import Path
@@ -91,7 +92,11 @@ def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> di
         # missing extra, which is the error the user actually needs.
         prefix = f"{provider}_"
         _reject(provider, [k for k in settings if k not in portable and not k.startswith(prefix)])
-        return dict(settings)
+        # Materialized here too: a host that calls load_settings() and logs the
+        # resolved config before building a model would otherwise hold a live
+        # iterator, which reads once and then empty, and refuses to serialize.
+        materialized: dict[str, Any] = _materialize(dict(settings))
+        return materialized
     dialect = getattr(module, class_name)
     # Snapshot the CALLER's structure before validating it. Pydantic consumes an
     # iterator while validating, so by the time the dropped-key walk runs there is
@@ -116,7 +121,7 @@ def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> di
 
 
 def _materialize(value: Any) -> Any:  # noqa: ANN401 - walks arbitrary settings values
-    """Force pydantic's lazy ``Iterable[...]`` validators into real containers.
+    """Force once-consumable iterators into real containers, and nothing else.
 
     Three leaves in the shipped dialects are annotated ``Iterable[...]``
     (``anthropic_context_management.edits``, ``anthropic_container.skills``,
@@ -125,12 +130,42 @@ def _materialize(value: Any) -> Any:  # noqa: ANN401 - walks arbitrary settings 
     is reused for every request of every run, so without this the first request
     carries the value and every later one carries an empty list — a provider
     feature that silently switches itself off after one turn.
+
+    Two jobs, deliberately separated, because conflating them has now broken this
+    function in both directions:
+
+    - **Rewrite** only an ``Iterator``. Testing ``Iterable`` caught everything with
+      ``__iter__`` — tuples, sets, deques, ``bytearray``, ``memoryview``, ``range``
+      and every pydantic model — and rewrote them all into lists. That mattered for
+      ``extra_body``, the one annotation pydantic passes through untouched, so this
+      walk was the only thing that saw it: a host handing it a model for a local
+      server's own knobs got a list of key/value pairs in the request body instead of
+      a loud failure at JSON encode.
+    - **Walk** the re-iterable containers this can faithfully rebuild, keeping each
+      one's own type. Narrowing the *rewrite* test is not the same as narrowing the
+      *recursion*, and conflating them stranded an iterator nested one container in — a
+      generator inside a list inside ``extra_body`` survived untouched and was consumed
+      by the first request, which is verbatim the defect this function exists to
+      prevent.
+
+    ``ValidatorIterator`` is an ``Iterator``, as are generators, ``iter(...)`` and
+    ``map(...)``, so the rewrite still reaches every lazy leaf. Anything outside the
+    walked types is returned whole, which is right for every validated annotation — the
+    three lazy leaves are reached through ``Mapping``s only — and a bounded gap on
+    ``extra_body``, the one surface where a caller can nest arbitrary objects.
+
+    Sets are deliberately not walked: a materialized member is a ``list``, which a set
+    cannot hold, so there is no correct rewrite. A lazy value inside a set is
+    unreachable through any validated annotation and would not serialize into a request
+    body anyway.
     """
     if isinstance(value, Mapping):
         return {key: _materialize(item) for key, item in value.items()}
-    if isinstance(value, str | bytes) or not isinstance(value, Iterable):
-        return value
-    return [_materialize(item) for item in value]
+    if isinstance(value, Iterator):
+        return [_materialize(item) for item in value]
+    if isinstance(value, list | tuple | deque):
+        return type(value)(_materialize(item) for item in value)
+    return value
 
 
 def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:  # noqa: ANN401
@@ -140,15 +175,28 @@ def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:
     when they are the same length, so a coercion that changes a list's shape is
     left to pydantic's own error rather than reported as a missing key.
 
-    Both sides are materialized before this runs, so both are lists and the
-    ``Sequence`` test is belt-and-braces rather than load-bearing — a mutant
-    narrowing it back to ``list`` is equivalent today. It is kept, and the
-    ``[list, tuple, generator]`` parametrization in the tests is kept as the
-    regression record, because this walk has already been skipped twice: once for a
-    tuple literal, and once for a generator, each dropping a misspelled nested key
-    in silence while the same config written with square brackets raised. TOML and
-    env can only produce lists; this is the programmatic surface, which is the one
-    every test here uses.
+    The original side's type test mirrors **what pydantic accepts**, not what
+    ``isinstance`` recognizes, because this walk has now been skipped three times and
+    each time by a container one step further out:
+
+    - a ``list`` test skipped a tuple literal;
+    - a ``Sequence`` test skipped generators and other iterators — fixed by
+      snapshotting the caller's structure before validation, which is why iterators
+      arrive here already materialized;
+    - ``Sequence`` still skipped the legacy sequence protocol, an object with
+      ``__getitem__`` and no ``__iter__``. ``Iterable``'s subclass hook checks only
+      ``__iter__``, but ``iter()`` falls back to ``__getitem__``, so pydantic validates
+      it happily while the walk gave up and the typo inside vanished;
+    - and requiring a ``list`` on the **validated** side skipped a tuple or a deque
+      there, because pydantic preserves the input container for a ``Sequence[...]``
+      annotation. Latent in the three mapped dialects, which have no
+      ``Sequence[TypedDict]`` leaf, and live one settings class over.
+
+    So both sides are simply converted, and only a conversion that fails is left
+    alone. Each skip dropped a misspelled nested key
+    in silence while the same config written with square brackets raised. TOML and env
+    can only produce lists; this is the programmatic surface, which is the one every
+    test here uses.
     """
     dropped: list[str] = []
     if isinstance(original, Mapping):
@@ -160,14 +208,21 @@ def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:
                 dropped.append(path)
             else:
                 dropped.extend(_dropped_keys(value, validated[key], f"{path}."))
-    elif (
-        isinstance(original, Sequence)
-        and not isinstance(original, str | bytes)
-        and isinstance(validated, list)
-        and len(original) == len(validated)
-    ):
-        for index, (left, right) in enumerate(zip(original, validated, strict=True)):
-            dropped.extend(_dropped_keys(left, right, f"{prefix}{index}."))
+        return dropped
+    if isinstance(original, str | bytes) or isinstance(validated, str | bytes | Mapping):
+        return dropped
+    try:
+        originals = list(original)
+        validateds = list(validated)
+    except TypeError:
+        # The bounded gap: a leaf that validates into a non-iterable object — today only
+        # `tool_choice`'s `ToolOrOutput` — ends the walk here rather than reporting a
+        # spurious key.
+        return dropped
+    if len(originals) != len(validateds):
+        return dropped
+    for index, (left, right) in enumerate(zip(originals, validateds, strict=True)):
+        dropped.extend(_dropped_keys(left, right, f"{prefix}{index}."))
     return dropped
 
 
@@ -273,8 +328,9 @@ class LimitsConfig(_Section):
     - ``cost_limit`` is in **USD** and is only enforced for models pydantic-ai
       can price. On an unpriced model (the local default among them) the run's
       cost is ``None``, the limit does nothing, and pydantic-ai raises a
-      ``CostNotFoundWarning`` on every request — which Python's default filter
-      dedupes, so an operator sees it once per process, not once per request.
+      ``CostNotFoundWarning`` once per **completed run** — the per-request checks
+      pass ``warn_if_cost_unavailable=False`` deliberately — which Python's warnings
+      registry then dedupes to once per process.
     - ``count_tokens_before_request`` needs a provider that offers a
       count-tokens call. Only ``anthropic`` and ``google`` do, so
       :class:`EljaSettings` refuses it together with ``provider = "openai"``

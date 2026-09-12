@@ -5,14 +5,18 @@ import os
 import subprocess
 import sys
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import pytest
-from pydantic import SecretStr, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from pytest_mock import MockerFixture
+
+# typing_extensions, not typing: pydantic refuses a `typing.TypedDict` below 3.12,
+# and CI runs 3.11.
+from typing_extensions import TypedDict
 
 import elja
 from elja.settings import (
@@ -617,3 +621,227 @@ class TestACeilingOfZeroIsAConfigError:
 
         assert getattr(LimitsConfig(**{field: 1}), field) == 1  # type: ignore[arg-type]
         assert getattr(LimitsConfig(**{field: None}), field) is None  # type: ignore[arg-type]
+
+
+class TestExtraBodyIsPassedThroughUntouched:
+    """`extra_body` is the one annotation pydantic does not validate, so nothing else sees it.
+
+    Which made `_materialize` the only thing that did — and it rewrote every iterable
+    into a list. A host handing `extra_body` a pydantic model for a local server's own
+    knobs (vLLM's `chat_template_kwargs`, `guided_json`) got a list of key/value pairs
+    in the request body instead of a loud failure at JSON encode: a wrong request that
+    looks like a right one. The walk now tests `Iterator`, not `Iterable`.
+    """
+
+    @staticmethod
+    def _body(value: object) -> object:
+        return ModelConfig(settings={"extra_body": value}).settings["extra_body"]
+
+    def test_a_pydantic_model_survives(self) -> None:
+        class Extras(BaseModel):
+            chat_template_kwargs: dict[str, bool] = {"enable_thinking": False}
+
+        body = self._body(Extras())
+        assert isinstance(body, Extras)
+        assert body.chat_template_kwargs == {"enable_thinking": False}
+
+    @pytest.mark.parametrize(
+        "value",
+        [(1, 2), {1, 2}, bytearray(b"hi"), range(3), {"guided_json": {"a": 1}}],
+        ids=["tuple", "set", "bytearray", "range", "dict"],
+    )
+    def test_every_other_iterable_shape_survives(self, value: object) -> None:
+        """All of these are `Iterable` and none is a once-consumable `Iterator`."""
+        body = self._body(value)
+        assert body == value
+        assert type(body) is type(value)
+
+    def test_a_real_iterator_is_still_materialized(self) -> None:
+        """The narrowing must not lose the fix it was narrowed from.
+
+        `extra_body` is not where the lazy-validator problem lives, but if a caller does
+        put an iterator there it has the same read-once hazard, so it is still forced.
+        """
+        body = self._body(iter([1, 2]))
+        assert body == [1, 2]
+
+
+class TestTheLegacySequenceProtocolIsWalkedToo:
+    """The third container shape to skip the dropped-key walk, each one step further out.
+
+    `Iterable`'s subclass hook checks only `__iter__`, but `iter()` falls back to
+    `__getitem__` — so pydantic validates a legacy sequence happily while the walk
+    gave up and the misspelled key inside vanished. The walk's type test now mirrors
+    what pydantic accepts rather than what `isinstance` recognizes.
+    """
+
+    class _GetItemOnly:
+        """A sequence by the old protocol: indexable, with no `__iter__`."""
+
+        def __init__(self, items: list[object]) -> None:
+            self._items = list(items)
+
+        def __getitem__(self, index: int) -> object:
+            return self._items[index]
+
+    def test_a_nested_typo_inside_one_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"anthropic_container\.skills\.0\.bogus"):
+            ModelConfig(
+                provider="anthropic",
+                settings={
+                    "anthropic_container": {
+                        "id": "c",
+                        "skills": self._GetItemOnly(
+                            [{"skill_id": "s", "type": "custom", "bogus": 1}]
+                        ),
+                    }
+                },
+            )
+
+    def test_a_correct_one_is_accepted_and_materialized(self) -> None:
+        cfg = ModelConfig(
+            provider="anthropic",
+            settings={
+                "anthropic_container": {
+                    "id": "c",
+                    "skills": self._GetItemOnly([{"skill_id": "s", "type": "custom"}]),
+                }
+            },
+        )
+        skills = cfg.settings["anthropic_container"]["skills"]
+        assert isinstance(skills, list)
+        assert len(skills) == 1
+
+    def test_something_that_is_not_a_sequence_at_all_is_left_alone(self) -> None:
+        """The fallback must not turn a failed conversion into a spurious rejection.
+
+        `isinstance(x, object)` would be true of every value, so this asserts identity:
+        the very object handed in comes back, unwrapped and unconverted.
+        """
+        sentinel = object()
+        cfg = ModelConfig(settings={"extra_body": sentinel})
+        assert cfg.settings["extra_body"] is sentinel
+
+
+class TestNarrowingTheRewriteMustNotNarrowTheRecursion:
+    """Two jobs in one walk, and conflating them broke it in both directions.
+
+    Testing `Iterable` rewrote every container into a list, mangling `extra_body`.
+    Narrowing to `Iterator` fixed that and silently stopped the walk from *descending*
+    into lists and tuples — so an iterator nested one container in survived untouched
+    and was consumed by the first request, which is verbatim the bug the function
+    exists to prevent.
+    """
+
+    @staticmethod
+    def _body(value: object) -> object:
+        return ModelConfig(settings={"extra_body": value}).settings["extra_body"]
+
+    @pytest.mark.parametrize("wrap", [list, tuple, deque], ids=["list", "tuple", "deque"])
+    def test_an_iterator_nested_in_a_container_is_still_materialized(
+        self, wrap: Callable[[list[object]], object]
+    ) -> None:
+        body = self._body(wrap([{"k": (item for item in [1, 2])}]))
+        # The container keeps its own type...
+        assert type(body) is type(wrap([]))
+        # ...and the generator inside it is a real list, readable more than once.
+        entries = cast("list[dict[str, Any]]", list(cast("Iterable[Any]", body)))
+        assert entries[0]["k"] == [1, 2]
+        assert entries[0]["k"] == [1, 2]
+
+    def test_a_set_is_left_whole_because_it_cannot_hold_the_result(self) -> None:
+        """Not an oversight: a materialized member is a list, which a set cannot hold.
+
+        So there is no correct rewrite, and a lazy value inside a set is unreachable
+        through any validated annotation — only `extra_body` could carry one, where it
+        would not serialize into a request body either. Asserted so the omission reads as
+        a decision rather than a gap.
+        """
+        generator = (item for item in [1, 2])
+        body = self._body({generator})
+        assert isinstance(body, set)
+        assert next(iter(body)) is generator
+
+    def test_the_container_type_itself_is_never_rewritten(self) -> None:
+        """The other direction: narrowing the rewrite is what protects `extra_body`."""
+        for value in ((1, 2), {1, 2}, frozenset({1}), deque([1]), bytearray(b"hi")):
+            assert type(self._body(value)) is type(value)
+
+    async def test_a_nested_iterator_survives_two_real_requests(self) -> None:
+        """The boundary the bug actually showed up at, not just the walk in isolation."""
+        from pydantic_ai.models import ModelRequestParameters
+
+        from elja.model import build_model
+
+        cfg = ModelConfig(
+            provider="openai",
+            name="local",
+            api_key=SecretStr("k"),
+            settings={"extra_body": {"chat_template_kwargs": [(x for x in ["a", "b"])]}},
+        )
+        model = build_model(EljaSettings(model=cfg))
+        seen = []
+        for _ in range(2):
+            prepared, _params = model.prepare_request(
+                None, model.customize_request_parameters(ModelRequestParameters())
+            )
+            assert prepared is not None
+            body = cast("dict[str, Any]", prepared["extra_body"])
+            seen.append(body["chat_template_kwargs"])
+        assert seen == [[["a", "b"]], [["a", "b"]]]
+
+
+class TestTheValidatedSideContainerIsWalkedToo:
+    """The fourth container family to end the dropped-key walk, this time on the right.
+
+    Requiring a `list` on the validated side skipped a tuple or a deque there, because
+    pydantic preserves the input container for a `Sequence[...]` annotation. Latent in
+    the three mapped dialects — they have no `Sequence[TypedDict]` leaf — and live one
+    settings class over, so it is pinned against a synthetic dialect of that shape
+    rather than waiting for upstream to add one.
+    """
+
+    class _Item(TypedDict, total=False):
+        ok: str
+
+    class _Dialect(BaseModel):
+        items: Sequence["TestTheValidatedSideContainerIsWalkedToo._Item"]
+
+    @pytest.mark.parametrize("wrap", [list, tuple, deque], ids=["list", "tuple", "deque"])
+    def test_a_typo_is_reported_whatever_container_pydantic_kept(
+        self, wrap: Callable[[list[object]], object]
+    ) -> None:
+        from elja.settings import _dropped_keys, _materialize
+
+        original = {"items": wrap([{"ok": "y", "bogus": 1}])}
+        validated = {"items": self._Dialect(**original).items}  # type: ignore[arg-type]
+        assert _dropped_keys(_materialize(original), validated) == ["items.0.bogus"]
+
+
+class TestTheNoExtraPathMaterializesToo:
+    """The `ImportError` branch returns early, and it was returning a live iterator.
+
+    Reached when a provider's optional dependency is missing: the dialect's own keys
+    cannot be enumerated, so the prefix is accepted and `build_model` is left to report
+    the missing extra. A host that calls `load_settings()` and logs the resolved config
+    before building would otherwise hold an iterator that reads once and then empty —
+    and refuses to serialize at all.
+    """
+
+    def test_a_generator_is_a_list_when_the_dialect_cannot_be_imported(
+        self, mocker: MockerFixture
+    ) -> None:
+        import json
+
+        mocker.patch(
+            "elja.settings.importlib.import_module", side_effect=ImportError("no anthropic")
+        )
+        cfg = ModelConfig(
+            provider="anthropic",
+            settings={"anthropic_container": {"skills": (s for s in [{"skill_id": "s"}])}},
+        )
+        skills = cfg.settings["anthropic_container"]["skills"]
+        assert skills == [{"skill_id": "s"}]
+        assert skills == [{"skill_id": "s"}], "read once and then empty"
+        # And the resolved config still serializes, which a live iterator does not.
+        json.dumps(cfg.settings)
