@@ -78,11 +78,14 @@ class GuardedModel(WrapperModel):
         await self.budget.reserve(self.attribution)
         return await super().count_tokens(messages, model_settings, model_request_parameters)
 
-    # compact_messages is NOT overridden here: nothing in pydantic-ai-harness calls
-    # Model.compact_messages (the name appears only as an OTel span), so no elja
-    # host reaches it today. That is a fact about the installed version, not a
-    # guarantee — the rule above still applies, so add it if you attach a
-    # capability that uses provider-side compaction.
+    # compact_messages is NOT overridden here, and that is a gap you may need to
+    # close. Nothing ELJA attaches calls it — the harness package uses the name only
+    # as an OTel span — but pydantic-ai core's own OpenAICompaction does
+    # (models/openai.py, `request_context.model.compact_messages(...)`), on the run's
+    # outermost model, i.e. your guard. A host that attaches OpenAICompaction and
+    # leaves this hook alone gets a real /responses/compact dispatch with no
+    # admission. Override it if you attach anything that uses provider-side
+    # compaction.
 ```
 
 What elja guarantees:
@@ -139,10 +142,15 @@ Two channels work today, with no upstream patch:
    | where the settings live | what the compaction request receives |
    | --- | --- |
    | agent-level `model_settings=` | **nothing at all** — `model_settings=None` |
+   | per-run `agent.run(..., model_settings=)` | **nothing at all** |
+   | a capability's `get_model_settings()` | **nothing at all** |
+   | `agent.override(model_settings=)` | **nothing at all** |
    | the model object's own `settings=` | all of them |
    | `summarizer_model_settings=` | these, shallow-replacing the model's per key |
 
-   **Agent-level settings never reach the compaction request.**
+   **Nothing that lives on the parent agent or its run reaches the compaction
+   request** — which is four of the six rows, including the per-request one a
+   multi-tenant host reaches for first.
    `SummarizingCompaction._summarize` builds a *separate*
    `Agent(model, instructions=…, model_settings=self.model_settings)`, so the
    parent agent's `model_settings` are never handed to it — not `extra_headers`,
@@ -201,9 +209,15 @@ above; recorded rather than pretended to be covered.
   silently swallowing the model's own output would be worse than failing, so a
   raising delta sink does abort the turn (a closed stdout, for instance) and that
   turn's history is not saved. Two sinks, two different answers, on purpose. A
-  third caller-supplied callback, `EljaDeps.confirm`, is also unsuppressed — a
-  raise there kills the run — though it only applies to the CLI deps type, which
-  the `PermissionGate` note below says is not usable on this path anyway.
+  third caller-supplied callback, `EljaDeps.confirm`, is also unsuppressed — but
+  "unsuppressed" is as far as the claim goes. A raise there ends the run only on the
+  parent's own tool calls; inside a delegation, `subagents.py`'s `except Exception`
+  converts it into a `ModelRetry`, so the model re-delegates until the tool's retry
+  budget is spent. Measured on one configured sub-agent: a raising approver was
+  invoked four times and the run ended as `UnexpectedModelBehavior: exceeded max
+  retries`, having spent six extra paid requests. It only applies to the CLI deps
+  type, which the `PermissionGate` note below says is not usable on this path
+  anyway.
 - **`notify` lets a `BaseException` through.** `asyncio.CancelledError`,
   `KeyboardInterrupt` and `SystemExit` pass it untouched, because cancellation is
   the host's and a telemetry helper must not eat it.
@@ -352,17 +366,23 @@ and the guard is what stops a framework complaint about iteration order replacin
 the failure the host has to see.
 
 **A checkpoint with an unanswered tool call cannot be replayed, and that is exactly
-the case you are checkpointing for.** Providers refuse a history whose response
-carries a `ToolCallPart` with no result, and so does pydantic-ai: replaying one with
-a new user prompt raises `UserError('Cannot provide a new user prompt when the
-message history contains unprocessed tool calls.')`, and replaying it *without* a
-prompt re-executes the call — the duplicate side effect you were avoiding, one level
-down. pydantic-ai repairs dangling calls itself before sending, but deliberately
-skips the **last** response, whose calls are the live frontier that resumption and
+the case you are checkpointing for.** Not because a provider sees it — pydantic-ai
+repairs dangling calls at send time *unconditionally*, last response included, so one
+never reaches the wire. The refusal is earlier, in the pass that decides how to resume
+a history you hand back: replaying a dangling call with a new user prompt raises
+`UserError('Cannot provide a new user prompt when the message history contains
+unprocessed tool calls.')`, and replaying it *without* a prompt re-executes the call —
+the duplicate side effect you were avoiding, one level down. That resumption pass is
+the one that leaves the last response alone, because its calls are the live frontier
 `deferred_tool_results` may still answer. A turn that dies *inside* a tool leaves its
 dangling call exactly there. The one shape that self-heals is a response with two
 calls where one returned, which is why a single-tool turn fails where a parallel one
 does not.
+
+The distinction matters for what you do with it: repair a history you are about to
+**persist and replay**, never one you are about to hand straight back to the model,
+and never a successful `DeferredToolRequests` history — upstream preserves that
+frontier on purpose, and closing it is the defect below.
 
 So close the frontier yourself, the way pydantic-ai would — a `ToolReturnPart` with
 `outcome='interrupted'`, the response's own timestamp, and the synthesized marker so

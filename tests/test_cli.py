@@ -413,11 +413,19 @@ class TestShowOn:
         from elja.cli import show_on
 
         buffer = StringIO()
-        # `color_system="standard"` rather than leaving it to detection:
-        # `force_terminal=True` is what makes rich consult `TERM`, and a `dumb`
-        # or `unknown` one then reports no colour system, so these assertions
-        # would pass or fail on the developer's shell.
-        console = Console(file=buffer, force_terminal=True, width=width, color_system="standard")
+        # Every knob pinned rather than detected: `force_terminal=True` is what makes
+        # rich consult the environment at all, and then `TERM`, `NO_COLOR` and
+        # `TTY_COMPATIBLE` each decide whether these assertions can pass. Stating
+        # `color_system` and `no_color` makes this class immune to any of them,
+        # present or future, instead of relying on the fixture to strip the ones we
+        # currently know about.
+        console = Console(
+            file=buffer,
+            force_terminal=True,
+            width=width,
+            color_system="standard",
+            no_color=False,
+        )
         if style is None:
             show_on(console, message)
         else:
@@ -566,14 +574,20 @@ class TestTheReplsOwnDiagnosticsReachTheTerminal:
     async def test_model_output_is_neither_wrapped_nor_interpreted(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
     ) -> None:
-        """Streamed deltas are data too, and a path in one breaks the same way."""
+        """Streamed deltas are data too, and a path in one breaks the same way.
+
+        This is the only site whose text comes from the MODEL rather than from config
+        or from elja's own f-strings, which makes it the likeliest source of a stray
+        `:100:` in prose — and `emoji=False` here was the one flag left unpinned after
+        two rounds of claiming the set was complete.
+        """
         self._forced(mocker)
         path = "/private/var/folders/6h/tmpqjz2q66_/skills/broken.md"
 
         async def stream(
             messages: list[ModelMessage], info: AgentInfo
         ) -> AsyncIterator[StreamItem]:
-            yield f"I read the skill at {path} and [bold]notes.md too"
+            yield f"I read the skill at {path} and [bold]notes.md and notes:100:.md too"
 
         settings = EljaSettings(workspace=WorkspaceConfig(root=tmp_path))
         agent: Agent[EljaDeps, str] = Agent(
@@ -584,6 +598,8 @@ class TestTheReplsOwnDiagnosticsReachTheTerminal:
         out = capsys.readouterr().out
         assert path in out
         assert "[bold]notes.md" in out
+        assert "notes:100:.md" in out
+        assert "💯" not in out
 
 
 class TestTheBannerDoesNotInterpretConfigValues:
@@ -642,8 +658,13 @@ class TestTheBannerDoesNotInterpretConfigValues:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], mocker: MockerFixture
     ) -> None:
         """Same hazard as every other diagnostic, on the one line markup still runs on."""
+        from tests.conftest import narrow_terminal
+
         endpoint = "http://ml-inference-gateway.internal-hostname.corp.example.com:11434/v1"
-        mocker.patch.dict("os.environ", {"COLUMNS": "40"})
+        # Through the shared guard, so this asserts the RELATION rather than trusting
+        # that the example stays longer than 40 columns. It was the sixth
+        # width-sensitive site and the only one still setting COLUMNS by hand.
+        narrow_terminal(mocker, endpoint)
         settings = EljaSettings(
             workspace=WorkspaceConfig(root=tmp_path),
             model={"base_url": endpoint},  # type: ignore[arg-type]

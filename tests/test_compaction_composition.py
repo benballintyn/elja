@@ -670,7 +670,7 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     def test_a_prompt_without_the_placeholder_is_refused(self, tmp_path: Path) -> None:
         """Otherwise the summary is written from nothing and replaces history."""
-        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
+        with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(_settings(tmp_path), summary_prompt="Summarize concisely.")
 
     def test_an_unresolvable_brace_is_refused(self, tmp_path: Path) -> None:
@@ -729,14 +729,18 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             'Output JSON like {{"intent": "x"}}\n\n{{messages}}',
             "{messages[0]}",
             "{messages:.5}",
-            "Summarize: eljatranscriptsentinelalpha",
+            "{messages:.23}",
+            "{messages:.2000}",
+            "{messages.upper}",
         ],
         ids=[
             "placeholder-alone",
             "everything-doubled",
             "first-character-only",
             "truncated-to-five",
-            "sentinel-text-but-no-placeholder",
+            "truncated-to-the-old-boundary",
+            "truncated-to-a-plausible-cap",
+            "attribute-not-substitution",
         ],
     )
     def test_a_prompt_that_does_not_substitute_is_refused_despite_the_text(
@@ -751,27 +755,52 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
         gets there by obeying this module's own advice to double their literal
         braces: doubling all of them takes the placeholder with it.
 
-        Three more shapes that substitute something useless rather than nothing:
-        `{messages[0]}` keeps one character and `{messages:.5}` keeps five, which is
-        a transcript in name only. And a prompt containing the sentinel's own text
-        with no placeholder at all used to be ACCEPTED, which is why the check now
-        renders twice with two different transcripts and requires the results to
-        differ rather than looking for a magic string.
+        The rest substitute something useless rather than nothing, and the widths are
+        the point. A check that compared two renderings for *difference* accepted
+        `{messages:.23}` — 23 being exactly where the two stand-ins stopped agreeing —
+        so a host could cap the transcript at any width above that and the summarizer
+        would rewrite the history from a fragment. `{messages:.2000}` is the plausible
+        shape of that mistake: someone capping cost. Requiring each rendering to
+        contain its whole stand-in refuses every width.
+
+        `{messages.upper}` is the same class from the other side: it renders a method
+        repr, which differs between the two stand-ins because the objects differ, so
+        difference accepted it and containment does not.
         """
-        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
+        with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(_settings(tmp_path), summary_prompt=doubled)
 
     @pytest.mark.parametrize(
         "accepted",
-        ["Summarize.\n\n{messages}", "{messages!r}", "{messages:>10}", "{{{messages}}}"],
-        ids=["plain", "repr-conversion", "format-spec", "braced-placeholder"],
+        [
+            "Summarize.\n\n{messages}",
+            "{messages!r}",
+            "{messages!s}",
+            "{messages!a}",
+            "{messages:>10}",
+            "{messages:^50}",
+            "{{{messages}}}",
+            "{messages} and again {messages}",
+        ],
+        ids=[
+            "plain",
+            "repr-conversion",
+            "str-conversion",
+            "ascii-conversion",
+            "pad-right",
+            "centre",
+            "braced-placeholder",
+            "twice",
+        ],
     )
     def test_a_prompt_that_substitutes_is_accepted(self, tmp_path: Path, accepted: str) -> None:
         """Rendering is the more permissive test, and correctly so.
 
-        A conversion and a format spec both substitute at format time, so refusing
-        them would be the guard over-reaching. `{{{messages}}}` is a literal brace
-        either side of a real placeholder.
+        Every one of these substitutes the transcript in full — a conversion, padding,
+        centring, literal braces either side, or twice over — so refusing any of them
+        would be the guard over-reaching. Padding and centring matter: they change the
+        rendering's length without removing anything, which is the case a naive
+        length check would get wrong.
         """
         assert build_compaction(_settings(tmp_path), summary_prompt=accepted)
 
@@ -787,14 +816,14 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             workspace=WorkspaceConfig(root=tmp_path),
             compaction=CompactionConfig(enabled=False, target_tokens=3000),
         )
-        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
+        with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(settings, summary_prompt="Summarize concisely.")
         # And the disabled path still returns nothing for a prompt that is fine.
         assert build_compaction(settings, summary_prompt="Summarize.\n\n{messages}") == []
 
     @pytest.mark.parametrize(
         ("substitute", "refusal"),
-        [("{transcript}", r"cannot resolve"), ("", r"does not substitute the transcript")],
+        [("{transcript}", r"cannot resolve"), ("", r"does not substitute the whole transcript")],
         ids=["variable-renamed", "substitution-dropped"],
     )
     def test_eljas_own_default_prompt_is_checked_the_same_way(
@@ -844,3 +873,42 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     def test_nothing_is_checked_when_no_prompt_is_given(self, tmp_path: Path) -> None:
         assert build_compaction(_settings(tmp_path))
+
+
+class TestTheAdviceTextNamesTheRightPlaceholder:
+    """The error messages ARE the product of `check_summary_prompt`, so pin their content.
+
+    Changing `_PLACEHOLDER` to anything else left all tests green while both refusals
+    then told the caller to keep the wrong brace single — advice that would send them
+    round the exact loop the guard exists to end.
+    """
+
+    def test_both_refusals_name_the_placeholder_the_summarizer_substitutes(
+        self, tmp_path: Path
+    ) -> None:
+        with pytest.raises(ValueError, match=r"'\{messages\}' placeholder is missing"):
+            build_compaction(_settings(tmp_path), summary_prompt="Summarize concisely.")
+        with pytest.raises(ValueError, match=r"leave the '\{messages\}' placeholder single"):
+            build_compaction(_settings(tmp_path), summary_prompt="{messages} and {0}")
+
+
+class TestAnEmptyClearedPlaceholderIsRefused:
+    """The one caller-supplied string that was not validated at all.
+
+    `cleared_placeholder=""` was accepted and produced tool returns with literally empty
+    content — upstream assigns the string as given and does not fall back to its own
+    default — so the model lost every cue that anything had been cleared. Asymmetric
+    with the care taken over `summary_prompt`, and the same class of mistake: a host
+    string that reaches the model unchecked.
+    """
+
+    def test_an_empty_placeholder_is_refused_at_construction(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"cleared_placeholder must not be empty"):
+            build_compaction(_settings(tmp_path), cleared_placeholder="")
+
+    def test_whitespace_only_is_refused_too(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r"cleared_placeholder must not be empty"):
+            build_compaction(_settings(tmp_path), cleared_placeholder="   \n")
+
+    def test_a_real_placeholder_is_accepted(self, tmp_path: Path) -> None:
+        assert build_compaction(_settings(tmp_path), cleared_placeholder="[cleared]")

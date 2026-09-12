@@ -40,21 +40,27 @@ def _hermetic(tmp_path: Path, mocker: MockerFixture) -> Iterator[None]:
     file in the repo root would change test results.
 
     The terminal variables matter too, now that diagnostics are asserted by the
-    colour they emit. Forcing a terminal is what exposes a test to ``TERM``:
-    rich treats ``TERM`` in ``("dumb", "unknown")`` as a dumb terminal, and then
-    reports no colour system at all AND short-circuits its width to 80 columns
-    before it reads ``COLUMNS`` — so both the style and the narrow-terminal
-    preconditions silently evaporate. Measured on a correct tree: ``TERM=dumb``,
-    ``TERM=unknown`` or ``NO_COLOR=1`` each turn six passing tests red. CI's runner
-    sets none of them, so this is a local-only trap, and ``AGENTS.md`` tells
+    colour they emit. Forcing a terminal is what exposes a test to them:
+    ``TTY_COMPATIBLE=0`` makes ``Console.is_terminal`` false **before** rich even
+    looks at ``FORCE_COLOR``, and ``TERM`` in ``("dumb", "unknown")`` reports no
+    colour system at all AND short-circuits the width to 80 columns before reading
+    ``COLUMNS`` — so the style and the narrow-terminal preconditions both evaporate.
+    Measured on a correct tree, each on its own: ``TTY_COMPATIBLE=0`` turns six tests
+    red, ``TERM=dumb`` and ``TERM=unknown`` six each, ``NO_COLOR=1`` eight. CI's
+    runner sets none of them, so this is a local-only trap — and ``AGENTS.md`` tells
     contributors to run pytest locally.
+
+    ``TTY_COMPATIBLE`` was the omission that mattered: it is the variable rich checks
+    first, so stripping the others left the whole mechanism overridable by the one
+    that outranks them.
     """
     provider_keys = {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"}
-    colour_keys = {"NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR"}
+    # Everything rich consults that can move a colour or width assertion here.
+    terminal_keys = {"TTY_COMPATIBLE", "FORCE_COLOR", "NO_COLOR", "TTY_INTERACTIVE", "COLORTERM"}
     clean = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith("ELJA_") and k not in provider_keys and k not in colour_keys
+        if not k.startswith("ELJA_") and k not in provider_keys and k not in terminal_keys
     }
     clean["TERM"] = "xterm-256color"
     mocker.patch.dict("os.environ", clean, clear=True)

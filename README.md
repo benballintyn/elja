@@ -148,17 +148,21 @@ top_p = 0.9
 # Reasoning controls are the provider's own — no elja-side enum:
 #   openai_reasoning_effort / anthropic_thinking / google_thinking_config,
 #   or the portable `thinking` (true/false or "minimal".."xhigh").
-# NB: pair a reasoning setting with temperature = "" rather than a value.
-# anthropic DROPS temperature/top_p when reasoning is on, with a warning; openai
-# and google send them and the API rejects the request with a 400.
+# NB: pair a reasoning setting with temperature = "" rather than a value. Whether
+# temperature/top_p survive is provider- AND model-specific, not a rule about
+# reasoning: anthropic drops them per MODEL PROFILE, independent of thinking
+# (claude-sonnet-5 drops them with a warning, claude-sonnet-4-5 does not); openai
+# drops them at request time when reasoning is effectively active, which for the
+# o-series and the original GPT-5 is the default; google sends them.
 
 [limits]                 # every field maps to pydantic-ai's UsageLimits
 request_limit = 25
 total_tokens_limit = 120000
 cost_limit = 2.50        # USD, and only for models pydantic-ai can price —
                          # on an unpriced model (the local default included) it
-                         # is unenforced and warns. The warning is raised every
-                         # request; Python's default filter shows it once.
+                         # is unenforced and warns once per completed run (the
+                         # per-request checks pass warn_if_cost_unavailable=False),
+                         # which the warnings registry then shows once per process.
 tool_calls_limit = 40
 input_tokens_limit = 100000
 output_tokens_limit = 20000

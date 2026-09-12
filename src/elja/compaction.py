@@ -17,8 +17,11 @@ Strategy (see the project's compaction research, 2026-08):
    dropping is the documented failure mode: 0% → 30% policy violations) and
    updates incrementally rather than rewriting wholesale.
 
-The system prompt/instructions and the deferred-skills catalog live outside
-message history in pydantic-ai, so they are never subject to compaction.
+``instructions`` and the deferred-skills catalog live outside message history in
+pydantic-ai, so they are never subject to compaction. A **system prompt** is a
+different matter and the distinction is load-bearing: ``Agent(system_prompt=...)``
+puts a ``SystemPromptPart`` *into* the first request, i.e. into history, where
+compaction does see it — and duplicates it (see "irreducible content" below).
 Loaded skill BODIES, however, travel as tool returns inside history: if the
 summarization tier drops a load, the skill silently unloads (the catalog
 survives, so the model can re-load it) — the summary prompt is extended to
@@ -68,7 +71,7 @@ one paid LLM call each. Measured over a six-step turn: one summarizer call in th
 ordinary case, **six** when something irreducible exceeds target — one-to-one with
 requests, and unbounded.
 
-Two things are irreducible, and the second is the likely one:
+Three things are irreducible, and the ones a host trips over are the last two:
 
 - **A pin.** Re-injection happens *after* the tail is trimmed, so ``keep_tokens``
   cannot bound it.
@@ -79,12 +82,24 @@ Two things are irreducible, and the second is the likely one:
   pin anywhere. Measured: a 20k-character first user message at
   ``target_tokens=1000`` gives six summarizer calls over six requests, and the same
   turn with ``preserve_first_user_message=False`` gives one.
+- **A ``SystemPromptPart`` sitting in caller-owned history**, which is what
+  ``Agent(system_prompt=...)`` produces. This one *grows*: the harness copies every
+  leading system part into the summary message on each compaction, and
+  ``preserve_first_user_message`` keeps the original request carrying it as well, so
+  each compaction leaves one more copy for the next to find. Measured over five
+  caller-owned turns with a 350-character policy: **1, 2, 3, 4, 5** copies and the
+  history 1.1k → 4.4k characters, versus a flat **1** with
+  ``preserve_first_user_message=False``. A policy that starts comfortably under
+  target therefore reaches the unbounded regime by growth alone.
 
-So a host whose first message is large has two options: raise ``target_tokens``
-above it, or pass ``preserve_first_user_message=False`` to
-:func:`build_compaction` and keep the task in its own instructions instead. elja
-does not *bound* this; doing so needs a latch that refuses to re-enter the
-summarizing tier once it has failed to reach target, which is not built.
+Remedies, in order of preference. **Carry policy in ``instructions=``, not
+``system_prompt=``** — instructions live outside message history, so compaction never
+sees them and nothing accumulates. (elja's own paths use ``instructions=``, which is
+why the CLI never hits this.) Failing that, ``preserve_first_user_message=False``
+stops the *growth* but does not help a single copy that is already above target; for
+that, raise ``target_tokens`` above it. elja does not *bound* any of this; doing so
+needs a latch that refuses to re-enter the summarizing tier once it has failed to
+reach target, which is not built.
 """
 
 import inspect
@@ -117,11 +132,16 @@ _SKILLS_WARNING = (
 )
 _ANCHOR = "<messages>"
 _PLACEHOLDER = "{messages}"
-# Two transcripts, rendered separately, to prove the prompt actually substitutes:
-# if changing the transcript does not change the output, the prompt is not using it.
-# They share a long prefix on purpose, so a field that discards what it substitutes
-# (`{messages[0]}`, `{messages:.5}`) renders both identically and is refused too.
-_SENTINELS = ("eljatranscriptsentinelalpha", "eljatranscriptsentinelbeta")
+# Two stand-in transcripts, rendered separately, to prove the prompt substitutes the
+# WHOLE transcript. Requiring each rendering to contain its own stand-in verbatim is
+# what catches a field that substitutes only part of it: a previous version compared
+# the two renderings for difference, which let `{messages:.23}` through — 23 being the
+# length at which the two stand-ins stopped agreeing. Any truncation is now refused,
+# whatever its width, because a truncated rendering cannot contain the whole thing.
+# Long and repetitive on purpose: the distinguishing token sits at the END, so no
+# plausible width slices it off and accidentally satisfies containment.
+_TRANSCRIPT_STAND_IN = "elja-transcript-stand-in " * 200
+_SENTINELS = (_TRANSCRIPT_STAND_IN + "alpha", _TRANSCRIPT_STAND_IN + "beta")
 
 
 def extend_summary_prompt(harness_default: str) -> str:
@@ -140,9 +160,9 @@ def extend_summary_prompt(harness_default: str) -> str:
     Raises:
         RuntimeError: If the anchor is absent. A plain ``str.replace`` would
             no-op silently and drop the warning, and the harness pin is a range,
-            so a patch release could reword the prompt. Failing loudly at import
-            beats shipping a prompt that quietly lost its warning. Loudly at
-            first use rather than at import: see ``default_summary_prompt``.
+            so a patch release could reword the prompt. Failing loudly beats
+            shipping a prompt that quietly lost its warning — at first use rather
+            than at import: see ``default_summary_prompt``.
     """
     if _ANCHOR not in harness_default:
         raise RuntimeError(
@@ -181,45 +201,47 @@ def default_summary_prompt() -> str:
 def check_summary_prompt(summary_prompt: str) -> None:
     """Refuse a summary prompt the summarizer cannot use, at construction time.
 
-    ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)``
-    and nothing else. ``str.format`` no-ops on a string with no placeholder, so a
-    prompt that does not *substitute* hands the summarizer an instruction with no
-    transcript — and its output still **replaces every message before the
-    cutoff**. The run completes, nothing logs, and the history is gone. A stray
-    single brace raises ``KeyError`` instead, at the first summarization, deep in
-    a conversation.
+        ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)``
+        and nothing else. ``str.format`` no-ops on a string with no placeholder, so a
+        prompt that does not *substitute* hands the summarizer an instruction with no
+        transcript — and its output still **replaces every message before the
+        cutoff**. The run completes, nothing logs, and the history is gone. A stray
+        single brace raises ``KeyError`` instead, at the first summarization, deep in
+        a conversation.
 
-    So this renders the prompt twice with two different transcripts and requires the
-    results to differ, rather than looking for ``{messages}`` in the text. Those are
-    not the same test, and the difference is a hole this function has had twice over:
-    ``{messages}`` is a substring of ``{{messages}}``, which is an escaped brace that
-    renders as literal text and substitutes nothing — and a caller reaches that by
-    obeying this very function's advice to double their literal braces, since
-    doubling all of them takes the placeholder with it.
+    So this renders the prompt twice with two different stand-in transcripts and
+        requires each rendering to contain its own stand-in **whole**, rather than looking
+        for ``{messages}`` in the text. Those are not the same test, and the difference is
+        a hole this function has had three times over:
 
-    Two transcripts rather than one sentinel checked for by name, because a prompt
-    containing the sentinel's own text would then pass with no placeholder at all.
-    "Changing the transcript changes the output" is the property that actually
-    matters, and it needs no magic string.
+        - ``{messages}`` is a substring of ``{{messages}}``, an escaped brace that renders
+          as literal text and substitutes nothing — reached by obeying this very function's
+          advice to double literal braces, since doubling all of them takes the placeholder
+          with it.
+        - Checking for one sentinel *by name* accepted a prompt that merely contained the
+          sentinel's own text, with no placeholder at all.
+        - Comparing two renderings for *difference* accepted ``{messages:.23}`` — the
+          width at which the two stand-ins stopped agreeing — handing the summarizer 23
+          characters of a 40k transcript while its output still replaced the history.
 
-    It is also the more permissive test, and rightly: ``{messages!r}`` and
-    ``{messages:>10}`` both work at format time and are accepted. A field that
-    *discards* what it substitutes is not — ``{messages[0]}`` keeps one character
-    and ``{messages:.5}`` keeps five, which is a transcript in name only.
+        Containment is the property that actually matters: the whole transcript has to come
+        out. It stays permissive where it should — ``{messages!r}``, ``{messages!s}``,
+        ``{messages:>10}`` and ``{{{messages}}}`` all substitute in full and are accepted —
+        and refuses every field that keeps only part of it, at any width.
 
-    Args:
-        summary_prompt: The caller's prompt.
+        Args:
+            summary_prompt: The caller's prompt.
 
-    Raises:
-        ValueError: If the prompt does not substitute the transcript, or a brace
-            cannot be resolved. Every failure arrives as ``ValueError``:
-            ``str.format`` raises at least five different types on a bad field
-            (``KeyError``, ``IndexError``, ``ValueError``, ``AttributeError``,
-            ``TypeError``), and a caller guarding its construction path should not
-            have to enumerate them.
+        Raises:
+            ValueError: If the prompt does not substitute the transcript, or a brace
+                cannot be resolved. Every failure arrives as ``ValueError``:
+                ``str.format`` raises at least five different types on a bad field
+                (``KeyError``, ``IndexError``, ``ValueError``, ``AttributeError``,
+                ``TypeError``), and a caller guarding its construction path should not
+                have to enumerate them.
     """
     try:
-        rendered = {summary_prompt.format(messages=transcript) for transcript in _SENTINELS}
+        rendered = [summary_prompt.format(messages=transcript) for transcript in _SENTINELS]
     except Exception as exc:
         raise ValueError(
             f"summary_prompt contains a field str.format cannot resolve ({exc!r}); "
@@ -227,17 +249,20 @@ def check_summary_prompt(summary_prompt: str) -> None:
             f"{_PLACEHOLDER!r} placeholder single. Unchecked this raises at the "
             "first summarization, deep in a conversation."
         ) from exc
-    if len(rendered) == 2:
+    if all(
+        stand_in in rendering for stand_in, rendering in zip(_SENTINELS, rendered, strict=True)
+    ):
         return
     raise ValueError(
-        "summary_prompt does not substitute the transcript: rendering it with two "
-        "different transcripts produced the same string. Either the "
+        "summary_prompt does not substitute the whole transcript: rendering it with a "
+        "stand-in transcript did not produce that transcript. Either the "
         f"{_PLACEHOLDER!r} placeholder is missing, or it is escaped (a doubled "
         "{{messages}} is a literal, not a placeholder — leave this one single even "
-        "when doubling the rest), or the field discards what it substitutes "
-        "({messages[0]} keeps one character, {messages:.5} keeps five). Unchecked, "
-        "the summarizer is handed an instruction with no transcript and its output "
-        "still replaces the history."
+        "when doubling the rest), or the field keeps only part of what it substitutes "
+        "({messages[0]} keeps one character, {messages:.2000} keeps two thousand of "
+        "however many there are). Unchecked, the summarizer is handed an instruction "
+        "with no transcript, or a fragment of one, and its output still replaces the "
+        "history."
     )
 
 
@@ -311,6 +336,16 @@ def build_compaction(
     """
     if summary_prompt is not None:
         check_summary_prompt(summary_prompt)
+    if cleared_placeholder is not None and not cleared_placeholder.strip():
+        # Upstream assigns this string as given and does not fall back to its own
+        # default, so an empty one leaves the model a cleared tool result with no cue
+        # that anything was cleared — the masking tier's whole signal, silently gone.
+        raise ValueError(
+            "cleared_placeholder must not be empty: it replaces a tool result's "
+            "content, and an empty one leaves the model no indication that anything "
+            "was cleared. Pass text naming your own store, e.g. "
+            "'[result cleared; retrieve it by its receipt id]'."
+        )
     cfg = settings.compaction
     if not cfg.enabled:
         return []

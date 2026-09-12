@@ -39,7 +39,8 @@ What elja provides is the construction door
 
 import asyncio
 import contextlib
-from collections.abc import Callable, Container, Sequence
+from collections.abc import Callable, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from typing import Any, TypeGuard
 
@@ -376,45 +377,66 @@ def _insert_tool_results(request: ModelRequest, results: list[ModelRequestPart])
 def close_interrupted_calls(
     messages: Sequence[ModelMessage],
     *,
-    leave_open: Container[str] = (),
+    leave_open: AbstractSet[str] = frozenset(),
 ) -> list[ModelMessage]:
     """Answer every tool call a FAILED turn never finished, so the history can be replayed.
 
-    **Without this a checkpoint is not resumable, in exactly the case that motivates
-    taking one.** A provider refuses a history whose response has a tool call with no
-    result, and so does pydantic-ai: replaying one with a new user prompt raises
-    ``UserError('Cannot provide a new user prompt when the message history contains
-    unprocessed tool calls.')``, and replaying it *without* a prompt re-executes the
-    call — the duplicate side effect the checkpoint exists to prevent, one level down.
+        **Without this a checkpoint is not resumable, in exactly the case that motivates
+        taking one.** A provider refuses a history whose response has a tool call with no
+        result, and so does pydantic-ai: replaying one with a new user prompt raises
+        ``UserError('Cannot provide a new user prompt when the message history contains
+        unprocessed tool calls.')``, and replaying it *without* a prompt re-executes the
+        call — the duplicate side effect the checkpoint exists to prevent, one level down.
 
-    pydantic-ai repairs dangling calls itself at send time, but deliberately leaves the
-    **last** response alone: its calls are the live frontier that run resumption and
-    ``deferred_tool_results`` may still answer. A turn that died *inside* a tool leaves
-    its dangling call exactly there. The one case that self-heals is a response with
-    two calls where one returned — the completed sibling's request is recorded, and the
-    interrupted one is closed out alongside it — which is why a single-tool turn fails
-    where a parallel one does not.
+    The refusal is not a provider's. pydantic-ai repairs dangling calls at send time
+        *unconditionally*, last response included, so one never reaches the wire. What
+        leaves the last response alone is the earlier pass that decides how to resume a
+        history handed back to it — and that is where the ``UserError`` comes from. Its
+        calls are the live frontier ``deferred_tool_results`` may still answer. A turn that
+        died *inside* a tool leaves its dangling call exactly there. The one case that
+        self-heals is a response with two calls where one returned — the completed
+        sibling's request is recorded, and the interrupted one is closed out alongside it —
+        which is why a single-tool turn fails where a parallel one does not.
 
-    ``leave_open`` is the other half of that frontier, and the reason this function is
-    **for a failed turn only**. A deferred call (``CallDeferred``, which is how
-    ``ask_user`` asks) is a *pending question the host has already shown someone*, not
-    interrupted work. Closing it out makes the answer permanently unacceptable —
-    ``UserError('Tool call … was already executed and its result cannot be
-    overridden.')`` — and tells the model the question was interrupted. The history
-    cannot distinguish the two (``tool_kind`` is ``None`` on both), but the host knows
-    which of its own tools defer, so it names them here.
+        So repair a history you are about to **persist and replay**, and never a
+        successful ``DeferredToolRequests`` history: upstream preserves that frontier on
+        purpose, and closing it is exactly what ``leave_open`` exists to prevent.
 
-    Args:
-        messages: The run's messages, as handed back by a dying turn.
-        leave_open: Names of tools whose dangling calls are pending questions rather
-            than interrupted work, and must stay open for the host to answer.
+        ``leave_open`` is the other half of that frontier, and the reason this function is
+        **for a failed turn only**. A deferred call (``CallDeferred``, which is how
+        ``ask_user`` asks) is a *pending question the host has already shown someone*, not
+        interrupted work. Closing it out makes the answer permanently unacceptable —
+        ``UserError('Tool call … was already executed and its result cannot be
+        overridden.')`` — and tells the model the question was interrupted. The history
+        cannot distinguish the two (``tool_kind`` is ``None`` on both), but the host knows
+        which of its own tools defer, so it names them here.
 
-    Returns:
-        The history with every unanswered call answered, each result carrying
-        pydantic-ai's own interrupted content, ``outcome='interrupted'``, the repaired
-        response's timestamp (so a second pass produces the same bytes), and the
-        marker pydantic-ai sets on its own synthesized returns. A new list either way,
-        never the run's own.
+        Args:
+            messages: The run's messages, as handed back by a dying turn.
+            leave_open: Names of tools whose dangling calls are pending questions rather
+                than interrupted work, and must stay open for the host to answer. A
+                ``Set``, not a ``Container``: a bare ``str`` would type-check and then
+                match every tool whose name is one of its substrings. ``CallDeferred`` is
+                not the only reason to list a tool — ``ApprovalRequired`` and externally
+                executed tools have the same property.
+
+        Returns:
+            The history with every unanswered call answered **except those named in
+            ``leave_open``**, which stay dangling by design. Each synthesized result
+            carries pydantic-ai's own interrupted content, ``outcome='interrupted'``, the
+            repaired response's timestamp (so a second pass over the same history produces
+            the same bytes), and the marker pydantic-ai sets on its own synthesized
+            returns. A new list either way, never the run's own.
+
+            Resume a checkpoint with something left open using
+            ``deferred_tool_results=`` keyed on the pending call's ``tool_call_id``,
+            which the host reads off the dangling ``ToolCallPart`` — on the failure path
+            the run raised instead of returning ``DeferredToolRequests``, so the history
+            is the only place that id exists. Replaying it with a new user prompt
+            instead is **not** an error, and that is the trap: pydantic-ai repairs the
+            history at send time, so the question is silently closed out as interrupted
+            and the answer can never be supplied. Measured. Keeping a call open buys the
+            ``deferred_tool_results`` path and nothing else.
     """
     dangling = {
         index: [call for call in calls if call.tool_name not in leave_open]

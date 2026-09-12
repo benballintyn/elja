@@ -30,6 +30,7 @@ from pydantic_ai.messages import (
     INTERRUPTED_TOOL_RETURN_CONTENT,
     ModelMessage,
     ModelRequest,
+    ModelRequestPart,
     ModelResponse,
     RetryPromptPart,
     TextPart,
@@ -60,6 +61,7 @@ from examples.server_agent import (
     build_host_agent,
     deserialize,
     foreign_thinking_parts,
+    household_toolset,
     run_turn,
     run_with_deadline,
     serialize,
@@ -674,10 +676,16 @@ class TestHostOwnedPersistence:
         assert [part.content for part in foreign_thinking_parts([mixed], model)] == ["theirs"]
 
     def test_a_request_carries_no_reasoning_to_weigh(self) -> None:
-        """Requests have parts too, and none of them is a thinking part."""
+        """Requests have parts too, and `ThinkingPart` is not among the types they can hold.
+
+        So the `ModelResponse` filter is a type narrowing for `message.parts`, not a
+        guard against anything reachable — removing it changes no behaviour. Asserted
+        here as documentation of that, rather than left to look like a pinned guard.
+        """
         model = FunctionModel(lambda m, i: None)  # type: ignore[arg-type,return-value]
         request = ModelRequest(parts=[UserPromptPart(content="think about it")])
         assert foreign_thinking_parts([request], model) == []
+        assert ThinkingPart not in getattr(ModelRequestPart, "__args__", ())
 
     async def test_nothing_is_written_unless_the_host_writes_it(self, tmp_path: Path) -> None:
         before = sorted(p.name for p in tmp_path.iterdir())
@@ -906,12 +914,14 @@ class TestCancellation:
                 )
 
     async def test_the_cancelled_run_carries_its_own_resumable_history(self) -> None:
-        """``RunCancelled`` is not only a signal; it holds the state too.
+        """``RunCancelled`` is not only a signal; it carries the run's history.
 
-        Tool calls the stop interrupted are closed out with synthesized
-        ``outcome='interrupted'`` returns, so the exception's history goes straight
-        back in as ``message_history`` — which is why the example does not need a
-        second representation of a cancelled turn.
+        What it does NOT carry is a *resumable* history — see
+        `TestACancelledRunsOwnHistoryIsNotResumable`, which measures a tool stopped
+        inside its own body leaving its call dangling in this very snapshot. This
+        fixture stalls the model stream on a later turn, so `save_fact` completed and
+        its return is a real success; all this asserts is that the completed work is
+        present on the exception, which is the claim the assertion can support.
         """
         deps = _deps()
         agent = build_host_agent(_writes_then_stalls())
@@ -1534,3 +1544,219 @@ class TestACancelledRunsOwnHistoryIsNotResumable:
         assert _dangling_tool_names(caught.value.all_messages()) == ["charge"]
         # ...and the checkpoint the host persists is.
         assert _dangling_tool_names(recorder.partial) == []
+
+
+class TestLeaveOpenIsASetNotJustAContainer:
+    """`Container[str]` accepted a bare `str`, and `in` on a `str` is substring matching.
+
+    So `leave_open="ask_user"` type-checked clean under strict mypy and silently kept
+    every tool whose name is a substring of it — `ask` and `user` — open as well,
+    leaving a history the next replay refuses. `AbstractSet[str]` makes that a type
+    error, because a `str` is not a `Set`.
+    """
+
+    @staticmethod
+    def _three_dangling() -> list[ModelMessage]:
+        return [
+            ModelRequest(parts=[UserPromptPart(content="go")]),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name="ask", args={}, tool_call_id="a"),
+                    ToolCallPart(tool_name="user", args={}, tool_call_id="u"),
+                    ToolCallPart(tool_name="charge", args={}, tool_call_id="c"),
+                ]
+            ),
+        ]
+
+    def test_only_the_named_tool_is_left_open(self) -> None:
+        from examples.server_agent import close_interrupted_calls
+
+        repaired = close_interrupted_calls(self._three_dangling(), leave_open={"ask"})
+        closed = [
+            part.tool_name
+            for message in repaired
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        # Exactly the two NOT named, rather than everything whose name happens to be a
+        # substring of the argument.
+        assert sorted(closed) == ["charge", "user"]
+
+    def test_the_default_closes_everything(self) -> None:
+        from examples.server_agent import close_interrupted_calls
+
+        repaired = close_interrupted_calls(self._three_dangling())
+        closed = [
+            part.tool_name
+            for message in repaired
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        assert sorted(closed) == ["ask", "charge", "user"]
+
+
+class TestASynthesizedResultGoesAfterTheExistingOnes:
+    """The position rule, on the only shape that has a non-zero insert point.
+
+    Both docstrings single out "a response with two calls where one returned" as the
+    load-bearing case, and it is the one a real run produces when parallel calls
+    resolve differently. Providers expect tool results ahead of user-facing parts, so
+    a synthesized result has to land after the existing results and before the rest —
+    and two surviving mutants (scanning forward, or inserting at the match instead of
+    after it) show that was asserted nowhere.
+    """
+
+    def test_the_trailing_request_keeps_results_first_and_in_order(self) -> None:
+        from examples.server_agent import close_interrupted_calls
+
+        history: list[ModelMessage] = [
+            ModelRequest(parts=[UserPromptPart(content="do both")]),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name="quick", args={}, tool_call_id="q"),
+                    ToolCallPart(tool_name="also", args={}, tool_call_id="z"),
+                    ToolCallPart(tool_name="slow", args={}, tool_call_id="s"),
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(tool_name="quick", content="ok", tool_call_id="q"),
+                    ToolReturnPart(tool_name="also", content="ok", tool_call_id="z"),
+                    UserPromptPart(content="and while you are there"),
+                ]
+            ),
+        ]
+        repaired = close_interrupted_calls(history)
+        tail = repaired[-1]
+        assert isinstance(tail, ModelRequest)
+        # Two existing results, then the synthesized one, then the user text. Two
+        # existing results rather than one so the order separates "insert after the
+        # last match" from "insert at the first".
+        assert [
+            (type(part).__name__, getattr(part, "tool_call_id", None)) for part in tail.parts
+        ] == [
+            ("ToolReturnPart", "q"),
+            ("ToolReturnPart", "z"),
+            ("ToolReturnPart", "s"),
+            ("UserPromptPart", None),
+        ]
+
+
+class TestAKeptOpenCheckpointResumesThroughDeferredResults:
+    """What `leave_open` actually buys, asserted rather than inferred.
+
+    The existing test only shows the call is still dangling and comments that this is
+    "what lets the host answer it" — an inference. A kept-open checkpoint is **not**
+    replayable with a new user prompt (same `UserError`); it is replayable with
+    `deferred_tool_results=` keyed on the pending call's `tool_call_id`, which the host
+    reads off the dangling `ToolCallPart` because the run raised instead of handing
+    back a `DeferredToolRequests`. Both directions below.
+    """
+
+    @staticmethod
+    def _asks_then_fails() -> tuple[FunctionToolset[HostDeps], FunctionModel]:
+        toolset: FunctionToolset[HostDeps] = FunctionToolset()
+
+        @toolset.tool
+        async def ask_user(ctx: RunContext[HostDeps], question: str) -> str:
+            """Defer, as the example's own tool does."""
+            raise CallDeferred
+
+        @toolset.tool
+        async def charge(ctx: RunContext[HostDeps], amount: str) -> str:
+            ctx.deps.store["charged"] = amount
+            raise RuntimeError("gateway 500")
+
+        async def stream(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            yield {
+                1: DeltaToolCall(name="ask_user", json_args='{"question": "which vet?"}'),
+                2: DeltaToolCall(name="charge", json_args='{"amount": "100"}'),
+            }
+
+        return toolset, FunctionModel(stream_function=stream)
+
+    async def _dying_turn(self) -> tuple[Agent[HostDeps, Any], HostDeps, TurnRecorder, str]:
+        toolset, model = self._asks_then_fails()
+        agent: Agent[HostDeps, str | DeferredToolRequests] = build_application_agent(
+            model,
+            deps_type=HostDeps,
+            output_type=[str, DeferredToolRequests],
+            toolsets=[toolset],
+        )
+        deps = _deps()
+        recorder = TurnRecorder()
+        with pytest.raises(RuntimeError, match="gateway 500"):
+            await run_turn(agent, deps, "book and charge", recorder=recorder)
+        pending = [
+            part.tool_call_id
+            for message in recorder.partial
+            for part in message.parts
+            if isinstance(part, ToolCallPart) and part.tool_name == "ask_user"
+        ]
+        assert len(pending) == 1
+        return agent, deps, recorder, pending[0]
+
+    async def test_answering_the_question_resumes_the_conversation(self) -> None:
+        agent, deps, recorder, call_id = await self._dying_turn()
+
+        async def answer(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            yield "booked with Dr. Meow"
+
+        resumed: Agent[HostDeps, str | DeferredToolRequests] = build_application_agent(
+            FunctionModel(stream_function=answer),
+            deps_type=HostDeps,
+            output_type=[str, DeferredToolRequests],
+            toolsets=[household_toolset()],
+        )
+        output, _ = await run_turn(
+            resumed,
+            deps,
+            history=recorder.partial,
+            recorder=TurnRecorder(),
+            deferred_tool_results=DeferredToolResults(calls={call_id: "Dr. Meow"}),
+        )
+        assert output == "booked with Dr. Meow"
+
+    async def test_a_new_prompt_silently_closes_the_question_instead(self) -> None:
+        """The cost of keeping it open, and it is not an error — which is the trap.
+
+        Replaying a kept-open checkpoint with a new user prompt *succeeds*. pydantic-ai
+        repairs the history at send time, so the pending question reaches the model as
+        `ToolReturnPart(ask_user, outcome='interrupted')` and the host's answer can
+        never be supplied afterwards. Nothing warns. So `leave_open` buys the
+        `deferred_tool_results` path and nothing else, and a host that takes the other
+        one has quietly discarded the question it already asked.
+        """
+        _, deps, recorder, _ = await self._dying_turn()
+        seen: list[tuple[str, object, object]] = []
+
+        async def spy(messages: list[ModelMessage], info: AgentInfo) -> AsyncIterator[StreamItem]:
+            seen.extend(
+                (
+                    type(part).__name__,
+                    getattr(part, "outcome", None),
+                    getattr(part, "tool_name", None),
+                )
+                for message in messages
+                for part in message.parts
+            )
+            yield "never mind then"
+
+        agent: Agent[HostDeps, str | DeferredToolRequests] = build_application_agent(
+            FunctionModel(stream_function=spy),
+            deps_type=HostDeps,
+            output_type=[str, DeferredToolRequests],
+            toolsets=[household_toolset()],
+        )
+        output, _ = await run_turn(
+            agent, deps, "never mind", history=recorder.partial, recorder=TurnRecorder()
+        )
+        assert output == "never mind then"
+        assert ("ToolReturnPart", "interrupted", "ask_user") in seen, (
+            "the question was not closed out, so this trap no longer exists and the "
+            "docstring should say so"
+        )

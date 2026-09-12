@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import pytest
-from pydantic import SecretStr, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from pytest_mock import MockerFixture
 
 import elja
@@ -617,3 +617,98 @@ class TestACeilingOfZeroIsAConfigError:
 
         assert getattr(LimitsConfig(**{field: 1}), field) == 1  # type: ignore[arg-type]
         assert getattr(LimitsConfig(**{field: None}), field) is None  # type: ignore[arg-type]
+
+
+class TestExtraBodyIsPassedThroughUntouched:
+    """`extra_body` is the one annotation pydantic does not validate, so nothing else sees it.
+
+    Which made `_materialize` the only thing that did — and it rewrote every iterable
+    into a list. A host handing `extra_body` a pydantic model for a local server's own
+    knobs (vLLM's `chat_template_kwargs`, `guided_json`) got a list of key/value pairs
+    in the request body instead of a loud failure at JSON encode: a wrong request that
+    looks like a right one. The walk now tests `Iterator`, not `Iterable`.
+    """
+
+    @staticmethod
+    def _body(value: object) -> object:
+        return ModelConfig(settings={"extra_body": value}).settings["extra_body"]
+
+    def test_a_pydantic_model_survives(self) -> None:
+        class Extras(BaseModel):
+            chat_template_kwargs: dict[str, bool] = {"enable_thinking": False}
+
+        body = self._body(Extras())
+        assert isinstance(body, Extras)
+        assert body.chat_template_kwargs == {"enable_thinking": False}
+
+    @pytest.mark.parametrize(
+        "value",
+        [(1, 2), {1, 2}, bytearray(b"hi"), range(3), {"guided_json": {"a": 1}}],
+        ids=["tuple", "set", "bytearray", "range", "dict"],
+    )
+    def test_every_other_iterable_shape_survives(self, value: object) -> None:
+        """All of these are `Iterable` and none is a once-consumable `Iterator`."""
+        body = self._body(value)
+        assert body == value
+        assert type(body) is type(value)
+
+    def test_a_real_iterator_is_still_materialized(self) -> None:
+        """The narrowing must not lose the fix it was narrowed from.
+
+        `extra_body` is not where the lazy-validator problem lives, but if a caller does
+        put an iterator there it has the same read-once hazard, so it is still forced.
+        """
+        body = self._body(iter([1, 2]))
+        assert body == [1, 2]
+
+
+class TestTheLegacySequenceProtocolIsWalkedToo:
+    """The third container shape to skip the dropped-key walk, each one step further out.
+
+    `Iterable`'s subclass hook checks only `__iter__`, but `iter()` falls back to
+    `__getitem__` — so pydantic validates a legacy sequence happily while the walk
+    gave up and the misspelled key inside vanished. The walk's type test now mirrors
+    what pydantic accepts rather than what `isinstance` recognizes.
+    """
+
+    class _GetItemOnly:
+        """A sequence by the old protocol: indexable, with no `__iter__`."""
+
+        def __init__(self, items: list[object]) -> None:
+            self._items = list(items)
+
+        def __getitem__(self, index: int) -> object:
+            return self._items[index]
+
+    def test_a_nested_typo_inside_one_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match=r"anthropic_container\.skills\.0\.bogus"):
+            ModelConfig(
+                provider="anthropic",
+                settings={
+                    "anthropic_container": {
+                        "id": "c",
+                        "skills": self._GetItemOnly(
+                            [{"skill_id": "s", "type": "custom", "bogus": 1}]
+                        ),
+                    }
+                },
+            )
+
+    def test_a_correct_one_is_accepted_and_materialized(self) -> None:
+        cfg = ModelConfig(
+            provider="anthropic",
+            settings={
+                "anthropic_container": {
+                    "id": "c",
+                    "skills": self._GetItemOnly([{"skill_id": "s", "type": "custom"}]),
+                }
+            },
+        )
+        skills = cfg.settings["anthropic_container"]["skills"]
+        assert isinstance(skills, list)
+        assert len(skills) == 1
+
+    def test_something_that_is_not_a_sequence_at_all_is_left_alone(self) -> None:
+        """The fallback must not turn a failed conversion into a spurious rejection."""
+        cfg = ModelConfig(settings={"extra_body": object()})
+        assert isinstance(cfg.settings["extra_body"], object)
