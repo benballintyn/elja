@@ -135,14 +135,23 @@ def implements_count_tokens(model: "Model | type[Model]") -> bool:
     support from a provider name: ``model.provider`` describes the model elja
     *would build*, which on the application path is not the model being used.
 
-    Wrappers are unwrapped first, because ``WrapperModel`` *defines*
-    ``count_tokens`` in order to delegate it — so the plain override test answers
-    True for every wrapper regardless of what it wraps. ``InstrumentedModel`` is a
-    ``WrapperModel``, and it is what pydantic-ai puts around a model whenever
-    instrumentation is on (``instrument=True``, ``Agent.instrument_all()``,
-    Logfire). Measured: an instrumented ``OpenAIChatModel`` answered True and then
-    raised ``NotImplementedError`` on the first request — the exact failure this
-    function exists to prevent.
+    Wrappers are unwrapped to the **bottom** of the chain, because
+    ``WrapperModel`` *defines* ``count_tokens`` in order to delegate it — so the
+    plain override test answers True for every wrapper regardless of what it wraps.
+    ``InstrumentedModel`` is a ``WrapperModel``, and it is what pydantic-ai puts
+    around a model whenever instrumentation is on (``instrument=True``,
+    ``Agent.instrument_all()``, Logfire). Measured: an instrumented
+    ``OpenAIChatModel`` answered True and then raised ``NotImplementedError`` on the
+    first request — the exact failure this function exists to prevent.
+
+    Unwrapping to the bottom rather than stopping at the first wrapper that defines
+    the method is deliberate: ``ConcurrencyLimitedModel`` is a shipped
+    ``WrapperModel`` that defines ``count_tokens`` *solely* to delegate it under a
+    semaphore, so a top-down test would report True for
+    ``ConcurrencyLimitedModel(OpenAIChatModel)``. The cost is the mirror case — a
+    host's own wrapper that supplies a real implementation is reported False even
+    though the call would have worked. That is the safe direction: the host declines
+    a feature rather than shipping a run that dies.
 
     A wrapper *class* has no instance to look through, so it answers False rather
     than guessing at what it would wrap.
@@ -151,8 +160,8 @@ def implements_count_tokens(model: "Model | type[Model]") -> bool:
         model: A model instance or class.
 
     Returns:
-        True if the model that will actually receive the call overrides
-        ``count_tokens``.
+        True if the model at the BOTTOM of the wrapper chain overrides
+        ``count_tokens``. A wrapper supplying its own implementation reads False.
     """
     if isinstance(model, type):
         return not issubclass(model, WrapperModel) and model.count_tokens is not Model.count_tokens

@@ -93,17 +93,24 @@ def validate_provider_settings(provider: str, settings: Mapping[str, Any]) -> di
         _reject(provider, [k for k in settings if k not in portable and not k.startswith(prefix)])
         return dict(settings)
     dialect = getattr(module, class_name)
+    # Snapshot the CALLER's structure before validating it. Pydantic consumes an
+    # iterator while validating, so by the time the dropped-key walk runs there is
+    # nothing left on the original side to compare — and the three leaves this
+    # matters for are annotated `Iterable[...]`, which is exactly the annotation
+    # that invites a caller to pass a generator. Widening the walk's type test
+    # cannot fix that; only snapshotting first can.
+    settings = _materialize(settings)
     validated = _materialize(_value_validator(dialect)(settings=settings).settings)  # type: ignore[attr-defined]
     # Pydantic DROPS keys a TypedDict does not declare rather than complaining,
     # at every depth. One walk of what came back finds all of them, so a typo
     # inside google_thinking_config is refused exactly like one beside it —
     # rather than silently disabling the setting it was meant to configure.
-    # One gap, bounded: a leaf that validates into a non-Mapping OBJECT rather
-    # than a dict ends the walk, so a typo beside a correctly-spelled field of
-    # `tool_choice` (which becomes a `ToolOrOutput` dataclass) is dropped in
-    # silence. Unreachable today — ToolOrOutput has exactly one field, so you
-    # cannot get there without also spelling it right — and real the moment
-    # upstream adds a second.
+    # One gap remains, and it is unreachable rather than merely unlikely: a leaf
+    # that validates into a non-Mapping OBJECT rather than a dict ends the walk, so
+    # a typo beside a correctly-spelled field of `tool_choice` (which becomes a
+    # `ToolOrOutput` dataclass) is dropped in silence. `ToolOrOutput` has exactly
+    # one field, so you cannot get there without also spelling it right — and it
+    # becomes real the moment upstream adds a second.
     _reject(provider, _dropped_keys(settings, validated))
     return dict(validated)
 
@@ -133,12 +140,15 @@ def _dropped_keys(original: Any, validated: Any, prefix: str = "") -> list[str]:
     when they are the same length, so a coercion that changes a list's shape is
     left to pydantic's own error rather than reported as a missing key.
 
-    The original side is tested as a ``Sequence``, not a ``list``. ``_materialize``
-    makes the validated side a list either way, but the original is whatever the
-    caller wrote — and a tuple literal used to skip the positional walk entirely,
-    so a misspelled key nested inside one was dropped in silence while the same
-    config with square brackets raised. TOML and env can only produce lists; this
-    is the programmatic surface, which is the one every test here uses.
+    Both sides are materialized before this runs, so both are lists and the
+    ``Sequence`` test is belt-and-braces rather than load-bearing — a mutant
+    narrowing it back to ``list`` is equivalent today. It is kept, and the
+    ``[list, tuple, generator]`` parametrization in the tests is kept as the
+    regression record, because this walk has already been skipped twice: once for a
+    tuple literal, and once for a generator, each dropping a misspelled nested key
+    in silence while the same config written with square brackets raised. TOML and
+    env can only produce lists; this is the programmatic surface, which is the one
+    every test here uses.
     """
     dropped: list[str] = []
     if isinstance(original, Mapping):
@@ -262,8 +272,9 @@ class LimitsConfig(_Section):
 
     - ``cost_limit`` is in **USD** and is only enforced for models pydantic-ai
       can price. On an unpriced model (the local default among them) the run's
-      cost is ``None``, the limit does nothing, and pydantic-ai emits a
-      ``CostNotFoundWarning`` on every request.
+      cost is ``None``, the limit does nothing, and pydantic-ai raises a
+      ``CostNotFoundWarning`` on every request — which Python's default filter
+      dedupes, so an operator sees it once per process, not once per request.
     - ``count_tokens_before_request`` needs a provider that offers a
       count-tokens call. Only ``anthropic`` and ``google`` do, so
       :class:`EljaSettings` refuses it together with ``provider = "openai"``
@@ -465,7 +476,9 @@ class EljaSettings(BaseSettings):
                     "'google', or drop the flag — per_request_input_tokens_limit is "
                     "enforced without it. A host injecting its own model should check "
                     "elja.model.implements_count_tokens(model) instead: this setting "
-                    "describes the model elja would build, not the one you passed."
+                    "describes the model elja would build, not the one you passed — "
+                    "and this config field stays closed to them, so build your own "
+                    "UsageLimits rather than setting it here."
                 )
         return self
 

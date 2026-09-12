@@ -69,15 +69,17 @@ top_p = 0.9
 # Reasoning controls are the provider's own — no elja-side enum:
 #   openai_reasoning_effort / anthropic_thinking / google_thinking_config,
 #   or the portable `thinking` (true/false or "minimal".."xhigh").
-# NB: providers DROP temperature and top_p when reasoning is enabled, with a
-# warning. Pair a reasoning setting with temperature = "" rather than a value.
+# NB: pair a reasoning setting with temperature = "" rather than a value.
+# anthropic DROPS temperature/top_p when reasoning is on, with a warning; openai
+# and google send them and the API rejects the request with a 400.
 
 [limits]                 # every field maps to pydantic-ai's UsageLimits
 request_limit = 25
 total_tokens_limit = 120000
 cost_limit = 2.50        # USD, and only for models pydantic-ai can price —
                          # on an unpriced model (the local default included) it
-                         # is unenforced and warns once per request.
+                         # is unenforced and warns. The warning is raised every
+                         # request; Python's default filter shows it once.
 tool_calls_limit = 40
 input_tokens_limit = 100000
 output_tokens_limit = 20000

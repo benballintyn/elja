@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+from collections import deque
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -497,6 +499,21 @@ class TestOmittingSamplingParameters:
         assert EljaSettings().model.temperature == 0.75
 
 
+# Every caller-writable container shape for an `Iterable[...]` leaf. The iterator
+# forms are the ones that matter: pydantic consumes them while validating, so the
+# dropped-key walk sees an exhausted original unless the caller's structure is
+# snapshotted first.
+_CONTAINERS: list[Callable[[list[object]], object]] = [
+    list,
+    tuple,
+    deque,
+    lambda items: (item for item in items),
+    iter,
+    lambda items: map(lambda item: item, items),
+]
+_CONTAINER_IDS = ["list", "tuple", "deque", "generator", "iter", "map"]
+
+
 class TestATypoBehindALazyLeafIsStillRefused:
     """The one place where the order of two steps decides a silent drop.
 
@@ -508,18 +525,22 @@ class TestATypoBehindALazyLeafIsStillRefused:
     with 289 tests green, because nothing else puts a typo behind a lazy leaf.
 
     Parametrized over the container type because that is a second, independent
-    skip: the walk used to require the ORIGINAL side be a `list`, so the same
-    config written with a tuple literal skipped it too. TOML and env can only
-    produce lists; this is the programmatic surface every test here uses.
+    skip, and it has been reached TWICE. The walk first required the original side
+    be a `list`, so a tuple literal skipped it; widening that to `Sequence` left
+    generators and other iterators skipping it, because pydantic consumes an
+    iterator while validating and there is nothing left on the original side to
+    compare. The fix is to snapshot the caller's structure first, which is why a
+    generator now refuses like a list. TOML and env can only produce lists; this is
+    the programmatic surface every test here uses.
     """
 
     @staticmethod
     def _skill(**extra: object) -> dict[str, object]:
         return {"skill_id": "s", "type": "custom", **extra}
 
-    @pytest.mark.parametrize("container", [list, tuple], ids=["list", "tuple"])
+    @pytest.mark.parametrize("container", _CONTAINERS, ids=_CONTAINER_IDS)
     def test_a_nested_typo_is_refused_by_its_dotted_path(
-        self, container: type[list[object]] | type[tuple[object, ...]]
+        self, container: Callable[[list[object]], object]
     ) -> None:
         with pytest.raises(ValidationError, match=r"anthropic_container\.skills\.0\.bogus"):
             ModelConfig(
@@ -532,9 +553,9 @@ class TestATypoBehindALazyLeafIsStillRefused:
                 },
             )
 
-    @pytest.mark.parametrize("container", [list, tuple], ids=["list", "tuple"])
+    @pytest.mark.parametrize("container", _CONTAINERS, ids=_CONTAINER_IDS)
     def test_the_same_config_spelled_correctly_is_accepted_and_materialized(
-        self, container: type[list[object]] | type[tuple[object, ...]]
+        self, container: Callable[[list[object]], object]
     ) -> None:
         """The positive control: the walk must not refuse a correct nested value.
 
