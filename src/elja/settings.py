@@ -189,7 +189,12 @@ class CompactionConfig(_Section):
     target_tokens: int = Field(default=24_000, ge=1000)
     # Recent tool call/result pairs kept verbatim by the masking tier.
     keep_tool_pairs: int = Field(default=10, ge=1)
-    # Recent messages kept verbatim if the summarization fallback fires.
+    # Recent messages kept verbatim if the summarization fallback fires. This is
+    # an UPPER bound: elja also passes keep_tokens = target_tokens // 3 (without
+    # which an irreducible tail re-fires the summarizer every request), and the
+    # tail is whichever bound binds first. Measured across three regimes, the
+    # token bound always won — so raising this alone does not lengthen the tail.
+    # Pinned by test_the_token_bound_dominates_keep_messages.
     keep_messages: int = Field(default=20, ge=1)
 
 

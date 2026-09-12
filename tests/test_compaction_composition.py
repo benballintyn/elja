@@ -316,6 +316,61 @@ class TestSummarizerComposition:
         assert roles.count("summarizer") == 1
 
 
+class TestRetentionKnobsActuallyRetain:
+    """Two config knobs whose effect nothing observed."""
+
+    async def test_the_token_bound_dominates_keep_messages(self, tmp_path: Path) -> None:
+        """``keep_messages`` is an upper bound the token bound usually pre-empts.
+
+        elja always sets ``keep_tokens = target_tokens // 3``, and the verbatim
+        tail is whichever bound binds first. Measured across three regimes — few
+        large messages, many small ones, and the default 24k target — the token
+        bound always won, so the knob is inert at elja's settings. Asserted as
+        equality rather than left unobserved: if a future change makes the
+        message count bind, this fails and the docs need updating with it.
+        """
+        outcomes: list[int] = []
+        for keep_messages in (2, 30):
+            settings = _settings(tmp_path, target=1000, keep_messages=keep_messages)
+            views, roles = await _drive(
+                settings, list(build_compaction(settings)), _mixed_history(20)
+            )
+            assert "summarizer" in roles
+            outcomes.append(len(views[0]))
+        assert outcomes[0] == outcomes[1], outcomes
+
+    async def test_an_incremental_summary_is_given_the_previous_one(self, tmp_path: Path) -> None:
+        """``incremental=True`` only engages on the SECOND summarization.
+
+        A single-summarization test cannot pin it, which is why it went
+        unobserved: the flag's whole effect is that the second summarizer call
+        receives the first summary instead of rewriting from scratch.
+        """
+        settings = _settings(tmp_path, target=1000, keep_messages=2)
+        summarizer_prompts: list[str] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                summarizer_prompts.append(str(messages))
+                return ModelResponse(
+                    parts=[TextPart(content=f"## Intent\nsummary {len(summarizer_prompts)}")]
+                )
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script), deps_type=EljaDeps, capabilities=build_compaction(settings)
+        )
+        deps = EljaDeps.from_settings(settings)
+        history = _mixed_history(20)
+        for turn in range(3):
+            result = await agent.run(f"turn{turn}", message_history=history, deps=deps)
+            # Re-inflate with fresh bulk so a second boundary is crossed.
+            history = [*result.all_messages(), *_mixed_history(20)[1:]]
+        assert len(summarizer_prompts) >= 2, "only one summarization; nothing to be incremental"
+        assert "<previous-summary>" in summarizer_prompts[-1]
+        assert "summary 1" in summarizer_prompts[-1]
+
+
 class TestReportingOrder:
     async def test_reporting_after_compaction_measures_the_request_that_was_sent(
         self, tmp_path: Path
