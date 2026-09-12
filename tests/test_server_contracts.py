@@ -30,7 +30,6 @@ from pydantic_ai.messages import (
     INTERRUPTED_TOOL_RETURN_CONTENT,
     ModelMessage,
     ModelRequest,
-    ModelRequestPart,
     ModelResponse,
     RetryPromptPart,
     TextPart,
@@ -676,16 +675,19 @@ class TestHostOwnedPersistence:
         assert [part.content for part in foreign_thinking_parts([mixed], model)] == ["theirs"]
 
     def test_a_request_carries_no_reasoning_to_weigh(self) -> None:
-        """Requests have parts too, and `ThinkingPart` is not among the types they can hold.
+        """Requests have parts too, and none of them is a thinking part.
 
         So the `ModelResponse` filter is a type narrowing for `message.parts`, not a
-        guard against anything reachable — removing it changes no behaviour. Asserted
-        here as documentation of that, rather than left to look like a pinned guard.
+        guard against anything reachable: removing it changes no behaviour and its mutant
+        survives. Recorded here in prose rather than with an assertion, because the one
+        I reached for — `ThinkingPart not in ModelRequestPart.__args__` — is vacuous:
+        `ModelRequestPart` is an `Annotated[Union[...], Discriminator]`, so `__args__`
+        holds the whole union as a single element and `not in` is true of every part type,
+        including genuine members.
         """
         model = FunctionModel(lambda m, i: None)  # type: ignore[arg-type,return-value]
         request = ModelRequest(parts=[UserPromptPart(content="think about it")])
         assert foreign_thinking_parts([request], model) == []
-        assert ThinkingPart not in getattr(ModelRequestPart, "__args__", ())
 
     async def test_nothing_is_written_unless_the_host_writes_it(self, tmp_path: Path) -> None:
         before = sorted(p.name for p in tmp_path.iterdir())

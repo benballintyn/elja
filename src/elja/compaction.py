@@ -83,13 +83,14 @@ Three things are irreducible, and the ones a host trips over are the last two:
   ``target_tokens=1000`` gives six summarizer calls over six requests, and the same
   turn with ``preserve_first_user_message=False`` gives one.
 - **A ``SystemPromptPart`` sitting in caller-owned history**, which is what
-  ``Agent(system_prompt=...)`` produces. This one *grows*: the harness copies every
-  leading system part into the summary message on each compaction, and
+  ``Agent(system_prompt=...)`` produces. This one *grows*: ``_extract_system_prompts``
+  copies every leading system part into the summary message on each compaction, and
   ``preserve_first_user_message`` keeps the original request carrying it as well, so
-  each compaction leaves one more copy for the next to find. Measured over five
-  caller-owned turns with a 350-character policy: **1, 2, 3, 4, 5** copies and the
-  history 1.1k → 4.4k characters, versus a flat **1** with
-  ``preserve_first_user_message=False``. A policy that starts comfortably under
+  each compaction leaves more copies for the next one to find. The rate is
+  configuration-dependent — one more copy per compaction in one measured setup, two in
+  another — so the number to rely on is the direction, not a figure: **copies grow
+  without bound while compaction keeps firing, and stop growing with
+  ``preserve_first_user_message=False``**. A policy that starts comfortably under
   target therefore reaches the unbounded regime by growth alone.
 
 Remedies, in order of preference. **Carry policy in ``instructions=``, not
@@ -103,7 +104,9 @@ reach target, which is not built.
 """
 
 import inspect
+import re
 from functools import cache
+from string import Formatter
 from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
@@ -131,17 +134,45 @@ _SKILLS_WARNING = (
     "load_capability before use.\n\n"
 )
 _ANCHOR = "<messages>"
-_PLACEHOLDER = "{messages}"
+_FIELD = "messages"
+_PLACEHOLDER = f"{{{_FIELD}}}"
 # Two stand-in transcripts, rendered separately, to prove the prompt substitutes the
-# WHOLE transcript. Requiring each rendering to contain its own stand-in verbatim is
-# what catches a field that substitutes only part of it: a previous version compared
-# the two renderings for difference, which let `{messages:.23}` through — 23 being the
-# length at which the two stand-ins stopped agreeing. Any truncation is now refused,
-# whatever its width, because a truncated rendering cannot contain the whole thing.
-# Long and repetitive on purpose: the distinguishing token sits at the END, so no
-# plausible width slices it off and accidentally satisfies containment.
-_TRANSCRIPT_STAND_IN = "elja-transcript-stand-in " * 200
-_SENTINELS = (_TRANSCRIPT_STAND_IN + "alpha", _TRANSCRIPT_STAND_IN + "beta")
+# transcript AT ALL. Each rendering must contain its own stand-in, so a prompt that
+# drops the placeholder, escapes it, or merely mentions one stand-in's text is refused.
+# Short on purpose: inferring *truncation* from a stand-in's length is what this check
+# used to try, and it only ever moved the boundary — first to 23 characters, then to
+# the stand-in's own length. Width is decided by `_substitutes_whole_transcript`
+# instead, which reads the format spec rather than guessing from a sample.
+_SENTINELS = ("elja-transcript-stand-in-alpha", "elja-transcript-stand-in-beta")
+
+# The standard format-spec grammar for a string, so a precision can be told from a fill
+# character that happens to be a dot (`{messages:.<40}` pads; `{messages:.40}` truncates).
+_FORMAT_SPEC = re.compile(r"^(?:.?[<>=^])?[-+ ]?#?0?\d*[,_]?(?:\.(?P<precision>\d+))?[a-zA-Z%]?$")
+
+
+def _substitutes_whole_transcript(summary_prompt: str) -> bool:
+    """Whether every ``messages`` reference substitutes the transcript entire.
+
+    Width-independent, which is the point: a precision (``{messages:.2000}``) or an
+    index or attribute access (``{messages[0]}``, ``{messages.upper}``) hands the
+    summarizer a fragment, and its output still replaces every message before the
+    cutoff. Two earlier versions tried to infer this by rendering a sample and looking
+    at the result, and each only relocated the boundary — to 23 characters, then to
+    the sample's own length, at which point ``{messages:.10000}`` was accepted. Reading
+    the spec settles it at every width.
+    """
+    for _, field_name, format_spec, _ in Formatter().parse(summary_prompt):
+        if field_name is None:
+            continue
+        root = field_name.split(".", 1)[0].split("[", 1)[0]
+        if root != _FIELD:
+            continue
+        if field_name != _FIELD:
+            return False
+        spec = _FORMAT_SPEC.match(format_spec or "")
+        if spec is None or spec.group("precision") is not None:
+            return False
+    return True
 
 
 def extend_summary_prompt(harness_default: str) -> str:
@@ -201,44 +232,41 @@ def default_summary_prompt() -> str:
 def check_summary_prompt(summary_prompt: str) -> None:
     """Refuse a summary prompt the summarizer cannot use, at construction time.
 
-        ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)``
-        and nothing else. ``str.format`` no-ops on a string with no placeholder, so a
-        prompt that does not *substitute* hands the summarizer an instruction with no
-        transcript — and its output still **replaces every message before the
-        cutoff**. The run completes, nothing logs, and the history is gone. A stray
-        single brace raises ``KeyError`` instead, at the first summarization, deep in
-        a conversation.
+    ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)`` and
+    nothing else. ``str.format`` no-ops on a string with no placeholder, so a prompt
+    that does not *substitute* hands the summarizer an instruction with no transcript —
+    and its output still **replaces every message before the cutoff**. The run
+    completes, nothing logs, and the history is gone. A stray single brace raises at the
+    first summarization instead, deep in a conversation.
 
-    So this renders the prompt twice with two different stand-in transcripts and
-        requires each rendering to contain its own stand-in **whole**, rather than looking
-        for ``{messages}`` in the text. Those are not the same test, and the difference is
-        a hole this function has had three times over:
+    Two checks, because one test cannot settle both halves, and trying has put a hole in
+    this function three times:
 
-        - ``{messages}`` is a substring of ``{{messages}}``, an escaped brace that renders
-          as literal text and substitutes nothing — reached by obeying this very function's
-          advice to double literal braces, since doubling all of them takes the placeholder
-          with it.
-        - Checking for one sentinel *by name* accepted a prompt that merely contained the
-          sentinel's own text, with no placeholder at all.
-        - Comparing two renderings for *difference* accepted ``{messages:.23}`` — the
-          width at which the two stand-ins stopped agreeing — handing the summarizer 23
-          characters of a 40k transcript while its output still replaced the history.
+    - **Did the transcript come out at all?** The prompt is rendered with two different
+      stand-in transcripts and each rendering must contain its own. That refuses a
+      missing placeholder, an escaped one (``{{messages}}`` is a literal, reached by
+      obeying this function's own advice to double literal braces), and a prompt that
+      merely mentions one stand-in's text.
+    - **Did the whole transcript come out?** :func:`_substitutes_whole_transcript` reads
+      the format spec. Inferring this from a rendered sample is what failed twice: it
+      only ever moved the boundary, first to 23 characters and then to the sample's own
+      length, at which point ``{messages:.10000}`` was accepted and the summarizer
+      rewrote the history from a fragment.
 
-        Containment is the property that actually matters: the whole transcript has to come
-        out. It stays permissive where it should — ``{messages!r}``, ``{messages!s}``,
-        ``{messages:>10}`` and ``{{{messages}}}`` all substitute in full and are accepted —
-        and refuses every field that keeps only part of it, at any width.
+    Permissive where it should be: ``{messages!r}``, ``{messages!s}``, ``{messages!a}``,
+    padding and centring (``{messages:>10}``, ``{messages:.<40}`` — a dot there is a
+    fill character, not a precision), literal braces either side, and the placeholder
+    twice over all substitute in full and are accepted.
 
-        Args:
-            summary_prompt: The caller's prompt.
+    Args:
+        summary_prompt: The caller's prompt.
 
-        Raises:
-            ValueError: If the prompt does not substitute the transcript, or a brace
-                cannot be resolved. Every failure arrives as ``ValueError``:
-                ``str.format`` raises at least five different types on a bad field
-                (``KeyError``, ``IndexError``, ``ValueError``, ``AttributeError``,
-                ``TypeError``), and a caller guarding its construction path should not
-                have to enumerate them.
+    Raises:
+        ValueError: If the prompt does not substitute the whole transcript, or a field
+            cannot be resolved. Every failure arrives as ``ValueError``: ``str.format``
+            raises at least five different types on a bad field (``KeyError``,
+            ``IndexError``, ``ValueError``, ``AttributeError``, ``TypeError``), and a
+            caller guarding its construction path should not have to enumerate them.
     """
     try:
         rendered = [summary_prompt.format(messages=transcript) for transcript in _SENTINELS]
@@ -249,20 +277,25 @@ def check_summary_prompt(summary_prompt: str) -> None:
             f"{_PLACEHOLDER!r} placeholder single. Unchecked this raises at the "
             "first summarization, deep in a conversation."
         ) from exc
-    if all(
+    substituted = all(
         stand_in in rendering for stand_in, rendering in zip(_SENTINELS, rendered, strict=True)
-    ):
+    )
+    # Both checks always run: `and` would short-circuit the spec read away for a prompt
+    # that already fails containment, and the spec read is the half that is
+    # width-independent.
+    whole = _substitutes_whole_transcript(summary_prompt)
+    if substituted and whole:
         return
     raise ValueError(
-        "summary_prompt does not substitute the whole transcript: rendering it with a "
-        "stand-in transcript did not produce that transcript. Either the "
+        "summary_prompt does not substitute the whole transcript. Either the "
         f"{_PLACEHOLDER!r} placeholder is missing, or it is escaped (a doubled "
         "{{messages}} is a literal, not a placeholder — leave this one single even "
-        "when doubling the rest), or the field keeps only part of what it substitutes "
-        "({messages[0]} keeps one character, {messages:.2000} keeps two thousand of "
-        "however many there are). Unchecked, the summarizer is handed an instruction "
-        "with no transcript, or a fragment of one, and its output still replaces the "
-        "history."
+        "when doubling the rest), or the field keeps only part of what it substitutes: "
+        "a precision truncates ({messages:.2000} keeps two thousand characters of "
+        "however many there are) and an index or attribute access replaces it "
+        "({messages[0]}, {messages.upper}). Unchecked, the summarizer is handed an "
+        "instruction with no transcript, or a fragment of one, and its output still "
+        "replaces the history."
     )
 
 

@@ -137,7 +137,7 @@ Two channels work today, with no upstream patch:
    provider-neutral.
 
    **Two separate facts here, and conflating them costs money. Measured on the
-   same turn, all three rows:**
+   same turn, every row:**
 
    | where the settings live | what the compaction request receives |
    | --- | --- |

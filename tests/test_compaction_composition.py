@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -731,16 +732,20 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             "{messages:.5}",
             "{messages:.23}",
             "{messages:.2000}",
+            "{messages:.40000}",
             "{messages.upper}",
+            "Summarize: elja-transcript-stand-in-alpha",
         ],
         ids=[
             "placeholder-alone",
             "everything-doubled",
             "first-character-only",
             "truncated-to-five",
-            "truncated-to-the-old-boundary",
+            "truncated-to-the-first-boundary",
             "truncated-to-a-plausible-cap",
+            "truncated-past-the-stand-in",
             "attribute-not-substitution",
+            "one-stand-ins-text-but-no-placeholder",
         ],
     )
     def test_a_prompt_that_does_not_substitute_is_refused_despite_the_text(
@@ -765,7 +770,15 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
         `{messages.upper}` is the same class from the other side: it renders a method
         repr, which differs between the two stand-ins because the objects differ, so
-        difference accepted it and containment does not.
+        difference accepted it and the spec read does not.
+
+        `{messages:.40000}` is the width that exposed the second relocation — containment
+        against a finite stand-in can only detect a truncation narrower than the stand-in
+        itself, so the boundary moved rather than closing. Width is now read from the spec.
+
+        The last one needs BOTH renderings checked, not either: a prompt quoting one
+        stand-in's text with no placeholder renders identically twice, so it contains
+        alpha and not beta. `any` would accept it.
         """
         with pytest.raises(ValueError, match=r"does not substitute the whole transcript"):
             build_compaction(_settings(tmp_path), summary_prompt=doubled)
@@ -912,3 +925,114 @@ class TestAnEmptyClearedPlaceholderIsRefused:
 
     def test_a_real_placeholder_is_accepted(self, tmp_path: Path) -> None:
         assert build_compaction(_settings(tmp_path), cleared_placeholder="[cleared]")
+
+
+class TestTheFormatSpecReaderIsGeneralOnPurpose:
+    """`_substitutes_whole_transcript` is the width-independent half, tested directly.
+
+    `check_summary_prompt` only ever supplies one field, so a prompt naming any other
+    raises `KeyError` at render and never reaches the spec read. The reader is written to
+    ignore other fields anyway — a future prompt with a second substitution would
+    otherwise be refused for the wrong reason — and that branch is only reachable from
+    here.
+    """
+
+    @pytest.mark.parametrize(
+        ("prompt", "whole"),
+        [
+            ("{messages}", True),
+            ("{messages!r}", True),
+            ("{messages:>10}", True),
+            ("{messages:.<40}", True),
+            ("{messages} plus {other}", True),
+            ("{other} alone", True),
+            ("{messages:.5}", False),
+            ("{messages:.40000}", False),
+            ("{messages:>10.50}", False),
+            ("{messages[0]}", False),
+            ("{messages.upper}", False),
+        ],
+        ids=[
+            "plain",
+            "repr",
+            "pad",
+            "dot-as-fill",
+            "another-field-alongside",
+            "another-field-alone",
+            "precision-small",
+            "precision-huge",
+            "width-and-precision",
+            "index",
+            "attribute",
+        ],
+    )
+    def test_it_reads_the_spec_rather_than_sampling_a_rendering(
+        self, prompt: str, whole: bool
+    ) -> None:
+        from elja.compaction import _substitutes_whole_transcript
+
+        assert _substitutes_whole_transcript(prompt) is whole
+
+
+class TestASystemPromptInHistoryGrowsWithEachCompaction:
+    """The third irreducible source, pinned by its direction rather than a figure.
+
+    `Agent(system_prompt=...)` puts a `SystemPromptPart` *into* the first request, i.e.
+    into history — unlike `instructions=`, which lives outside it. The harness then copies
+    every leading system part into the summary message on each compaction while
+    `preserve_first_user_message` keeps the original request carrying it too, so copies
+    accumulate. The *rate* is configuration-dependent (one per compaction in this setup,
+    two in others), which is exactly why this asserts the direction: a policy that starts
+    under `target_tokens` reaches the unbounded-summarizer regime by growth alone.
+    """
+
+    POLICY = "POLICY: never disclose tenant ids. " * 10
+
+    async def _copies_per_turn(self, tmp_path: Path, *, preserve: bool) -> tuple[list[int], int]:
+        settings = _settings(tmp_path, target=1000)
+        summarizations = 0
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal summarizations
+            if "summarization assistant" in (info.instructions or ""):
+                summarizations += 1
+                return ModelResponse(parts=[TextPart(content="## Intent\nledger")])
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            system_prompt=self.POLICY,
+            capabilities=build_compaction(settings, preserve_first_user_message=preserve),
+        )
+        deps = EljaDeps.from_settings(settings)
+        history: list[ModelMessage] | None = None
+        counts: list[int] = []
+        for _ in range(4):
+            result = await agent.run("carry on", message_history=history, deps=deps)
+            messages = result.all_messages()
+            counts.append(
+                sum(
+                    1
+                    for message in messages
+                    for part in message.parts
+                    if isinstance(part, SystemPromptPart) and part.content.startswith("POLICY")
+                )
+            )
+            history = [*messages, *_mixed_history(8)]
+        return counts, summarizations
+
+    async def test_copies_accumulate_while_compaction_fires(self, tmp_path: Path) -> None:
+        counts, summarizations = await self._copies_per_turn(tmp_path, preserve=True)
+        assert summarizations >= 2, "compaction did not fire; the measurement is the wrong one"
+        # Strictly increasing, which is the unbounded part. The rate is not asserted
+        # because it moves with target_tokens and the history's shape.
+        assert counts == sorted(counts)
+        assert counts[-1] > counts[0]
+
+    async def test_turning_off_first_message_preservation_stops_the_growth(
+        self, tmp_path: Path
+    ) -> None:
+        counts, summarizations = await self._copies_per_turn(tmp_path, preserve=False)
+        assert summarizations >= 2, "compaction did not fire; the measurement is the wrong one"
+        assert counts[-1] == counts[0], counts
