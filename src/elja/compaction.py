@@ -50,12 +50,22 @@ sent; placed before, it reports one that never existed — measured at 1177 vers
 7239 tokens for the same run. Put reporting last.
 
 **What survives, verified rather than assumed.** Pinned parts
-(``pydantic_ai_harness.compaction.pin``) survive every tier, including when the
-pinned text alone exceeds the target — ``TieredCompaction`` re-injects them after
-each tier. Tool call/result pairing stays valid across both tiers. There is no
-upstream signal for "the target could not be reached": nothing is silently
-dropped, but a host that needs to know should compare a post-compaction
-``ReportContextUsage`` reading against its own target.
+(``pydantic_ai_harness.compaction.pin``) survive every tier, because
+``TieredCompaction`` re-injects them after each one. Tool call/result pairing
+stays valid across both tiers. There is no upstream signal for "the target could
+not be reached": nothing is silently dropped, but a host that needs to know
+should compare a post-compaction ``ReportContextUsage`` reading against its own
+target.
+
+**Keep a pinned set well under the target.** Re-injection happens *after* the
+tail is trimmed, so ``keep_tokens`` cannot bound a pin: when the pinned text's own
+estimate exceeds ``target_tokens``, the post-compaction estimate can never fall
+to target and the summarizing tier fires again on **every** model request for the
+rest of the run. Measured over a six-step turn: one paid summarizer call with no
+pin or a small pin, **six** with an oversized one, one-to-one with requests and
+unbounded. Treat an oversized pin as a host-side error. elja does not yet bound
+this; doing so needs a latch that refuses to re-enter the summarizing tier once
+it has failed to reach target, which is not built.
 """
 
 import inspect
@@ -87,6 +97,7 @@ _SKILLS_WARNING = (
     "load_capability before use.\n\n"
 )
 _ANCHOR = "<messages>"
+_PLACEHOLDER = "{messages}"
 
 
 def extend_summary_prompt(harness_default: str) -> str:
@@ -131,6 +142,39 @@ def default_summary_prompt() -> str:
     )
 
 
+def check_summary_prompt(summary_prompt: str) -> None:
+    """Refuse a summary prompt the summarizer cannot use, at construction time.
+
+    ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)``
+    and nothing else. ``str.format`` no-ops on a string with no placeholder, so a
+    prompt without ``{messages}`` hands the summarizer an instruction with no
+    transcript — and its output still **replaces every message before the
+    cutoff**. The run completes, nothing logs, and the history is gone. A stray
+    single brace raises ``KeyError`` instead, at the first summarization, deep in
+    a conversation.
+
+    Args:
+        summary_prompt: The caller's prompt.
+
+    Raises:
+        ValueError: If the placeholder is missing, or a brace cannot be resolved.
+    """
+    if _PLACEHOLDER not in summary_prompt:
+        raise ValueError(
+            f"summary_prompt must contain the {_PLACEHOLDER!r} placeholder; without it the "
+            "summarizer is handed an instruction with no transcript, and the summarized "
+            "history is replaced by a summary written from nothing"
+        )
+    try:
+        summary_prompt.format(messages="")
+    except (KeyError, IndexError) as exc:
+        raise ValueError(
+            f"summary_prompt contains a brace str.format cannot resolve ({exc!r}); "
+            "double any literal braces as {{ }}. Unchecked this raises at the first "
+            "summarization, deep in a conversation."
+        ) from exc
+
+
 def build_compaction(
     settings: EljaSettings,
     *,
@@ -152,17 +196,6 @@ def build_compaction(
             summarization should use a different provider, a cheaper model, or
             its own separately-attributed guard. An instance is handed to the
             summarizer untouched, never rebuilt from its display name.
-        cleared_placeholder: What a masked tool result is replaced with.
-            ``None`` keeps :data:`CLEARED_PLACEHOLDER`, which tells the model to
-            re-run the tool — correct for elja's idempotent built-ins, and an
-            invitation to repeat a side effect for anything else. A host with
-            write tools should pass text pointing at its own store instead.
-        summary_prompt: Replaces the summarization instruction. ``None`` keeps
-            elja's, which is the harness default plus a note about skills
-            unloading. A host with no skills has no reason to carry that note.
-        receipts: Leave a deterministic receipt where history was summarized
-            away, so the model treats its memory of earlier work as secondhand.
-            Off by default, as upstream has it.
 
             Deliberately a ``Model``, not a model *name*: a name makes the
             summarizer build a fresh provider client from environment
@@ -174,11 +207,33 @@ def build_compaction(
             ``model_settings`` argument, which is how **one** guard instance can
             tell a compaction request from a main one without a second model
             object: tag it, e.g.
-            ``{"extra_headers": {"x-phase": "compaction"}}``.
+            ``{"extra_headers": {"x-phase": "compaction"}}``. Note the merge is
+            shallow, so an ``extra_headers`` here replaces whatever the model
+            already carries, for the summarizer request only.
+        cleared_placeholder: What a masked tool result is replaced with.
+            ``None`` keeps :data:`CLEARED_PLACEHOLDER`, which tells the model to
+            re-run the tool — correct for elja's idempotent built-ins, and an
+            invitation to repeat a side effect for anything else. A host with
+            write tools should pass text pointing at its own store instead.
+        summary_prompt: Replaces the summarization instruction — the summarizer's
+            *user* turn, not its system prompt (upstream's ``instructions``,
+            which elja does not expose). ``None`` keeps elja's, which is the
+            harness default plus a note about skills unloading; a host with no
+            skills has no reason to carry that note. Must contain
+            ``{messages}``; see :func:`check_summary_prompt` for why that is
+            refused at construction rather than at first use.
+        receipts: Leave a deterministic receipt where history was summarized
+            away, so the model treats its memory of earlier work as secondhand.
+            Off by default, as upstream has it. Note one receipt accumulates per
+            compaction across a long caller-owned history, each with its own
+            dropped-message count — upstream's de-accumulation does not match
+            once the receipt has been merged into a mixed-parts message.
 
     Returns:
         A single tiered compaction capability, or ``[]`` when disabled.
     """
+    if summary_prompt is not None:
+        check_summary_prompt(summary_prompt)
     cfg = settings.compaction
     if not cfg.enabled:
         return []
