@@ -36,7 +36,7 @@ straight to the provider.** There are five, and the last one is the odd case:
 | --- | --- |
 | `request` | the ordinary non-streamed model call |
 | `request_stream` | the streamed call — `request` does **not** cover it |
-| `count_tokens` | before *every* request when `UsageLimits.count_tokens_before_request` is set. A real network call on the providers that implement it, routed through `check_allow_model_requests()` like any other model request. On one that does **not** implement it — `OpenAIChatModel`, elja's default — the flag raises `NotImplementedError` on every request rather than no-opping |
+| `count_tokens` | before every request when `UsageLimits.count_tokens_before_request` is set — with one exception: it is called from `_prepare_request` only, so a *resumed* suspended turn skips it (fails safe, no un-admitted dispatch). A real network call on the providers that implement it, routed through `check_allow_model_requests()` like any other model request. On one that does **not** implement it — `OpenAIChatModel`, elja's default — the flag raises `NotImplementedError` on every request rather than no-opping |
 | `compact_messages` | provider-side compaction, reachable if you attach a capability that uses it |
 | `cancel_suspended_response` | cancelling a suspended background response. On `OpenAIResponsesModel` this issues a real `responses.cancel` HTTP call, and it is reached from the ordinary agent path on the run's outermost model |
 
@@ -93,9 +93,12 @@ What elja guarantees:
   caller-supplied model to preserve — `build_agent` builds one from settings.)
 - **The summarizer goes through your guard too.** `build_compaction(settings)`
   leaves the summarization tier's `model=None`, which makes
-  `SummarizingCompaction` use the running agent's own model *object*, so
-  compaction's private request is admitted by the same wrapper as the main
-  request. Verified, not inferred.
+  `SummarizingCompaction` inherit `ModelRequestContext.model`, so compaction's
+  private request is admitted by the same wrapper as the main request. Verified,
+  not inferred. One caveat upstream states and this inherits: that context model
+  *starts* as the run's model and differs only where a capability replaced it. The
+  embedded path invites `capabilities=[...]`, so if you attach one that swaps the
+  model, this guarantee is the thing it swaps away.
 - **A separately supplied summarizer stays separate.**
   `build_compaction(settings, summarizer_model=my_other_guard)` hands that
   instance to the strategy untouched. It takes a `Model`, not a model *name*, on
@@ -130,15 +133,41 @@ Two channels work today, with no upstream patch:
    `extra_headers` is a base `ModelSettings` field, so this is typed and
    provider-neutral.
 
-   **It replaces, it does not merge.** `merge_model_settings` is a shallow
-   `base | overrides`, so an `extra_headers` you pass here wipes whatever your
-   model already carries — for the summarizer request only. Measured: a model
-   built with `extra_headers={"authorization": ..., "x-tenant": ...}` sends the
-   agent request with both and the compaction request with only `x-phase`. If
-   your model carries gateway or tenant headers, restate them inside
-   `summarizer_model_settings`. The same shallowness means a host carrying run
-   identity in agent-level `extra_headers` loses it on the compaction request —
-   identity belongs on the guard instance, which is what channel 2 is for.
+   **Two separate facts here, and conflating them costs money. Measured on the
+   same turn, all three rows:**
+
+   | where the settings live | what the compaction request receives |
+   | --- | --- |
+   | agent-level `model_settings=` | **nothing at all** — `model_settings=None` |
+   | the model object's own `settings=` | all of them |
+   | `summarizer_model_settings=` | these, shallow-replacing the model's per key |
+
+   **Agent-level settings never reach the compaction request.**
+   `SummarizingCompaction._summarize` builds a *separate*
+   `Agent(model, instructions=…, model_settings=self.model_settings)`, so the
+   parent agent's `model_settings` are never handed to it — not `extra_headers`,
+   not `max_tokens`, not `temperature`, and this has nothing to do with merging.
+   Measured: a parent agent carrying
+   `{"temperature": 0.1, "max_tokens": 77, "extra_headers": {"authorization":
+   "Bearer gw"}}` with `summarizer_model_settings` unset sends the main request
+   with all three and the compaction request with `model_settings=None`. A host
+   behind a gateway that puts its auth header at the agent level therefore sends
+   an **unauthenticated and unbounded** compaction request, deep in a long
+   conversation, after a paid main turn. `elja/application.py` says the same thing
+   in one line: settings on one agent never reach another.
+
+   So anything the compaction request needs — gateway auth, a token cap, run
+   identity — must live on the **model object** (`settings=ModelSettings(...)`,
+   which does survive; measured) or be restated in `summarizer_model_settings`.
+
+   **And what you restate replaces rather than merges.**
+   `merge_model_settings` is a shallow `base | overrides`, so an `extra_headers`
+   in `summarizer_model_settings` wipes the model's own wholesale. Measured: a
+   model carrying `{"authorization": ...}` plus
+   `summarizer_model_settings={"extra_headers": {"x-phase": "compaction"}}` sends
+   the compaction request with `x-phase` and **no** `authorization`, while
+   `max_tokens` and `temperature` from the model survive untouched. Restate every
+   header you still need.
 2. **Use a distinct instance.** Build one guarded model per run, closing over the
    run identity, and pass a separate one as `summarizer_model`.
 
@@ -171,7 +200,10 @@ above; recorded rather than pretended to be covered.
   turn's history. The CLI's **text-delta** sink is deliberately *not* suppressed:
   silently swallowing the model's own output would be worse than failing, so a
   raising delta sink does abort the turn (a closed stdout, for instance) and that
-  turn's history is not saved. Two sinks, two different answers, on purpose.
+  turn's history is not saved. Two sinks, two different answers, on purpose. A
+  third caller-supplied callback, `EljaDeps.confirm`, is also unsuppressed — a
+  raise there kills the run — though it only applies to the CLI deps type, which
+  the `PermissionGate` note below says is not usable on this path anyway.
 - **`notify` lets a `BaseException` through.** `asyncio.CancelledError`,
   `KeyboardInterrupt` and `SystemExit` pass it untouched, because cancellation is
   the host's and a telemetry helper must not eat it.

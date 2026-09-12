@@ -334,6 +334,91 @@ class TestSummarizerAttribution:
         )
         assert phases == ["compaction", None]
 
+    async def test_agent_level_settings_never_reach_the_compaction_request(
+        self, tmp_path: Path
+    ) -> None:
+        """Because `_summarize` builds a SEPARATE agent, not because of merging.
+
+        The doc said the loss was `merge_model_settings`' shallowness — i.e. a
+        consequence of *having passed* `summarizer_model_settings`. It is not: the
+        parent agent's `model_settings` are never handed to the summarizer's private
+        agent at all, so with nothing passed the compaction request goes out with
+        `model_settings=None`. For a host carrying gateway auth at the agent level
+        that is an unauthenticated and unbounded paid request, deep in a long
+        conversation, after a paid main turn.
+
+        Three rows, measured in one place so the three channels cannot drift apart.
+        """
+        settings = _compacting_settings(tmp_path)
+        carried: ModelSettings = {
+            "temperature": 0.1,
+            "max_tokens": 77,
+            "extra_headers": {"authorization": "Bearer gw"},
+        }
+
+        async def phases_for(
+            *,
+            agent_level: ModelSettings | None,
+            on_model: ModelSettings | None,
+            summarizer: ModelSettings | None,
+        ) -> list[ModelSettings | None]:
+            seen: list[ModelSettings | None] = []
+
+            class Recorder(WrapperModel):
+                async def request(
+                    self,
+                    messages: list[ModelMessage],
+                    model_settings: ModelSettings | None,
+                    model_request_parameters: ModelRequestParameters,
+                ) -> ModelResponse:
+                    seen.append(model_settings)
+                    return await super().request(
+                        messages, model_settings, model_request_parameters
+                    )
+
+            def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+                summarizing = "summarization assistant" in (info.instructions or "")
+                return ModelResponse(
+                    parts=[TextPart(content="## Intent\nx" if summarizing else "done")]
+                )
+
+            agent: Agent[EljaDeps, str] = Agent(
+                Recorder(FunctionModel(script, settings=on_model)),
+                deps_type=EljaDeps,
+                capabilities=build_compaction(settings, summarizer_model_settings=summarizer),
+                model_settings=agent_level,
+            )
+            await agent.run(
+                "continue",
+                message_history=_bulky_history(8),
+                deps=EljaDeps.from_settings(settings),
+            )
+            assert len(seen) == 2, "the summarizer did not run; the case is the wrong one"
+            return seen
+
+        # 1. Agent level, nothing restated: the compaction request gets NOTHING.
+        compaction, main = await phases_for(agent_level=carried, on_model=None, summarizer=None)
+        assert compaction is None
+        assert main == carried
+
+        # 2. On the model object instead: it survives, which is the remedy.
+        compaction, main = await phases_for(agent_level=None, on_model=carried, summarizer=None)
+        assert compaction == carried
+        assert main == carried
+
+        # 3. Restated per key, and the restatement REPLACES rather than merges:
+        # `authorization` is gone from the compaction request while the model's
+        # other two settings survive untouched.
+        compaction, main = await phases_for(
+            agent_level=None,
+            on_model=carried,
+            summarizer={"extra_headers": {"x-phase": "compaction"}},
+        )
+        assert compaction is not None
+        assert compaction["extra_headers"] == {"x-phase": "compaction"}
+        assert compaction["max_tokens"] == 77
+        assert (main or {}).get("extra_headers") == {"authorization": "Bearer gw"}
+
 
 class TestDenialIsTerminal:
     async def test_a_denied_main_request_reaches_the_caller_and_dispatches_nothing(
@@ -497,13 +582,24 @@ class TestCountTokensBeforeRequestIsNotSafeToTurnOn:
         assert type(model).count_tokens is Model.count_tokens
 
     async def test_the_flag_raises_rather_than_no_opping(self) -> None:
-        """Driven through a model that inherits the base method, as OpenAIChatModel does."""
+        """Driven through elja's own default model, which is the claim's subject.
 
-        class NoCountTokens(WrapperModel):
-            """Wraps a working model but leaves count_tokens to the base class."""
+        A `WrapperModel` stand-in would pass for a neighbouring reason: `WrapperModel`
+        *does* define `count_tokens` in order to delegate it, so the
+        `NotImplementedError` would come from whatever it wrapped. If upstream gave
+        `WrapperModel` a real local estimate — the shape `OpenAIEmbeddingModel`
+        already uses — the stand-in would go green while `OpenAIChatModel` kept
+        raising. `build_model` needs no API key and `count_tokens` raises before any
+        dispatch, so the real boundary is free to drive, and this also pins the exact
+        message `docs/EMBEDDING.md` quotes.
+        """
+        from elja.model import build_model
 
-        agent: Agent[None, str] = Agent(NoCountTokens(_streamable()))
-        with pytest.raises(NotImplementedError, match="Token counting ahead of the request"):
+        agent: Agent[None, str] = Agent(build_model(EljaSettings()))
+        with pytest.raises(
+            NotImplementedError,
+            match="Token counting ahead of the request is not supported by OpenAIChatModel",
+        ):
             await agent.run("go", usage_limits=UsageLimits(count_tokens_before_request=True))
 
     def test_the_two_providers_that_do_implement_it(self) -> None:
