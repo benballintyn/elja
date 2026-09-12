@@ -233,6 +233,50 @@ above; recorded rather than pretended to be covered.
   `ctx.deps.confirm` and is therefore typed to `EljaDeps`. A host with its own
   approval UX should gate inside its own toolset.
 
+## Composing compaction
+
+`build_compaction(settings, ...)` takes every part of the policy as an argument,
+because the defaults are tuned for a local workspace:
+
+| argument | why a host changes it |
+| --- | --- |
+| `cleared_placeholder` | The default says "re-run the tool if you need it again" and names `.elja/spill/`. Safe for idempotent reads in a workspace; an invitation to double-write anywhere else. Point it at your own store. |
+| `summary_prompt` | The default carries a note about reloading elja skills, which a host without skills has no reason to ship. This is the summarizer's *user* turn; upstream's `instructions` (its system prompt) is not exposed. Must *substitute* `{messages}`, checked at construction by rendering it twice — a doubled `{{messages}}` is a literal and is refused, while `{messages!r}` and `{messages:>10}` are fine. |
+| `summarizer_model` | A different provider, a cheaper model, or separate budget attribution (see above). |
+| `receipts` | Leaves a deterministic note where history was summarized away. With a capability implementing the harness's `TranscriptHandleProvider` protocol attached, the receipt carries a handle to your persisted transcript. Note one accumulates per compaction across a long caller-owned history, each with its own dropped-message count. |
+
+Replacing the policy wholesale is always available: build your own
+`TieredCompaction` and pass it as a capability instead of calling the factory.
+
+**Put `ReportContextUsage` last.** None of these capabilities declare an
+ordering, so list order decides what reporting measures. Measured on the same
+turn: ~1k tokens with reporting after compaction, ~6k with it before, where the
+second number describes a request that was never sent. Exact figures move with
+the harness's estimator, so treat the six-fold gap as the finding, not the
+numbers.
+
+**What survives, measured not assumed.** Pinned parts
+(`pydantic_ai_harness.compaction.pin`) survive every tier. Tool call/result
+pairing stays valid across both tiers. There is no upstream signal for "the
+target could not be reached": nothing is silently dropped, but a host that needs
+to know should compare a post-compaction `ReportContextUsage` reading against its
+own target.
+
+**Keep a pinned set well under the target.** Re-injection happens *after* the
+tail is trimmed, so `keep_tokens` cannot bound a pin. If the pinned text's own
+estimate exceeds `target_tokens`, the post-compaction estimate never falls to
+target and the summarizing tier fires again on **every** model request for the
+rest of the run. Measured over a six-step turn: one paid summarizer call with no
+pin or a small pin, **six** with an oversized one — one-to-one with requests, and
+unbounded. Treat an oversized pin as a host-side error. elja does not yet bound
+it; that needs a latch refusing to re-enter the summarizing tier once it has
+failed to reach target, which is not built.
+
+**`cleared_placeholder` covers the compaction placeholder only.** If you also use
+elja's built-in toolset, its output-capping message separately names
+`.elja/spill/` and suggests paging with `run_shell`. On the embedded path with
+your own tools that never arises; if you mix the two, that text is still there.
+
 ## Persistence
 
 History is caller-owned on the embedded path. Pass `message_history=` and

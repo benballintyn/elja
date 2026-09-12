@@ -24,14 +24,13 @@ elja's own pieces remain available, by opting in rather than by default:
   tool* and points at ``.elja/spill/``. Both are true of the convenience path,
   whose tools are idempotent reads and whose workspace holds that directory.
   Neither is true here: your tools may have side effects, and this path creates
-  no workspace, so the recovery route does not exist. Until the placeholder is
-  configurable, either build your own
-  ``TieredCompaction``/``ClearToolResults``/``SummarizingCompaction`` with a
-  ``placeholder=`` that says "retrieve the saved result", or leave compaction
-  off. If you build your own, copy ``build_compaction``'s body rather than the
-  upstream defaults — in particular its ``keep_tokens``, without which an
-  irreducible tail above the target re-fires a **paid** summarizer call on every
-  single request.
+  no workspace, so the recovery route does not exist. Pass your own wording —
+  ``build_compaction(settings, cleared_placeholder="... retrieve the saved
+  result ...")`` — and put any ``ReportContextUsage`` *after* compaction in the
+  list, or it measures a request that was never sent. If you replace the policy
+  wholesale instead, copy ``build_compaction``'s body rather than the upstream
+  defaults — in particular its ``keep_tokens``, without which an irreducible
+  tail above the target re-fires a **paid** summarizer call on every request.
 - **Skills**: ``capabilities=load_skills(settings)`` if you want markdown
   skills; that one does read a directory, which is why it is not implicit.
 - **Permissions**: :class:`~elja.permissions.PermissionGate` reads

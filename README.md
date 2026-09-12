@@ -107,11 +107,12 @@ toolset (`FunctionToolset(timeout=...)`), not on the agent — see the module
 docstring for why.
 
 elja's own capabilities stay available by opting in, e.g.
-`capabilities=build_compaction(load_settings())` — but read `elja/application.py`
-first: the default compaction placeholder tells the model to *re-run* a cleared
+`capabilities=build_compaction(load_settings(), cleared_placeholder=...)` — pass
+your own placeholder, because the default tells the model to *re-run* a cleared
 tool and names `.elja/spill/`, and neither is right for a host with
-side-effecting tools and no workspace. That docstring also covers how `None` and
-empty differ between the two paths, and
+side-effecting tools and no workspace. `elja/application.py` covers how `None`
+and empty differ between the two paths; `elja/compaction.py` covers composing
+the policy and why reporting goes last; and
 [docs/EMBEDDING.md](docs/EMBEDDING.md) covers metering, admission control and
 the limits of what elja enforces.
 

@@ -23,6 +23,68 @@ Loaded skill BODIES, however, travel as tool returns inside history: if the
 summarization tier drops a load, the skill silently unloads (the catalog
 survives, so the model can re-load it) — the summary prompt is extended to
 call this out.
+
+**Composing this for a host application.** Every piece of the policy above is
+an argument, because the defaults are right for a local workspace and wrong for
+a server:
+
+- ``cleared_placeholder`` replaces what a masked tool result says. The default
+  invites the model to *re-run the tool*, which is safe only because elja's own
+  tools are idempotent reads. A host whose tools have side effects must pass its
+  own text — "retrieve the saved result" — or the masking tier is an invitation
+  to double-write.
+- ``summary_prompt`` replaces the summarization instruction, and
+  ``summarizer_model`` the model that writes it.
+- ``receipts`` leaves a deterministic note where history was summarized away, so
+  the model knows its memory of earlier work is secondhand. With a capability
+  implementing the harness's ``TranscriptHandleProvider`` protocol attached, the
+  receipt also carries a handle for the persisted transcript.
+- Replacing the policy wholesale is always available: pass your own
+  ``TieredCompaction``/``ClearToolResults``/``SummarizingCompaction`` as
+  ``capabilities=`` instead of calling this factory at all.
+
+**Ordering matters, and it is list order.** None of these capabilities declare
+an ordering, so ``ReportContextUsage`` measures whatever the capabilities before
+it produced. Placed *after* compaction it reports the request that was actually
+sent; placed before, it reports one that never existed. Measured on the
+reporting-order test's own config: reporting after compaction read ~1k tokens,
+before it ~6k, for the same run — a six-fold difference in what the host is
+shown. Put reporting last.
+
+**What survives, verified rather than assumed.** Pinned parts
+(``pydantic_ai_harness.compaction.pin``) survive every tier, because
+``TieredCompaction`` re-injects them after each one. Tool call/result pairing
+stays valid across both tiers. There is no upstream signal for "the target could
+not be reached": nothing is silently dropped, but a host that needs to know
+should compare a post-compaction ``ReportContextUsage`` reading against its own
+target.
+
+**Keep every piece of irreducible content well under the target.** This is the
+one cost rule that matters, and it is about *any* content compaction cannot reduce
+— not only a pin. If what survives every tier is itself larger than
+``target_tokens``, the post-compaction estimate can never fall to target and the
+summarizing tier fires again on **every** model request for the rest of the run,
+one paid LLM call each. Measured over a six-step turn: one summarizer call in the
+ordinary case, **six** when something irreducible exceeds target — one-to-one with
+requests, and unbounded.
+
+Two things are irreducible, and the second is the likely one:
+
+- **A pin.** Re-injection happens *after* the tail is trimmed, so ``keep_tokens``
+  cannot bound it.
+- **The first user message**, which elja preserves on the host's behalf —
+  ``preserve_first_user_message``, on by default because dropping the original task
+  is how a long run forgets what it was asked to do. A server-side agent whose first
+  message is a task brief, a ticket body or a pasted document reaches this with no
+  pin anywhere. Measured: a 20k-character first user message at
+  ``target_tokens=1000`` gives six summarizer calls over six requests, and the same
+  turn with ``preserve_first_user_message=False`` gives one.
+
+So a host whose first message is large has two options: raise ``target_tokens``
+above it, or pass ``preserve_first_user_message=False`` to
+:func:`build_compaction` and keep the task in its own instructions instead. elja
+does not *bound* this; doing so needs a latch that refuses to re-enter the
+summarizing tier once it has failed to reach target, which is not built.
 """
 
 import inspect
@@ -54,6 +116,12 @@ _SKILLS_WARNING = (
     "load_capability before use.\n\n"
 )
 _ANCHOR = "<messages>"
+_PLACEHOLDER = "{messages}"
+# Two transcripts, rendered separately, to prove the prompt actually substitutes:
+# if changing the transcript does not change the output, the prompt is not using it.
+# They share a long prefix on purpose, so a field that discards what it substitutes
+# (`{messages[0]}`, `{messages:.5}`) renders both identically and is refused too.
+_SENTINELS = ("eljatranscriptsentinelalpha", "eljatranscriptsentinelbeta")
 
 
 def extend_summary_prompt(harness_default: str) -> str:
@@ -92,9 +160,84 @@ def default_summary_prompt() -> str:
     fails the caller who needs compaction instead of making ``import elja`` fail
     for a host that never touches it. The harness pin is a range, so a patch
     release can trigger it.
+
+    Checked the same way a caller's prompt is. ``extend_summary_prompt`` guards the
+    ``<messages>`` anchor it needs to insert the warning, which is a different
+    string from the ``{messages}`` placeholder the summarizer substitutes — a
+    patch release could keep the anchor and rename the variable, and then every
+    convenience-path user would get a default prompt that substitutes nothing.
+
+    Raises:
+        ValueError: If the harness default no longer substitutes a transcript.
+        RuntimeError: If it no longer carries the anchor.
     """
-    return extend_summary_prompt(
+    prompt = extend_summary_prompt(
         str(inspect.signature(SummarizingCompaction.__init__).parameters["summary_prompt"].default)
+    )
+    check_summary_prompt(prompt)
+    return prompt
+
+
+def check_summary_prompt(summary_prompt: str) -> None:
+    """Refuse a summary prompt the summarizer cannot use, at construction time.
+
+    ``SummarizingCompaction`` does ``self.summary_prompt.format(messages=...)``
+    and nothing else. ``str.format`` no-ops on a string with no placeholder, so a
+    prompt that does not *substitute* hands the summarizer an instruction with no
+    transcript — and its output still **replaces every message before the
+    cutoff**. The run completes, nothing logs, and the history is gone. A stray
+    single brace raises ``KeyError`` instead, at the first summarization, deep in
+    a conversation.
+
+    So this renders the prompt twice with two different transcripts and requires the
+    results to differ, rather than looking for ``{messages}`` in the text. Those are
+    not the same test, and the difference is a hole this function has had twice over:
+    ``{messages}`` is a substring of ``{{messages}}``, which is an escaped brace that
+    renders as literal text and substitutes nothing — and a caller reaches that by
+    obeying this very function's advice to double their literal braces, since
+    doubling all of them takes the placeholder with it.
+
+    Two transcripts rather than one sentinel checked for by name, because a prompt
+    containing the sentinel's own text would then pass with no placeholder at all.
+    "Changing the transcript changes the output" is the property that actually
+    matters, and it needs no magic string.
+
+    It is also the more permissive test, and rightly: ``{messages!r}`` and
+    ``{messages:>10}`` both work at format time and are accepted. A field that
+    *discards* what it substitutes is not — ``{messages[0]}`` keeps one character
+    and ``{messages:.5}`` keeps five, which is a transcript in name only.
+
+    Args:
+        summary_prompt: The caller's prompt.
+
+    Raises:
+        ValueError: If the prompt does not substitute the transcript, or a brace
+            cannot be resolved. Every failure arrives as ``ValueError``:
+            ``str.format`` raises at least five different types on a bad field
+            (``KeyError``, ``IndexError``, ``ValueError``, ``AttributeError``,
+            ``TypeError``), and a caller guarding its construction path should not
+            have to enumerate them.
+    """
+    try:
+        rendered = {summary_prompt.format(messages=transcript) for transcript in _SENTINELS}
+    except Exception as exc:
+        raise ValueError(
+            f"summary_prompt contains a field str.format cannot resolve ({exc!r}); "
+            "double any literal braces as {{ }} — but leave the "
+            f"{_PLACEHOLDER!r} placeholder single. Unchecked this raises at the "
+            "first summarization, deep in a conversation."
+        ) from exc
+    if len(rendered) == 2:
+        return
+    raise ValueError(
+        "summary_prompt does not substitute the transcript: rendering it with two "
+        "different transcripts produced the same string. Either the "
+        f"{_PLACEHOLDER!r} placeholder is missing, or it is escaped (a doubled "
+        "{{messages}} is a literal, not a placeholder — leave this one single even "
+        "when doubling the rest), or the field discards what it substitutes "
+        "({messages[0]} keeps one character, {messages:.5} keeps five). Unchecked, "
+        "the summarizer is handed an instruction with no transcript and its output "
+        "still replaces the history."
     )
 
 
@@ -103,6 +246,10 @@ def build_compaction(
     *,
     summarizer_model: Model | None = None,
     summarizer_model_settings: ModelSettings | None = None,
+    cleared_placeholder: str | None = None,
+    summary_prompt: str | None = None,
+    receipts: bool = False,
+    preserve_first_user_message: bool = True,
 ) -> list[AbstractCapability[Any]]:
     """Build the compaction capability from settings (empty list if disabled).
 
@@ -127,11 +274,43 @@ def build_compaction(
             ``model_settings`` argument, which is how **one** guard instance can
             tell a compaction request from a main one without a second model
             object: tag it, e.g.
-            ``{"extra_headers": {"x-phase": "compaction"}}``.
+            ``{"extra_headers": {"x-phase": "compaction"}}``. Note the merge is
+            shallow, so an ``extra_headers`` here replaces whatever the model
+            already carries, for the summarizer request only.
+        cleared_placeholder: What a masked tool result is replaced with.
+            ``None`` keeps :data:`CLEARED_PLACEHOLDER`, which tells the model to
+            re-run the tool — correct for elja's idempotent built-ins, and an
+            invitation to repeat a side effect for anything else. A host with
+            write tools should pass text pointing at its own store instead.
+        summary_prompt: Replaces the summarization instruction — the summarizer's
+            *user* turn, not its system prompt (upstream's ``instructions``,
+            which elja does not expose). ``None`` keeps elja's, which is the
+            harness default plus a note about skills unloading; a host with no
+            skills has no reason to carry that note. Must SUBSTITUTE
+            ``{messages}``; see :func:`check_summary_prompt` for why that is
+            refused at construction rather than at first use.
+        receipts: Leave a deterministic receipt where history was summarized
+            away, so the model treats its memory of earlier work as secondhand.
+            Off by default, as upstream has it. Note one receipt accumulates per
+            compaction across a long caller-owned history, each with its own
+            dropped-message count — upstream's de-accumulation does not match
+            once the receipt has been merged into a mixed-parts message.
+        preserve_first_user_message: Keep the run's original task verbatim through
+            every tier. On by default, because dropping it is how a long run forgets
+            what it was asked to do. **Turn it off when that message is large.** It
+            is irreducible content, so a first message bigger than
+            ``target_tokens`` makes the summarizing tier fire on every model
+            request for the rest of the run — one paid LLM call each, unbounded.
+            Measured: a 20k-character first user message at ``target_tokens=1000``
+            gives six summarizer calls over six requests; the same turn with this
+            off gives one. A host turning it off should carry the task in its own
+            instructions instead, where compaction cannot reach it.
 
     Returns:
         A single tiered compaction capability, or ``[]`` when disabled.
     """
+    if summary_prompt is not None:
+        check_summary_prompt(summary_prompt)
     cfg = settings.compaction
     if not cfg.enabled:
         return []
@@ -145,7 +324,9 @@ def build_compaction(
                 ClearToolResults(
                     max_tokens=1,
                     keep_pairs=cfg.keep_tool_pairs,
-                    placeholder=CLEARED_PLACEHOLDER,
+                    placeholder=(
+                        CLEARED_PLACEHOLDER if cleared_placeholder is None else cleared_placeholder
+                    ),
                 ),
                 SummarizingCompaction(
                     model=summarizer_model,
@@ -155,10 +336,13 @@ def build_compaction(
                     # reachable — otherwise an irreducible tail above target
                     # re-fires a summarizer LLM call on EVERY request.
                     keep_tokens=cfg.target_tokens // 3,
-                    preserve_first_user_message=True,
+                    preserve_first_user_message=preserve_first_user_message,
                     incremental=True,
                     model_settings=summarizer_model_settings,
-                    summary_prompt=default_summary_prompt(),
+                    summary_prompt=(
+                        default_summary_prompt() if summary_prompt is None else summary_prompt
+                    ),
+                    receipts=receipts,
                 ),
             ],
             target_tokens=cfg.target_tokens,
