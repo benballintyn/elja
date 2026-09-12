@@ -59,15 +59,32 @@ not be reached": nothing is silently dropped, but a host that needs to know
 should compare a post-compaction ``ReportContextUsage`` reading against its own
 target.
 
-**Keep a pinned set well under the target.** Re-injection happens *after* the
-tail is trimmed, so ``keep_tokens`` cannot bound a pin: when the pinned text's own
-estimate exceeds ``target_tokens``, the post-compaction estimate can never fall
-to target and the summarizing tier fires again on **every** model request for the
-rest of the run. Measured over a six-step turn: one paid summarizer call with no
-pin or a small pin, **six** with an oversized one, one-to-one with requests and
-unbounded. Treat an oversized pin as a host-side error. elja does not yet bound
-this; doing so needs a latch that refuses to re-enter the summarizing tier once
-it has failed to reach target, which is not built.
+**Keep every piece of irreducible content well under the target.** This is the
+one cost rule that matters, and it is about *any* content compaction cannot reduce
+— not only a pin. If what survives every tier is itself larger than
+``target_tokens``, the post-compaction estimate can never fall to target and the
+summarizing tier fires again on **every** model request for the rest of the run,
+one paid LLM call each. Measured over a six-step turn: one summarizer call in the
+ordinary case, **six** when something irreducible exceeds target — one-to-one with
+requests, and unbounded.
+
+Two things are irreducible, and the second is the likely one:
+
+- **A pin.** Re-injection happens *after* the tail is trimmed, so ``keep_tokens``
+  cannot bound it.
+- **The first user message**, which elja preserves on the host's behalf —
+  ``preserve_first_user_message``, on by default because dropping the original task
+  is how a long run forgets what it was asked to do. A server-side agent whose first
+  message is a task brief, a ticket body or a pasted document reaches this with no
+  pin anywhere. Measured: a 20k-character first user message at
+  ``target_tokens=1000`` gives six summarizer calls over six requests, and the same
+  turn with ``preserve_first_user_message=False`` gives one.
+
+So a host whose first message is large has two options: raise ``target_tokens``
+above it, or pass ``preserve_first_user_message=False`` to
+:func:`build_compaction` and keep the task in its own instructions instead. elja
+does not *bound* this; doing so needs a latch that refuses to re-enter the
+summarizing tier once it has failed to reach target, which is not built.
 """
 
 import inspect
@@ -100,9 +117,11 @@ _SKILLS_WARNING = (
 )
 _ANCHOR = "<messages>"
 _PLACEHOLDER = "{messages}"
-# Substituted in to prove the placeholder is a placeholder. Alphanumeric on
-# purpose, so `{messages!r}` — which works at format time — still renders it.
-_SENTINEL = "eljatranscriptsentinel"
+# Two transcripts, rendered separately, to prove the prompt actually substitutes:
+# if changing the transcript does not change the output, the prompt is not using it.
+# They share a long prefix on purpose, so a field that discards what it substitutes
+# (`{messages[0]}`, `{messages:.5}`) renders both identically and is refused too.
+_SENTINELS = ("eljatranscriptsentinelalpha", "eljatranscriptsentinelbeta")
 
 
 def extend_summary_prompt(harness_default: str) -> str:
@@ -170,45 +189,55 @@ def check_summary_prompt(summary_prompt: str) -> None:
     single brace raises ``KeyError`` instead, at the first summarization, deep in
     a conversation.
 
-    So this substitutes a sentinel and checks the sentinel came out, rather than
-    looking for ``{messages}`` in the text. The two are not the same, and the
-    difference is a hole this function used to have: ``{messages}`` is a substring
-    of ``{{messages}}``, which is an escaped brace that renders as the literal
-    text and substitutes nothing. A caller reaches that by obeying this very
-    function's advice to double their literal braces — doubling all of them takes
-    the placeholder with it. Rendering is also the more permissive test, and
-    rightly: ``{messages!r}`` and ``{messages:>10}`` both work at format time and
-    are now accepted.
+    So this renders the prompt twice with two different transcripts and requires the
+    results to differ, rather than looking for ``{messages}`` in the text. Those are
+    not the same test, and the difference is a hole this function has had twice over:
+    ``{messages}`` is a substring of ``{{messages}}``, which is an escaped brace that
+    renders as literal text and substitutes nothing — and a caller reaches that by
+    obeying this very function's advice to double their literal braces, since
+    doubling all of them takes the placeholder with it.
+
+    Two transcripts rather than one sentinel checked for by name, because a prompt
+    containing the sentinel's own text would then pass with no placeholder at all.
+    "Changing the transcript changes the output" is the property that actually
+    matters, and it needs no magic string.
+
+    It is also the more permissive test, and rightly: ``{messages!r}`` and
+    ``{messages:>10}`` both work at format time and are accepted. A field that
+    *discards* what it substitutes is not — ``{messages[0]}`` keeps one character
+    and ``{messages:.5}`` keeps five, which is a transcript in name only.
 
     Args:
         summary_prompt: The caller's prompt.
 
     Raises:
         ValueError: If the prompt does not substitute the transcript, or a brace
-            cannot be resolved.
+            cannot be resolved. Every failure arrives as ``ValueError``:
+            ``str.format`` raises at least five different types on a bad field
+            (``KeyError``, ``IndexError``, ``ValueError``, ``AttributeError``,
+            ``TypeError``), and a caller guarding its construction path should not
+            have to enumerate them.
     """
     try:
-        rendered = summary_prompt.format(messages=_SENTINEL)
-    except (KeyError, IndexError, ValueError) as exc:
+        rendered = {summary_prompt.format(messages=transcript) for transcript in _SENTINELS}
+    except Exception as exc:
         raise ValueError(
-            f"summary_prompt contains a brace str.format cannot resolve ({exc!r}); "
+            f"summary_prompt contains a field str.format cannot resolve ({exc!r}); "
             "double any literal braces as {{ }} — but leave the "
             f"{_PLACEHOLDER!r} placeholder single. Unchecked this raises at the "
             "first summarization, deep in a conversation."
         ) from exc
-    if _SENTINEL in rendered:
+    if len(rendered) == 2:
         return
-    if _PLACEHOLDER in summary_prompt:
-        raise ValueError(
-            f"summary_prompt contains {_PLACEHOLDER!r} only as literal text: a doubled "
-            "{{messages}} is an escaped brace, not a placeholder. Leave this one single "
-            "even when doubling the rest. Unchecked, the summarizer is handed an "
-            "instruction with no transcript and its output still replaces the history."
-        )
     raise ValueError(
-        f"summary_prompt must substitute the {_PLACEHOLDER!r} placeholder; without it the "
-        "summarizer is handed an instruction with no transcript, and the summarized "
-        "history is replaced by a summary written from nothing"
+        "summary_prompt does not substitute the transcript: rendering it with two "
+        "different transcripts produced the same string. Either the "
+        f"{_PLACEHOLDER!r} placeholder is missing, or it is escaped (a doubled "
+        "{{messages}} is a literal, not a placeholder — leave this one single even "
+        "when doubling the rest), or the field discards what it substitutes "
+        "({messages[0]} keeps one character, {messages:.5} keeps five). Unchecked, "
+        "the summarizer is handed an instruction with no transcript and its output "
+        "still replaces the history."
     )
 
 
@@ -220,6 +249,7 @@ def build_compaction(
     cleared_placeholder: str | None = None,
     summary_prompt: str | None = None,
     receipts: bool = False,
+    preserve_first_user_message: bool = True,
 ) -> list[AbstractCapability[Any]]:
     """Build the compaction capability from settings (empty list if disabled).
 
@@ -256,7 +286,7 @@ def build_compaction(
             *user* turn, not its system prompt (upstream's ``instructions``,
             which elja does not expose). ``None`` keeps elja's, which is the
             harness default plus a note about skills unloading; a host with no
-            skills has no reason to carry that note. Must contain
+            skills has no reason to carry that note. Must SUBSTITUTE
             ``{messages}``; see :func:`check_summary_prompt` for why that is
             refused at construction rather than at first use.
         receipts: Leave a deterministic receipt where history was summarized
@@ -265,6 +295,16 @@ def build_compaction(
             compaction across a long caller-owned history, each with its own
             dropped-message count — upstream's de-accumulation does not match
             once the receipt has been merged into a mixed-parts message.
+        preserve_first_user_message: Keep the run's original task verbatim through
+            every tier. On by default, because dropping it is how a long run forgets
+            what it was asked to do. **Turn it off when that message is large.** It
+            is irreducible content, so a first message bigger than
+            ``target_tokens`` makes the summarizing tier fire on every model
+            request for the rest of the run — one paid LLM call each, unbounded.
+            Measured: a 20k-character first user message at ``target_tokens=1000``
+            gives six summarizer calls over six requests; the same turn with this
+            off gives one. A host turning it off should carry the task in its own
+            instructions instead, where compaction cannot reach it.
 
     Returns:
         A single tiered compaction capability, or ``[]`` when disabled.
@@ -296,7 +336,7 @@ def build_compaction(
                     # reachable — otherwise an irreducible tail above target
                     # re-fires a summarizer LLM call on EVERY request.
                     keep_tokens=cfg.target_tokens // 3,
-                    preserve_first_user_message=True,
+                    preserve_first_user_message=preserve_first_user_message,
                     incremental=True,
                     model_settings=summarizer_model_settings,
                     summary_prompt=(

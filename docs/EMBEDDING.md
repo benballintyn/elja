@@ -241,7 +241,7 @@ because the defaults are tuned for a local workspace:
 | argument | why a host changes it |
 | --- | --- |
 | `cleared_placeholder` | The default says "re-run the tool if you need it again" and names `.elja/spill/`. Safe for idempotent reads in a workspace; an invitation to double-write anywhere else. Point it at your own store. |
-| `summary_prompt` | The default carries a note about reloading elja skills, which a host without skills has no reason to ship. This is the summarizer's *user* turn; upstream's `instructions` (its system prompt) is not exposed. Must contain `{messages}`, checked at construction. |
+| `summary_prompt` | The default carries a note about reloading elja skills, which a host without skills has no reason to ship. This is the summarizer's *user* turn; upstream's `instructions` (its system prompt) is not exposed. Must *substitute* `{messages}`, checked at construction by rendering it twice — a doubled `{{messages}}` is a literal and is refused, while `{messages!r}` and `{messages:>10}` are fine. |
 | `summarizer_model` | A different provider, a cheaper model, or separate budget attribution (see above). |
 | `receipts` | Leaves a deterministic note where history was summarized away. With a capability implementing the harness's `TranscriptHandleProvider` protocol attached, the receipt carries a handle to your persisted transcript. Note one accumulates per compaction across a long caller-owned history, each with its own dropped-message count. |
 

@@ -355,7 +355,13 @@ class TestAnOversizedPinIsNotBounded:
     """
 
     async def _summarizer_calls_over_a_multi_step_turn(
-        self, tmp_path: Path, pinned: str | None, steps: int
+        self,
+        tmp_path: Path,
+        pinned: str | None,
+        steps: int,
+        *,
+        first_message: str = "original task: reconcile the ledger",
+        preserve_first_user_message: bool = True,
     ) -> tuple[int, int]:
         settings = _settings(tmp_path, target=1000)
         toolset: FunctionToolset[EljaDeps] = FunctionToolset()
@@ -381,11 +387,15 @@ class TestAnOversizedPinIsNotBounded:
             FunctionModel(script),
             deps_type=EljaDeps,
             toolsets=[toolset],
-            capabilities=build_compaction(settings),
+            capabilities=build_compaction(
+                settings, preserve_first_user_message=preserve_first_user_message
+            ),
         )
+        history = _mixed_history(8, pinned=pinned)
+        history[0] = ModelRequest(parts=[UserPromptPart(content=first_message)])
         await agent.run(
             "carry on",
-            message_history=_mixed_history(8, pinned=pinned),
+            message_history=history,
             deps=EljaDeps.from_settings(settings),
         )
         return len(requests), roles.count("summarizer")
@@ -416,6 +426,43 @@ class TestAnOversizedPinIsNotBounded:
         )
         assert requests == 6
         assert summarizations == requests
+
+    async def test_a_large_first_message_does_it_too_with_no_pin_anywhere(
+        self, tmp_path: Path
+    ) -> None:
+        """The realistic shape of the same failure, and the one the docs missed.
+
+        A pin is something a host opts into. The first user message is something elja
+        preserves on the host's behalf, so a server-side agent whose first message is
+        a task brief, a ticket body or a pasted document reaches the unbounded
+        summarizer with no pin anywhere — having followed the advice exactly.
+        Measured: 1 summarizer call over 6 requests with a short first message, 6
+        with a 20k-character one.
+        """
+        requests, summarizations = await self._summarizer_calls_over_a_multi_step_turn(
+            tmp_path, None, steps=6, first_message="TASK BRIEF " * 2000
+        )
+        assert requests == 6
+        assert summarizations == requests
+
+    async def test_turning_off_first_message_preservation_is_the_escape(
+        self, tmp_path: Path
+    ) -> None:
+        """Which is why the knob is exposed rather than hard-coded.
+
+        Same oversized first message, same target, one argument different: back to one
+        summarizer call for the whole turn. A host that takes this should carry the
+        task in its own instructions, where compaction cannot reach it.
+        """
+        requests, summarizations = await self._summarizer_calls_over_a_multi_step_turn(
+            tmp_path,
+            None,
+            steps=6,
+            first_message="TASK BRIEF " * 2000,
+            preserve_first_user_message=False,
+        )
+        assert requests == 6
+        assert summarizations == 1
 
 
 class TestSummarizerComposition:
@@ -623,7 +670,7 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     def test_a_prompt_without_the_placeholder_is_refused(self, tmp_path: Path) -> None:
         """Otherwise the summary is written from nothing and replaces history."""
-        with pytest.raises(ValueError, match=r"must substitute the '\{messages\}' placeholder"):
+        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
             build_compaction(_settings(tmp_path), summary_prompt="Summarize concisely.")
 
     def test_an_unresolvable_brace_is_refused(self, tmp_path: Path) -> None:
@@ -644,19 +691,33 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
 
     @pytest.mark.parametrize(
         "unresolvable",
-        ['Output JSON like {"intent": "x"}\n\n{messages}', "{messages} then {0}", "a { brace"],
-        ids=["stray-open-brace-pair", "positional-field", "lone-open-brace"],
+        [
+            'Output JSON like {"intent": "x"}\n\n{messages}',
+            "{messages} then {0}",
+            "a { brace",
+            "{messages.user}",
+            "{messages[intent]}",
+        ],
+        ids=[
+            "stray-open-brace-pair",
+            "positional-field",
+            "lone-open-brace",
+            "attribute-access",
+            "string-key-index",
+        ],
     )
-    def test_every_kind_of_unresolvable_brace_is_refused_with_guidance(
+    def test_every_kind_of_unresolvable_field_is_refused_with_guidance(
         self, tmp_path: Path, unresolvable: str
     ) -> None:
-        """str.format raises three different exception types on these.
+        """str.format raises at least FIVE exception types on a bad field.
 
         A literal-brace pair raises `KeyError`, a positional field `IndexError`, a
-        lone brace `ValueError` from the parser. All three have to arrive as the
-        same `ValueError` carrying the escape instructions, or a caller gets a bare
-        parser complaint — and narrowing the caught set is invisible to a suite that
-        only tries one of them.
+        lone brace `ValueError` from the parser, attribute access `AttributeError`,
+        and a string key into a string `TypeError`. Every one has to arrive as the
+        same `ValueError` carrying the escape instructions, or a caller guarding its
+        construction path with `except ValueError` crashes instead — and the last two
+        were escaping bare, because the first version of this test listed three and
+        the caught set was narrowed to match it.
         """
         with pytest.raises(ValueError, match=r"double any literal braces"):
             build_compaction(_settings(tmp_path), summary_prompt=unresolvable)
@@ -666,10 +727,19 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
         [
             "Summarize.\n\n{{messages}}",
             'Output JSON like {{"intent": "x"}}\n\n{{messages}}',
+            "{messages[0]}",
+            "{messages:.5}",
+            "Summarize: eljatranscriptsentinelalpha",
         ],
-        ids=["placeholder-alone", "everything-doubled"],
+        ids=[
+            "placeholder-alone",
+            "everything-doubled",
+            "first-character-only",
+            "truncated-to-five",
+            "sentinel-text-but-no-placeholder",
+        ],
     )
-    def test_a_doubled_placeholder_is_refused_despite_containing_the_text(
+    def test_a_prompt_that_does_not_substitute_is_refused_despite_the_text(
         self, tmp_path: Path, doubled: str
     ) -> None:
         """The hole a substring test leaves, and the route a caller takes into it.
@@ -680,8 +750,15 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
         with no transcript and its output replaces the history anyway. The caller
         gets there by obeying this module's own advice to double their literal
         braces: doubling all of them takes the placeholder with it.
+
+        Three more shapes that substitute something useless rather than nothing:
+        `{messages[0]}` keeps one character and `{messages:.5}` keeps five, which is
+        a transcript in name only. And a prompt containing the sentinel's own text
+        with no placeholder at all used to be ACCEPTED, which is why the check now
+        renders twice with two different transcripts and requires the results to
+        differ rather than looking for a magic string.
         """
-        with pytest.raises(ValueError, match=r"only as literal text"):
+        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
             build_compaction(_settings(tmp_path), summary_prompt=doubled)
 
     @pytest.mark.parametrize(
@@ -710,14 +787,14 @@ class TestTheSummaryPromptIsCheckedAtConstruction:
             workspace=WorkspaceConfig(root=tmp_path),
             compaction=CompactionConfig(enabled=False, target_tokens=3000),
         )
-        with pytest.raises(ValueError, match=r"must substitute"):
+        with pytest.raises(ValueError, match=r"does not substitute the transcript"):
             build_compaction(settings, summary_prompt="Summarize concisely.")
         # And the disabled path still returns nothing for a prompt that is fine.
         assert build_compaction(settings, summary_prompt="Summarize.\n\n{messages}") == []
 
     @pytest.mark.parametrize(
         ("substitute", "refusal"),
-        [("{transcript}", r"cannot resolve"), ("", r"must substitute")],
+        [("{transcript}", r"cannot resolve"), ("", r"does not substitute the transcript")],
         ids=["variable-renamed", "substitution-dropped"],
     )
     def test_eljas_own_default_prompt_is_checked_the_same_way(

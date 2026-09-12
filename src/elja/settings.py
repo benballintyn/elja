@@ -189,11 +189,14 @@ class CompactionConfig(_Section):
     target_tokens: int = Field(default=24_000, ge=1000)
     # Recent tool call/result pairs kept verbatim by the masking tier.
     keep_tool_pairs: int = Field(default=10, ge=1)
-    # Recent messages kept verbatim if the summarization fallback fires. This is
-    # an UPPER bound: elja also passes keep_tokens = target_tokens // 3 (without
-    # which an irreducible tail re-fires the summarizer every request), and the
-    # tail is whichever bound binds first. Measured across three regimes, the
-    # token bound always won — so raising this alone does not lengthen the tail.
+    # INERT under elja's configuration, and kept only so a host reading upstream's
+    # docs is not surprised by its absence. Upstream reads it in two places: when
+    # `keep_tokens is None`, and inside `if self.keep_user_messages:`. elja always
+    # passes `keep_tokens = target_tokens // 3` (without which an irreducible tail
+    # re-fires the summarizer on every request) and never passes
+    # `keep_user_messages`, so neither branch is reachable. Measured: the model's
+    # view is 15 messages and 7 tool calls at keep_messages = 1, 2, 20 and 1000
+    # alike. Changing it does nothing in either direction.
     # Pinned by test_keep_messages_cannot_bind_because_of_two_settings_elja_chooses.
     keep_messages: int = Field(default=20, ge=1)
 
