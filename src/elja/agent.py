@@ -6,6 +6,7 @@ from pydantic_ai import Agent
 from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
+from elja.application import build_application_agent
 from elja.compaction import build_compaction
 from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets
@@ -42,7 +43,10 @@ def build_agent(
         ``usage_limits=build_usage_limits(settings)`` when running it.
     """
     instructions = settings.agent.instructions
-    return Agent(
+    # Assembly itself lives in build_application_agent, so the convenience path
+    # and the embedded path cannot drift apart in how an Agent is constructed.
+    # What differs is only what this path chooses to hand it.
+    return build_application_agent(
         build_model(settings),
         deps_type=EljaDeps,
         # An explicit empty string means "no system prompt"; only None gets the default.

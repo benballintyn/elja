@@ -20,6 +20,7 @@ from pydantic_ai.tools import ToolFuncEither
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import UsageLimits
 
+from elja.application import build_application_agent
 from elja.compaction import build_compaction
 from elja.deps import EljaDeps
 from elja.model import build_model
@@ -107,7 +108,7 @@ def _make_delegate(
 ) -> Callable[[RunContext[EljaDeps], str], Awaitable[str]]:
     # Built once per subagent and reused across delegations — a fresh Agent
     # per call would leak one provider HTTP client per delegation.
-    child: Agent[EljaDeps, str] = Agent(
+    child: Agent[EljaDeps, str] = build_application_agent(
         build_model(settings),
         deps_type=EljaDeps,
         instructions=cfg.instructions,
