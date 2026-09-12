@@ -113,8 +113,13 @@ tool and names `.elja/spill/`, and neither is right for a host with
 side-effecting tools and no workspace. `elja/application.py` covers how `None`
 and empty differ between the two paths; `elja/compaction.py` covers composing
 the policy and why reporting goes last; and
-[docs/EMBEDDING.md](docs/EMBEDDING.md) covers metering, admission control and
-the limits of what elja enforces.
+`docs/EMBEDDING.md` covers metering, admission control, events, checkpoints,
+cancellation, persistence, and the limits of what elja enforces, and
+`examples/server_agent.py` is all of it as a running server-shaped host, driven
+by the test suite so it cannot rot. Both live in the repository rather than the
+published package, so they are linked from
+[github.com/benballintyn/elja](https://github.com/benballintyn/elja/blob/main/docs/EMBEDDING.md)
+for anyone reading this on PyPI.
 
 Configuration lives in `elja.toml` (all keys optional; `ELJA_*` env vars
 override, e.g. `ELJA_MODEL__BASE_URL`):

@@ -67,7 +67,9 @@ testpaths = ["tests"]
 # silently disable every `# pragma: no cover` in the tree, which matters now the
 # 100% floor is enforced. There is nothing to exempt today: `if TYPE_CHECKING:` is
 # already a coverage default and no `raise NotImplementedError` exists in src/.
-addopts = "--cov=src/elja --cov-report=term-missing -m 'not integration'"
+# examples/ is measured too: it is the documented host integration, and three of
+# its branches sat unexecuted behind a coverage scope that stopped at src/.
+addopts = "--cov=src/elja --cov=examples --cov-report=term-missing -m 'not integration'"
 asyncio_mode = "auto"
 markers = [
     "integration: tests that need a live external service - LLM endpoint or internet (deselected in CI)",
@@ -76,7 +78,10 @@ markers = [
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests"]
+# examples/ is type-checked and lint-checked too: it is the documented host
+# integration, so it has to stay correct against a pinned-range dependency rather
+# than rot quietly.
+files = ["src", "tests", "examples"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0"]

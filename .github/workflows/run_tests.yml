@@ -39,17 +39,18 @@ jobs:
         run: poetry install --with dev --no-interaction
 
       - name: Lint
-        run: poetry run ruff check src tests
+        run: poetry run ruff check src tests examples
 
       - name: Format check
-        run: poetry run ruff format --check src tests
+        run: poetry run ruff format --check src tests examples
 
       - name: Type check
-        # Paths come from [tool.mypy] files = ["src", "tests"] in pyproject.toml.
+        # Paths come from [tool.mypy] files in pyproject.toml, examples/ included.
         run: poetry run mypy
 
       - name: Run tests
         # The `integration` marker requires a live LLM endpoint — skip in CI.
         run: >
           poetry run pytest -m "not integration"
-          --cov=src/elja --cov-report=xml --cov-report=term --cov-fail-under=100
+          --cov=src/elja --cov=examples
+          --cov-report=xml --cov-report=term --cov-fail-under=100
