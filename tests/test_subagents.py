@@ -10,6 +10,7 @@ from pydantic_ai.messages import (
     ModelResponse,
     TextPart,
     ToolCallPart,
+    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -376,7 +377,20 @@ class TestDelegationVisibility:
     async def test_broken_sink_does_not_abort_delegation(
         self, settings: EljaSettings, mocker: MockerFixture
     ) -> None:
-        """A raising status sink is telemetry-only; the delegation completes."""
+        """A raising status sink is telemetry-only; the delegation completes.
+
+        What makes this load-bearing is the *delegate tool's own return value*, not
+        the parent's final answer. Losing the suppression here does not abort the
+        run: the raising sink is caught by the delegate's `except Exception`, which
+        re-raises it as `ModelRetry("subagent 'researcher' failed: …")`. The model
+        then re-delegates, pays again, and eventually gives up — so the parent still
+        answers "done" and an assertion on that cannot tell the two apart. Measured:
+        3 status labels and a retry loop without the suppression, 24 labels and a
+        clean delegation with it.
+
+        So this asserts the child's answer reached the parent, and that the parent
+        was asked exactly twice.
+        """
         from collections.abc import AsyncIterator
 
         from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
@@ -397,6 +411,7 @@ class TestDelegationVisibility:
             return_value=FunctionModel(stream_function=child_sf),
         )
         calls: list[int] = []
+        returned: list[object] = []
 
         def parent_script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             calls.append(1)
@@ -404,9 +419,18 @@ class TestDelegationVisibility:
                 return ModelResponse(
                     parts=[ToolCallPart(tool_name="delegate_researcher", args={"task": "t"})]
                 )
+            returned.extend(
+                part.content
+                for message in messages
+                for part in message.parts
+                if isinstance(part, ToolReturnPart) and part.tool_name == "delegate_researcher"
+            )
             return ModelResponse(parts=[TextPart(content="done")])
 
-        def broken_sink(_: str) -> None:
+        labels: list[str] = []
+
+        def broken_sink(label: str) -> None:
+            labels.append(label)
             raise BrokenPipeError("stdout gone")
 
         toolset = build_subagent_toolset(settings)
@@ -418,3 +442,10 @@ class TestDelegationVisibility:
             "go", deps=EljaDeps.from_settings(settings, on_status=broken_sink)
         )
         assert result.output == "done"
+        # The sink really was reached and really did raise.
+        assert labels, "the status sink never fired; the suppression is untested"
+        # The child's answer reached the parent, rather than a retry prompt naming
+        # the subagent as the thing that failed.
+        assert returned == ["child done"]
+        # And no retry loop: two parent dispatches, not three or more.
+        assert len(calls) == 2

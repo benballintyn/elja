@@ -1,5 +1,6 @@
 """Run-scoped dependencies injected into every tool via ``RunContext``."""
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,25 @@ from elja.settings import EljaSettings
 
 # An approver takes the human-readable call description and answers yes/no.
 ConfirmCallback = Callable[[str], bool] | Callable[[str], Awaitable[bool]]
+
+
+def notify(sink: "Callable[[str], None] | None", label: str) -> None:
+    """Send a status label, treating the sink as display-only telemetry.
+
+    A status sink is a UI affordance. A broken one must never abort a run — and
+    must never take the turn's history with it, which is what an exception here
+    did before, since it escaped before the session was saved. Accounting and
+    admission belong in a model wrapper, which cannot be skipped; see
+    ``docs/EMBEDDING.md``.
+
+    Args:
+        sink: The caller's status callback, or ``None``.
+        label: A short human-readable label.
+    """
+    if sink is None:
+        return
+    with contextlib.suppress(Exception):
+        sink(label)
 
 
 @dataclass

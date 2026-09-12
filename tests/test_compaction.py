@@ -1,5 +1,8 @@
 """Tests for elja.compaction."""
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,12 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from elja.compaction import build_compaction
+import elja
+from elja.compaction import (
+    build_compaction,
+    default_summary_prompt,
+    extend_summary_prompt,
+)
 from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
 
@@ -64,6 +72,80 @@ class TestConfig:
     def test_enabled_builds_one_tiered_capability(self) -> None:
         (cap,) = build_compaction(EljaSettings())
         assert type(cap).__name__ == "TieredCompaction"
+
+
+class TestSummaryPromptExtension:
+    """The warning must be inserted, or its absence must be loud."""
+
+    def test_the_warning_is_inserted_before_the_transcript(self) -> None:
+        out = extend_summary_prompt("preamble\n\n<messages>\n{messages}\n</messages>")
+        assert "load_capability" in out
+        assert out.index("load_capability") < out.index("<messages>")
+
+    def test_a_reworded_harness_prompt_fails_loudly_instead_of_silently(self) -> None:
+        """A plain str.replace would no-op and drop the warning with no signal."""
+        with pytest.raises(RuntimeError, match=r"no longer contains the '<messages>' anchor"):
+            extend_summary_prompt("a prompt upstream reworded without the anchor")
+
+    def test_the_installed_harness_prompt_still_carries_the_anchor(self) -> None:
+        """Pins the dependency contract itself, not just the helper."""
+        assert "load_capability" in default_summary_prompt()
+        assert "## Key decisions" in default_summary_prompt()
+
+    def test_importing_elja_does_not_compute_the_prompt(self, tmp_path: Path) -> None:
+        """A reworded harness prompt must not break ``import elja``.
+
+        The anchor check raises, so computing it at import turned a cosmetic
+        upstream string change into a total outage for a host that never touches
+        compaction. A subprocess, because this session has already computed it.
+
+        The canary is the *outage itself*, not the cache counter. `currsize == 0`
+        is fakeable: any module-level computation that does not go through the
+        cached function leaves it at zero, so reintroducing exactly the eager call
+        this test exists to forbid passes it. Here the anchor is removed from the
+        upstream default first — so an eager elja would fail to import — and the
+        test asserts the import survives *and* that the error still arrives at
+        first use. Nothing can satisfy both with the laziness removed.
+        """
+        root = str(Path(elja.__file__).resolve().parent.parent)
+        probe = tmp_path / "probe.py"
+        probe.write_text(
+            "import inspect\n"
+            "from pydantic_ai_harness.compaction import SummarizingCompaction as S\n"
+            "init = S.__init__\n"
+            "named = [\n"
+            "    p.name\n"
+            "    for p in inspect.signature(init).parameters.values()\n"
+            "    if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD\n"
+            "    and p.default is not inspect.Parameter.empty\n"
+            "]\n"
+            "defaults = init.__defaults__\n"
+            "assert defaults is not None and len(defaults) == len(named)\n"
+            "i = named.index('summary_prompt')\n"
+            "reworded = str(defaults[i]).replace('<messages>', '<TRANSCRIPT>')\n"
+            "assert '<messages>' not in reworded\n"
+            "init.__defaults__ = (*defaults[:i], reworded, *defaults[i + 1 :])\n"
+            "import elja\n"
+            "print('IMPORT SURVIVED')\n"
+            "from elja.compaction import default_summary_prompt\n"
+            "try:\n"
+            "    default_summary_prompt()\n"
+            "except RuntimeError:\n"
+            "    print('RAISED AT FIRST USE')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(probe)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": root},
+        )
+        assert result.stdout.split() == ["IMPORT", "SURVIVED", "RAISED", "AT", "FIRST", "USE"], (
+            result.stdout,
+            result.stderr,
+        )
 
 
 class TestMaskingBehavior:
@@ -191,6 +273,103 @@ class TestSummarizationTier:
         result2 = await agent.run("two", message_history=list(result.all_messages()), deps=deps)
         assert result2.output == "ok"
         assert len(summarizer_calls) == first_round
+
+    async def test_the_token_bounded_tail_is_what_stops_the_summarizer_refiring(
+        self, tmp_path: Path
+    ) -> None:
+        """keep_tokens, not keep_messages, is what makes the target reachable.
+
+        Starts from the state that can actually fail: keep_messages (30) exceeds
+        the whole transcript, so the verbatim tail is irreducible by message
+        count alone. Without the token bound the summarizer fires on EVERY
+        request (measured: S a S a S a S a); with it, exactly once (S a a a a).
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(target_tokens=1000, keep_tool_pairs=1, keep_messages=30),
+        )
+        summarizer_calls: list[int] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                summarizer_calls.append(1)
+                return ModelResponse(parts=[TextPart(content="## Intent\nshort summary")])
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(settings),
+        )
+        deps = EljaDeps.from_settings(settings)
+        history = _history_with_tool_pairs(20, result_size=600)
+        for turn in range(4):
+            result = await agent.run(f"turn{turn}", message_history=history, deps=deps)
+            history = list(result.all_messages())
+        assert result.output == "ok"
+        # One summarization for the whole conversation, not one per request.
+        assert len(summarizer_calls) == 1
+
+    async def test_eljas_skills_warning_reaches_the_summarizer(self, tmp_path: Path) -> None:
+        """The module docstring promises it; a silent .replace no-op would drop it.
+
+        The harness pin is a range, so a patch release that rewords its prompt
+        would have removed the warning with no test failure at all.
+        """
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(target_tokens=1000, keep_tool_pairs=1, keep_messages=2),
+        )
+        prompts: list[str] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                prompts.append(str(messages))
+                return ModelResponse(parts=[TextPart(content="## Intent\nshort")])
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(settings),
+        )
+        await agent.run(
+            "continue",
+            message_history=_history_with_tool_pairs(8, result_size=600),
+            deps=EljaDeps.from_settings(settings),
+        )
+        assert prompts, "the summarizer never ran"
+        assert "load_capability" in prompts[0]
+        # And the harness's own structure is still there, i.e. we extended it
+        # rather than replacing it.
+        assert "## Key decisions" in prompts[0]
+
+    async def test_the_first_user_message_survives_summarization(self, tmp_path: Path) -> None:
+        """Dropping the original task is the documented failure mode."""
+        settings = EljaSettings(
+            workspace=WorkspaceConfig(root=tmp_path),
+            compaction=CompactionConfig(target_tokens=1000, keep_tool_pairs=1, keep_messages=2),
+        )
+        agent_views: list[list[ModelMessage]] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                return ModelResponse(parts=[TextPart(content="## Intent\naudit files")])
+            agent_views.append(list(messages))
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            capabilities=build_compaction(settings),
+        )
+        await agent.run(
+            "continue",
+            message_history=_history_with_tool_pairs(8, result_size=600),
+            deps=EljaDeps.from_settings(settings),
+        )
+        assert agent_views, "the agent never ran"
+        assert "original task: audit the files" in str(agent_views[0])
 
     async def test_streaming_path_persists_compacted_session(self, tmp_path: Path) -> None:
         """The CLI's run_turn (event streaming) saves the compacted history."""
