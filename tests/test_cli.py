@@ -1,5 +1,6 @@
 """Tests for elja.cli."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -333,3 +334,18 @@ class TestABrokenStatusSinkCannotKillATurn:
         seen: list[str] = []
         notify(seen.append, "thinking…")
         assert seen == ["thinking…"]
+
+    @pytest.mark.parametrize("escaping", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+    def test_notify_does_not_swallow_a_base_exception(self, escaping: type[BaseException]) -> None:
+        """Cancellation is the host's; telemetry must not eat it.
+
+        suppress(Exception) rather than suppress(BaseException) is the whole
+        point, and widening it would have passed a green suite.
+        """
+        from elja.deps import notify
+
+        def raising(_label: str) -> None:
+            raise escaping
+
+        with pytest.raises(escaping):
+            notify(raising, "x")

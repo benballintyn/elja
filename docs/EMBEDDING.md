@@ -20,19 +20,38 @@ behaviors below are pinned by `tests/test_metering.py` rather than assumed.
 The mechanism is a model wrapper. Subclass `pydantic_ai.models.wrapper.WrapperModel`,
 run your admission check, then delegate.
 
-**The rule, not a list: `WrapperModel` forwards every provider-reaching method it
-does not override.** There are four, and each one dispatches to the provider:
+**The rule, not a list: any of these that your subclass does not override goes
+straight to the provider.** There are five, and the last one is the odd case:
 
 | method | when it fires |
 | --- | --- |
 | `request` | the ordinary non-streamed model call |
 | `request_stream` | the streamed call — `request` does **not** cover it |
-| `count_tokens` | before *every* request when `UsageLimits.count_tokens_before_request` is set. A real network call on the providers that implement it, and pydantic-ai routes it through `check_allow_model_requests()` like any other model request |
+| `count_tokens` | before *every* request when `UsageLimits.count_tokens_before_request` is set. A real network call on the providers that implement it, routed through `check_allow_model_requests()` like any other model request |
 | `compact_messages` | provider-side compaction, reachable if you attach a capability that uses it |
+| `cancel_suspended_response` | cancelling a suspended background response. On `OpenAIResponsesModel` this issues a real `responses.cancel` HTTP call, and it is reached from the ordinary agent path on the run's outermost model |
 
-A guard on only `request` spends ungated on the other three.
+`cancel_suspended_response` needs **recording, not admission**: a cancel bills no
+tokens, so reserving budget on it would be perverse. Two things make it worth
+knowing anyway. It is the one dispatch that does **not** call
+`check_allow_model_requests()`, so a host whose test suite proves "no egress
+without admission" by setting `ALLOW_MODEL_REQUESTS=False` is not covered on this
+path. And E2 asks that provider cancellation stay available to an
+application-owned recorder, which means seeing it.
+
+A guard on only `request` spends ungated on the other four.
 `tests/test_metering.py` pins `request`, `request_stream` and `count_tokens`,
 each with a positive control so the denial assertions cannot pass vacuously.
+
+**One admission is one *logical* request, not one network attempt.** The provider
+SDKs retry underneath: `openai` and `anthropic` both default to
+`max_retries=2`, and elja's `build_model` does not override it, so a single
+admission can front up to three HTTP attempts — and a retry after a timeout on a
+request the server already began generating is billable. E2 is explicit that a
+callback firing once while the provider makes several hidden requests does not
+satisfy strict admission. A host that needs per-attempt admission must pass its
+own client with `max_retries=0` (`AsyncOpenAI(max_retries=0)` /
+`AsyncAnthropic(max_retries=0)`) and own the retry loop above the guard.
 
 ```python
 class GuardedModel(WrapperModel):
@@ -75,6 +94,9 @@ What elja guarantees:
   parent run's totals exactly once. Reconcile against the token totals, not
   `usage.requests`, which counts committed request *steps* rather than dispatches.
 
+The compaction helper lives in its own module: `from elja.compaction import
+build_compaction`.
+
 ## Telling a compaction request from a main one
 
 A `Model.request` call receives no run context at all, and the summarizer's
@@ -92,6 +114,16 @@ Two channels work today, with no upstream patch:
    `build_compaction(settings, summarizer_model_settings={"extra_headers": {"x-phase": "compaction"}})`.
    `extra_headers` is a base `ModelSettings` field, so this is typed and
    provider-neutral.
+
+   **It replaces, it does not merge.** `merge_model_settings` is a shallow
+   `base | overrides`, so an `extra_headers` you pass here wipes whatever your
+   model already carries — for the summarizer request only. Measured: a model
+   built with `extra_headers={"authorization": ..., "x-tenant": ...}` sends the
+   agent request with both and the compaction request with only `x-phase`. If
+   your model carries gateway or tenant headers, restate them inside
+   `summarizer_model_settings`. The same shallowness means a host carrying run
+   identity in agent-level `extra_headers` loses it on the compaction request —
+   identity belongs on the guard instance, which is what channel 2 is for.
 2. **Use a distinct instance.** Build one guarded model per run, closing over the
    run identity, and pass a separate one as `summarizer_model`.
 
@@ -117,15 +149,28 @@ above; recorded rather than pretended to be covered.
   A guard passed to `build_application_agent` does not cover a delegation, and a
   per-delegation request budget is not a shared dollar budget. Keep sub-agents off
   the embedded path until elja propagates them explicitly.
-- **No enforcement via event callbacks.** Status sinks in elja are display
-  telemetry, and a raising sink is suppressed on purpose — one shared helper,
-  `elja.deps.notify` — so a broken display cannot abort a run or lose the turn's
-  history. Never put admission or accounting in a UI subscriber; put it in the
-  model wrapper.
+- **No enforcement via event callbacks.** Never put admission or accounting in a
+  UI subscriber; put it in the model wrapper. elja's *status* sink is display
+  telemetry and a raising one is suppressed — one shared helper,
+  `elja.deps.notify` — so a broken status display cannot abort a run or lose the
+  turn's history. The CLI's **text-delta** sink is deliberately *not* suppressed:
+  silently swallowing the model's own output would be worse than failing, so a
+  raising delta sink does abort the turn (a closed stdout, for instance) and that
+  turn's history is not saved. Two sinks, two different answers, on purpose.
+- **`notify` lets a `BaseException` through.** `asyncio.CancelledError`,
+  `KeyboardInterrupt` and `SystemExit` pass it untouched, because cancellation is
+  the host's and a telemetry helper must not eat it.
 - **A wrapper is skippable by the host itself.** `agent.override(model=...)` and a
-  per-run `model=` replace it, and nesting the guard *inside* a `FallbackModel`
-  lets a denial trigger an attempt against the next model. Keep the guard
-  outermost.
+  per-run `model=` replace it. Keep the guard outermost.
+- **Nesting the guard inside a `FallbackModel` is unsafe regardless of your
+  exception type.** Whether a *denial* falls through depends on the chain:
+  `FallbackModel` defaults to `fallback_on=(ModelAPIError,)`, so a plain
+  `Exception` denial aborts the run (good) while a denial raised as a
+  `ModelHTTPError` silently dispatches to the next model (bad) — both measured.
+  But the deeper problem holds either way: every *other* model in the chain sits
+  outside your guard, so any genuine `ModelAPIError` from the first model
+  produces an un-admitted dispatch to the second. Put the `FallbackModel` inside
+  the guard, not the other way round.
 - **`count_tokens_before_request` is not self-evidently enforcement.** It only
   does something on providers that implement a count-tokens call, and it is
   itself a guarded dispatch (see the table above).

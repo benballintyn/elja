@@ -18,7 +18,7 @@ What elja does NOT provide is a spend ledger. See ``docs/EMBEDDING.md``.
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from pydantic_ai import Agent, ModelRetry, RunContext
@@ -66,8 +66,9 @@ class GuardedModel(WrapperModel):
         self.dispatches: list[str] = []
         self.stream_had_run_context: list[bool] = []
 
-    def _admit(self) -> None:
-        self.admissions.append(self.tag)
+    def _admit(self, hook: str = "request") -> None:
+        """Record WHICH hook asked, so a denial test says what it claims."""
+        self.admissions.append(f"{self.tag}:{hook}")
         if self.deny:
             raise BudgetDeniedError(f"{self.tag}: budget exhausted")
 
@@ -95,7 +96,7 @@ class GuardedModel(WrapperModel):
         ``check_allow_model_requests()`` like any other model request. A guard on
         ``request``/``request_stream`` alone never sees it.
         """
-        self._admit()
+        self._admit("count_tokens")
         self.dispatches.append(f"{self.tag}:count_tokens")
         return await super().count_tokens(messages, model_settings, model_request_parameters)
 
@@ -108,7 +109,7 @@ class GuardedModel(WrapperModel):
         run_context: RunContext[Any] | None = None,
     ) -> AsyncIterator[StreamedResponse]:
         """The streamed path needs its own gate; `request` does not cover it."""
-        self._admit()
+        self._admit("request_stream")
         self.dispatches.append(self.tag)
         # Unlike `request`, this hook DOES receive the run context — recorded so
         # the asymmetry is pinned rather than assumed (see docs/EMBEDDING.md).
@@ -170,7 +171,7 @@ def _streamable() -> FunctionModel:
     return FunctionModel(stream_function=stream)
 
 
-def _counting_model() -> FunctionModel:
+def _counting_model() -> Model:
     """A model that implements count_tokens, which FunctionModel does not."""
 
     class Counting(WrapperModel):
@@ -183,7 +184,7 @@ def _counting_model() -> FunctionModel:
             """Answer without a network call, as a provider would with one."""
             return RequestUsage(input_tokens=11)
 
-    return cast("FunctionModel", Counting(_script([])))
+    return Counting(_script([]))
 
 
 def _compacting_settings(tmp_path: Path) -> EljaSettings:
@@ -211,7 +212,7 @@ class TestAdmissionRunsBeforeEveryRequest:
         assert result.output == "done"
         # The summarizer really ran, and it ran through the guard.
         assert roles == ["summarizer", "agent"]
-        assert admissions == ["main", "main"]
+        assert admissions == ["main:request", "main:request"]
 
     async def test_a_supplied_summarizer_guard_stays_separate(self, tmp_path: Path) -> None:
         """Separate instances are how a host tells main from compaction."""
@@ -231,7 +232,7 @@ class TestAdmissionRunsBeforeEveryRequest:
             deps=EljaDeps.from_settings(settings),
         )
         assert result.output == "done"
-        assert admissions == ["summarizer", "main"]
+        assert admissions == ["summarizer:request", "main:request"]
         assert summarizer.dispatches == ["summarizer"]
         assert main.dispatches == ["main"]
 
@@ -265,7 +266,7 @@ class TestCountTokensIsGuardedToo:
         )
         # Counted first, then the request itself — both through the guard.
         assert guarded.dispatches == ["main:count_tokens", "main"]
-        assert admissions == ["main", "main"]
+        assert admissions == ["main:count_tokens", "main:request"]
 
     async def test_a_denial_stops_the_count_tokens_dispatch(self, tmp_path: Path) -> None:
         settings = _compacting_settings(tmp_path)
@@ -278,7 +279,9 @@ class TestCountTokensIsGuardedToo:
                 deps=EljaDeps.from_settings(settings),
                 usage_limits=UsageLimits(request_limit=5, count_tokens_before_request=True),
             )
-        assert admissions == ["main"]
+        # Naming the hook is the point: without it this test passes unchanged
+        # when count_tokens is never consulted and `request` denies instead.
+        assert admissions == ["main:count_tokens"]
         assert guarded.dispatches == []
 
     async def test_without_the_flag_count_tokens_is_never_reached(self, tmp_path: Path) -> None:
@@ -338,7 +341,7 @@ class TestDenialIsTerminal:
         with pytest.raises(BudgetDeniedError):
             await agent.run("go", deps=EljaDeps.from_settings(settings))
         # Admitted once, refused, and never dispatched — no retry, no fallback.
-        assert admissions == ["main"]
+        assert admissions == ["main:request"]
         assert guarded.dispatches == []
 
     async def test_a_denied_summarizer_request_is_not_retried(self, tmp_path: Path) -> None:
@@ -358,7 +361,7 @@ class TestDenialIsTerminal:
                 message_history=_bulky_history(8),
                 deps=EljaDeps.from_settings(settings),
             )
-        assert admissions == ["summarizer"]
+        assert admissions == ["summarizer:request"]
         assert summarizer.dispatches == []
         assert main.dispatches == []
 
@@ -373,7 +376,7 @@ class TestDenialIsTerminal:
             ) as events:
                 async for _event in events:
                     pass
-        assert admissions == ["main"]
+        assert admissions == ["main:request_stream"]
         assert guarded.dispatches == []
 
     async def test_an_admitted_streamed_request_does_reach_the_provider(
@@ -387,7 +390,7 @@ class TestDenialIsTerminal:
         async with agent.run_stream_events("go", deps=EljaDeps.from_settings(settings)) as events:
             async for _event in events:
                 pass
-        assert admissions == ["main"]
+        assert admissions == ["main:request_stream"]
         assert guarded.dispatches == ["main"]
         # A streamed wrapper hook receives the run context; `request` does not.
         assert guarded.stream_had_run_context == [True]
@@ -422,7 +425,7 @@ class TestDenialIsTerminal:
             if len(admissions) >= 2:
                 raise BudgetDeniedError("main: budget exhausted")
 
-        guard._admit = admit_then_deny  # type: ignore[method-assign]
+        guard._admit = admit_then_deny  # type: ignore[method-assign,assignment]
         with pytest.raises(BudgetDeniedError):
             await agent.run("go", deps=EljaDeps.from_settings(settings))
         assert len(turns) == 1

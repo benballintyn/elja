@@ -1,5 +1,8 @@
 """Tests for elja.compaction."""
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,7 +18,12 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from elja.compaction import _SUMMARY_PROMPT, build_compaction, extend_summary_prompt
+import elja
+from elja.compaction import (
+    build_compaction,
+    default_summary_prompt,
+    extend_summary_prompt,
+)
 from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
 
@@ -81,8 +89,32 @@ class TestSummaryPromptExtension:
 
     def test_the_installed_harness_prompt_still_carries_the_anchor(self) -> None:
         """Pins the dependency contract itself, not just the helper."""
-        assert "load_capability" in _SUMMARY_PROMPT
-        assert "## Key decisions" in _SUMMARY_PROMPT
+        assert "load_capability" in default_summary_prompt()
+        assert "## Key decisions" in default_summary_prompt()
+
+    def test_importing_elja_does_not_compute_the_prompt(self) -> None:
+        """A reworded harness prompt must not break ``import elja``.
+
+        The anchor check raises, so computing it at import turned a cosmetic
+        upstream string change into a total outage for a host that never touches
+        compaction. A subprocess, because this session has already computed it.
+        """
+        root = str(Path(elja.__file__).resolve().parent.parent)
+        probe = (
+            "import elja;"
+            "from elja.compaction import default_summary_prompt as f;"
+            "print(f.cache_info().currsize)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+            cwd=root,
+            env={**os.environ, "PYTHONPATH": root},
+        )
+        assert result.stdout.strip() == "0"
 
 
 class TestMaskingBehavior:

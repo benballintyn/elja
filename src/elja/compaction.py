@@ -26,6 +26,7 @@ call this out.
 """
 
 import inspect
+from functools import cache
 from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
@@ -82,9 +83,18 @@ def extend_summary_prompt(harness_default: str) -> str:
     return harness_default.replace(_ANCHOR, f"{_SKILLS_WARNING}{_ANCHOR}")
 
 
-_SUMMARY_PROMPT: str = extend_summary_prompt(
-    str(inspect.signature(SummarizingCompaction.__init__).parameters["summary_prompt"].default)
-)
+@cache
+def default_summary_prompt() -> str:
+    """elja's summary prompt: the harness default plus the skills warning.
+
+    Computed on first use rather than at import, so a reworded harness prompt
+    fails the caller who needs compaction instead of making ``import elja`` fail
+    for a host that never touches it. The harness pin is a range, so a patch
+    release can trigger it.
+    """
+    return extend_summary_prompt(
+        str(inspect.signature(SummarizingCompaction.__init__).parameters["summary_prompt"].default)
+    )
 
 
 def build_compaction(
@@ -147,7 +157,7 @@ def build_compaction(
                     preserve_first_user_message=True,
                     incremental=True,
                     model_settings=summarizer_model_settings,
-                    summary_prompt=_SUMMARY_PROMPT,
+                    summary_prompt=default_summary_prompt(),
                 ),
             ],
             target_tokens=cfg.target_tokens,
