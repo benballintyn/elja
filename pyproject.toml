@@ -47,7 +47,7 @@ ruff = "^0.15"
 mypy = "^1.14"
 pre-commit = "^4.0"
 types-pyyaml = "^6.0.12.20260815"
-pydantic-ai-slim = {version = ">=2.36,<3", extras = ["anthropic", "google"]}
+pydantic-ai-slim = {version = ">=2.53.0,<3", extras = ["anthropic", "google"]}
 
 [tool.ruff]
 line-length = 99
