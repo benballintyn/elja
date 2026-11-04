@@ -5,6 +5,9 @@ results is forced through compaction, and then every property a host depends on
 is checked — the write outcomes stay recoverable, no mutation rerun is
 solicited, pins survive, call/result pairing is valid, an unfittable protected
 floor does not silently drop it, and the summarizer is bounded.
+
+The bound's own mechanics — the budget, the prediction, the latch, the reset, the
+metering wrapper — are pinned in ``tests/test_compaction_bounds.py``.
 """
 
 import inspect
@@ -33,13 +36,29 @@ from pydantic_ai_harness.compaction import (
 )
 from pydantic_ai_harness.compaction._receipts import is_receipt_part
 
-from elja.compaction import CLEARED_PLACEHOLDER, build_compaction, default_summary_prompt
+from elja.compaction import (
+    CLEARED_PLACEHOLDER,
+    OnUnfit,
+    TargetUnreachable,
+    TargetUnreachableError,
+    build_compaction,
+    default_summary_prompt,
+)
 from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
 
 # A host's own wording: the evidence is in its store, not re-derivable by
 # repeating a write.
 HOST_PLACEHOLDER = "[result cleared; retrieve the saved evidence by its receipt id]"
+
+
+def _recording(reports: list[TargetUnreachable]) -> OnUnfit[object]:
+    """A gate that records the report and lets the request go — the host's choice."""
+
+    def gate(ctx: RunContext[object], report: TargetUnreachable) -> None:
+        reports.append(report)
+
+    return gate
 
 
 def _mixed_history(
@@ -240,11 +259,11 @@ class TestThePlaceholderIsTheHosts:
 
 class TestStructuralInvariants:
     @pytest.mark.parametrize(
-        ("target", "pinned", "summarizes", "pairs_survive"),
+        ("target", "pinned", "summarizes", "pairs_survive", "fits"),
         [
-            (3000, None, False, True),
-            (1000, None, True, False),
-            (3000, _GIANT_PIN, True, True),
+            (3000, None, False, True, True),
+            (1000, None, True, False, True),
+            (3000, _GIANT_PIN, True, True, False),
         ],
         ids=["masking-only", "summarizing-empties-the-tail", "summarizing-keeps-a-tail"],
     )
@@ -255,6 +274,7 @@ class TestStructuralInvariants:
         pinned: str | None,
         summarizes: bool,
         pairs_survive: bool,
+        fits: bool,
     ) -> None:
         """Neither tier leaves an orphaned call or return.
 
@@ -262,9 +282,14 @@ class TestStructuralInvariants:
         summarization alone the tool tail is emptied — 0 calls and 0 returns — and
         ``set() - set() == set()`` holds for every possible implementation, so that
         case certifies nothing about the summarizing tier. The third regime is the
-        one that asks it the question: a pin larger than the target forces
+        one that asks it the question: a pin just under the target forces
         summarization AND leaves the recent pairs standing. Measured across the
         three: 8/8 pairs, 0/0, 7/7.
+
+        The third is also the cannot-fit path — pin plus summary plus tail is over
+        target — so it runs with a gate that lets the request go, and asserts the
+        typed outcome arrived. Pairing has to hold there too: it is the request
+        that gets sent.
 
         The canary says *something* compacted; ``pairs_survive`` says whether there
         was anything left to pair. Both are needed, because round 1 of this PR's
@@ -272,9 +297,14 @@ class TestStructuralInvariants:
         """
         settings = _settings(tmp_path, target=target)
         history = _mixed_history(8, pinned=pinned)
-        views, roles = await _drive(settings, list(build_compaction(settings)), history)
+        reports: list[TargetUnreachable] = []
+        views, roles = await _drive(
+            settings, list(build_compaction(settings, on_unfit=_recording(reports))), history
+        )
         _assert_compaction_fired(views, history)
         assert ("summarizer" in roles) is summarizes, "this regime is not the one named"
+        assert (reports == []) is fits
+        assert all(report.reason == "no_progress" for report in reports)
         call_ids = set()
         return_ids = set()
         for message in views[0]:
@@ -291,28 +321,33 @@ class TestStructuralInvariants:
         assert return_ids - call_ids == set()
 
     @pytest.mark.parametrize(
-        ("target", "pin_text", "summarizes"),
+        ("target", "pin_text", "summarizes", "fits"),
         [
-            (3000, "NEVER DROP: tenant=acme, currency=USD", False),
-            (1000, "NEVER DROP: tenant=acme, currency=USD", True),
-            (3000, f"NEVER DROP: tenant=acme, currency=USD {_GIANT_PIN}", True),
+            (3000, "NEVER DROP: tenant=acme, currency=USD", False, True),
+            (1000, "NEVER DROP: tenant=acme, currency=USD", True, True),
+            (3000, f"NEVER DROP: tenant=acme, currency=USD {_GIANT_PIN}", True, False),
         ],
         ids=["masking-only", "summarizing", "summarizing-with-a-tail"],
     )
     async def test_a_pinned_part_survives_whichever_tiers_run(
-        self, tmp_path: Path, target: int, pin_text: str, summarizes: bool
+        self, tmp_path: Path, target: int, pin_text: str, summarizes: bool, fits: bool
     ) -> None:
         """ "Every tier" is a claim about the pair of cases, not about each one.
 
         A small pin at target=3000 never reaches the summarizing tier at all, so
         ``summarizes`` is asserted per case: it is what stops the parametrization
-        quietly collapsing to one regime after an estimator change upstream.
+        quietly collapsing to one regime after an estimator change upstream. The
+        last case cannot fit, and the pin survives on that path as well.
         """
         settings = _settings(tmp_path, target=target)
         history = _mixed_history(8, pinned=pin_text)
-        views, roles = await _drive(settings, list(build_compaction(settings)), history)
+        reports: list[TargetUnreachable] = []
+        views, roles = await _drive(
+            settings, list(build_compaction(settings, on_unfit=_recording(reports))), history
+        )
         _assert_compaction_fired(views, history)
         assert ("summarizer" in roles) is summarizes, "this regime is not the one named"
+        assert (reports == []) is fits
         pinned = [
             part
             for message in views[0]
@@ -325,17 +360,20 @@ class TestStructuralInvariants:
     async def test_protected_material_larger_than_the_target_is_kept_not_dropped(
         self, tmp_path: Path
     ) -> None:
-        """E4: do not silently drop protected material.
+        """E4: do not meet the target by silently dropping protected material.
 
-        There is no upstream "could not fit" signal, so the guarantee elja can
-        make is the one that matters: the pin survives even when it alone
-        exceeds the target.
+        The target is unreachable here, and the host is told so — typed, before the
+        request is sent. A host that chooses to send anyway sends the pin intact.
         """
         settings = _settings(tmp_path, target=1000)
         giant = "IRREDUCIBLE CONSTRAINT " * 500
         history = _mixed_history(8, pinned=giant)
-        views, _ = await _drive(settings, list(build_compaction(settings)), history)
+        reports: list[TargetUnreachable] = []
+        views, _ = await _drive(
+            settings, list(build_compaction(settings, on_unfit=_recording(reports))), history
+        )
         _assert_compaction_fired(views, history)
+        assert [report.reason for report in reports] == ["protected_floor"]
         assert "IRREDUCIBLE CONSTRAINT" in _rendered(views)
         pinned = [
             part
@@ -345,24 +383,38 @@ class TestStructuralInvariants:
         ]
         assert len(pinned) == 1
 
+    async def test_by_default_nothing_is_sent_over_target(self, tmp_path: Path) -> None:
+        """No gate means the request never leaves: a typed error, not a silent send."""
+        settings = _settings(tmp_path, target=1000)
+        history = _mixed_history(8, pinned="IRREDUCIBLE CONSTRAINT " * 500)
+        with pytest.raises(TargetUnreachableError) as raised:
+            await _drive(settings, list(build_compaction(settings)), history)
+        assert raised.value.report.reason == "protected_floor"
 
-class TestAnOversizedPinIsNotBounded:
-    """The cost of the pin guarantee, measured rather than claimed safe.
 
-    Re-injection happens AFTER the tail is trimmed, so ``keep_tokens`` cannot
-    bound a pin. When the pinned text's own estimate exceeds ``target_tokens``
-    the post-compaction estimate never falls to target and the summarizing tier
-    fires again on every model request for the rest of the run.
+class TestAnOversizedFloorIsBounded:
+    """The issue's three shapes of irreducible content, each over a six-step turn.
+
+    Before the bound, each of these paid for a summary before EVERY request — six
+    summarizer calls over six requests, one-to-one and unbounded — because
+    re-injection and first-message preservation happen after the tail is trimmed, so
+    ``keep_tokens`` could not bound them. Now the protected floor is measured before
+    paying: with no gate the run stops at the first request with a typed outcome and
+    zero summarizer requests; with a gate that proceeds, the turn completes having
+    paid for at most the configured number.
     """
 
-    async def _summarizer_calls_over_a_multi_step_turn(
+    STEPS = 6
+
+    async def _turn(
         self,
         tmp_path: Path,
-        pinned: str | None,
-        steps: int,
         *,
+        pinned: str | None = None,
         first_message: str = "original task: reconcile the ledger",
+        system_prompt: str | None = None,
         preserve_first_user_message: bool = True,
+        on_unfit: OnUnfit[EljaDeps] | None = None,
     ) -> tuple[int, int]:
         settings = _settings(tmp_path, target=1000)
         toolset: FunctionToolset[EljaDeps] = FunctionToolset()
@@ -380,7 +432,7 @@ class TestAnOversizedPinIsNotBounded:
                 roles.append("summarizer")
                 return ModelResponse(parts=[TextPart(content="## Intent\nledger")])
             requests.append(1)
-            if len(requests) < steps:
+            if len(requests) < self.STEPS:
                 return ModelResponse(parts=[ToolCallPart(tool_name="ping", args={})])
             return ModelResponse(parts=[TextPart(content="ok")])
 
@@ -389,81 +441,102 @@ class TestAnOversizedPinIsNotBounded:
             deps_type=EljaDeps,
             toolsets=[toolset],
             capabilities=build_compaction(
-                settings, preserve_first_user_message=preserve_first_user_message
+                settings,
+                preserve_first_user_message=preserve_first_user_message,
+                on_unfit=on_unfit,
             ),
         )
         history = _mixed_history(8, pinned=pinned)
-        history[0] = ModelRequest(parts=[UserPromptPart(content=first_message)])
-        await agent.run(
-            "carry on",
-            message_history=history,
-            deps=EljaDeps.from_settings(settings),
-        )
+        # Policy where `Agent(system_prompt=...)` leaves it in caller-owned history:
+        # inside the first request, ahead of the user's prompt.
+        policy = [SystemPromptPart(content=system_prompt)] if system_prompt else []
+        history[0] = ModelRequest(parts=[*policy, UserPromptPart(content=first_message)])
+        try:
+            await agent.run(
+                "carry on",
+                message_history=history,
+                deps=EljaDeps.from_settings(settings),
+            )
+        finally:
+            self.roles = roles
         return len(requests), roles.count("summarizer")
 
+    # The issue's three shapes: an oversized pin, a large preserved first message
+    # with no pin anywhere, and protected system policy (`Agent(system_prompt=...)`).
+    SHAPES = pytest.mark.parametrize(
+        "shape",
+        [
+            {"pinned": "IRREDUCIBLE CONSTRAINT " * 500},
+            {"first_message": "TASK BRIEF " * 2000},
+            {"system_prompt": "POLICY: never disclose tenant ids. " * 200},
+        ],
+        ids=["oversized-pin", "large-first-message", "protected-system-policy"],
+    )
+
     @pytest.mark.parametrize("pinned", [None, "NEVER DROP: tenant=acme"])
-    async def test_an_ordinary_history_summarizes_once_per_turn(
+    async def test_an_ordinary_history_still_summarizes_once_per_turn(
         self, tmp_path: Path, pinned: str | None
     ) -> None:
-        """The control: keep_tokens does its job when the pin fits."""
-        requests, summarizations = await self._summarizer_calls_over_a_multi_step_turn(
-            tmp_path, pinned, steps=6
+        """The positive control: compaction runs, fits, and reports nothing."""
+        reports: list[TargetUnreachable] = []
+        requests, summarizations = await self._turn(
+            tmp_path, pinned=pinned, on_unfit=_recording(reports)
         )
-        assert requests == 6
+        assert requests == self.STEPS
         assert summarizations == 1
+        assert reports == []
 
-    async def test_a_pin_larger_than_the_target_summarizes_once_per_request(
-        self, tmp_path: Path
+    @SHAPES
+    async def test_by_default_the_run_stops_before_paying_for_a_futile_summary(
+        self, tmp_path: Path, shape: dict[str, str]
     ) -> None:
-        """Unbounded, and elja does not yet bound it.
+        """No gate: a typed outcome at the first request, and nothing spent."""
+        with pytest.raises(TargetUnreachableError) as raised:
+            await self._turn(tmp_path, **shape)  # type: ignore[arg-type]
+        assert self.roles == [], "a summary was paid for, or the request was sent"
+        report = raised.value.report
+        assert report.reason == "protected_floor"
+        assert report.protected_tokens > report.target_tokens == 1000
+        assert report.estimated_tokens >= report.protected_tokens
+        assert (report.summarizer_requests, report.max_summarizer_requests) == (0, 3)
+        assert report.occurrence == 1
 
-        Written in the direction that documents the real behaviour rather than
-        the behaviour E4 asks for, so the gap is visible instead of implied. A
-        fix needs a latch that refuses to re-enter the summarizing tier once it
-        has failed to reach target; when that lands, this test changes with it.
-        """
-        requests, summarizations = await self._summarizer_calls_over_a_multi_step_turn(
-            tmp_path, "IRREDUCIBLE CONSTRAINT " * 500, steps=6
-        )
-        assert requests == 6
-        assert summarizations == requests
-
-    async def test_a_large_first_message_does_it_too_with_no_pin_anywhere(
-        self, tmp_path: Path
+    @SHAPES
+    async def test_a_host_that_proceeds_pays_for_at_most_the_budget(
+        self, tmp_path: Path, shape: dict[str, str]
     ) -> None:
-        """The realistic shape of the same failure, and the one the docs missed.
+        """Proceeding: every over-target request is reported, the summarizer is bounded.
 
-        A pin is something a host opts into. The first user message is something elja
-        preserves on the host's behalf, so a server-side agent whose first message is
-        a task brief, a ticket body or a pasted document reaches the unbounded
-        summarizer with no pin anywhere — having followed the advice exactly.
-        Measured: 1 summarizer call over 6 requests with a short first message, 6
-        with a 20k-character one.
+        Measured: at most one summary over the six requests — it shrinks the
+        reducible history once, and the run never re-summarizes the summary — where
+        the unbounded version paid for six.
         """
-        requests, summarizations = await self._summarizer_calls_over_a_multi_step_turn(
-            tmp_path, None, steps=6, first_message="TASK BRIEF " * 2000
-        )
-        assert requests == 6
-        assert summarizations == requests
-
-    async def test_turning_off_first_message_preservation_is_the_escape(
-        self, tmp_path: Path
-    ) -> None:
-        """Which is why the knob is exposed rather than hard-coded.
-
-        Same oversized first message, same target, one argument different: back to one
-        summarizer call for the whole turn. A host that takes this should carry the
-        task in its own instructions, where compaction cannot reach it.
-        """
-        requests, summarizations = await self._summarizer_calls_over_a_multi_step_turn(
+        reports: list[TargetUnreachable] = []
+        requests, summarizations = await self._turn(
             tmp_path,
-            None,
-            steps=6,
+            on_unfit=_recording(reports),
+            **shape,  # type: ignore[arg-type]
+        )
+        assert requests == self.STEPS
+        assert summarizations <= 1 < self.STEPS
+        assert summarizations <= reports[0].max_summarizer_requests
+        # Every request went out over target, so every one was put to the gate —
+        # nothing over target is sent without it being asked.
+        assert [report.occurrence for report in reports] == list(range(1, self.STEPS + 1))
+        assert {report.reason for report in reports} == {"protected_floor"}
+
+    async def test_turning_off_first_message_preservation_still_fits(self, tmp_path: Path) -> None:
+        """The knob still works: the large message is summarizable, so the turn fits."""
+        reports: list[TargetUnreachable] = []
+        requests, summarizations = await self._turn(
+            tmp_path,
             first_message="TASK BRIEF " * 2000,
             preserve_first_user_message=False,
+            on_unfit=_recording(reports),
         )
-        assert requests == 6
+        assert requests == self.STEPS
         assert summarizations == 1
+        assert reports == []
 
 
 class TestSummarizerComposition:
@@ -624,14 +697,22 @@ class TestRetentionKnobsActuallyRetain:
             result = await agent.run(f"turn{turn}", message_history=history, deps=deps)
             # Re-inflate with fresh bulk so a second boundary is crossed.
             history = [*result.all_messages(), *_mixed_history(20)[1:]]
-        assert len(summarizer_prompts) >= 2, "only one summarization; nothing to be incremental"
-        # The SECOND call, which is exactly what the flag does: it receives the
-        # first summary instead of rewriting from scratch. Asserting on the LAST
-        # call would pin an upstream defect as the contract — with caller-owned
-        # history the summaries accumulate and _extract_previous_summary returns
-        # the oldest, so the third call is still anchored on summary 1.
+        assert len(summarizer_prompts) >= 3, "too few summarizations to see the anchor move"
+        # The SECOND call is what the flag does: it receives the first summary
+        # instead of rewriting from scratch.
         assert "<previous-summary>" in summarizer_prompts[1]
         assert "summary 1" in summarizer_prompts[1]
+        # And every later call is anchored on the summary just before it. Upstream
+        # alone gets this wrong with caller-owned history: summaries accumulate in
+        # the preserved first request and `_extract_previous_summary` returns the
+        # oldest, so the third call used to be anchored on summary 1. elja drops a
+        # superseded summary once its replacement is written, so there is only ever
+        # one to find.
+        assert len(summarizer_prompts) < 10, "single-digit labels keep the matches exact"
+        for index in range(2, len(summarizer_prompts)):
+            anchor = summarizer_prompts[index].split("<previous-summary>", 1)[1]
+            assert f"summary {index}" in anchor
+            assert f"summary {index - 1}" not in anchor
 
 
 class TestReportingOrder:
@@ -974,21 +1055,27 @@ class TestTheFormatSpecReaderIsGeneralOnPurpose:
         assert _substitutes_whole_transcript(prompt) is whole
 
 
-class TestASystemPromptInHistoryGrowsWithEachCompaction:
-    """The third irreducible source, pinned by its direction rather than a figure.
+class TestASystemPromptInHistoryDoesNotGrow:
+    """The third irreducible source, which used to GROW, held to a single copy.
 
     `Agent(system_prompt=...)` puts a `SystemPromptPart` *into* the first request, i.e.
-    into history — unlike `instructions=`, which lives outside it. The harness then copies
-    every leading system part into the summary message on each compaction while
-    `preserve_first_user_message` keeps the original request carrying it too, so copies
-    accumulate. The *rate* is configuration-dependent (one per compaction in this setup,
-    two in others), which is exactly why this asserts the direction: a policy that starts
-    under `target_tokens` reaches the unbounded-summarizer regime by growth alone.
+    into history — unlike `instructions=`, which lives outside it. The harness copies
+    every leading system part into its new summary message, `preserve_first_user_message`
+    keeps the original request too, and pydantic-ai merges consecutive requests when the
+    history is replayed — so the next "first request" also held the previous summary and
+    copy, and the harness preserved all of it again. Before the fix this measured one more
+    policy copy per compacting turn, strictly increasing, until a policy that started under
+    target reached the unbounded regime by growth alone.
+
+    elja now removes what compaction manufactured after each summary: exact copies of a
+    system part (the first, leading one is kept) and summaries a newer one superseded.
     """
 
     POLICY = "POLICY: never disclose tenant ids. " * 10
 
-    async def _copies_per_turn(self, tmp_path: Path, *, preserve: bool) -> tuple[list[int], int]:
+    async def _per_turn(
+        self, tmp_path: Path, *, preserve: bool
+    ) -> tuple[list[int], list[int], list[list[str]], int]:
         settings = _settings(tmp_path, target=1000)
         summarizations = 0
 
@@ -996,7 +1083,9 @@ class TestASystemPromptInHistoryGrowsWithEachCompaction:
             nonlocal summarizations
             if "summarization assistant" in (info.instructions or ""):
                 summarizations += 1
-                return ModelResponse(parts=[TextPart(content="## Intent\nledger")])
+                return ModelResponse(
+                    parts=[TextPart(content=f"## Intent\nledger {summarizations}")]
+                )
             return ModelResponse(parts=[TextPart(content="ok")])
 
         agent: Agent[EljaDeps, str] = Agent(
@@ -1007,32 +1096,89 @@ class TestASystemPromptInHistoryGrowsWithEachCompaction:
         )
         deps = EljaDeps.from_settings(settings)
         history: list[ModelMessage] | None = None
-        counts: list[int] = []
-        for _ in range(4):
-            result = await agent.run("carry on", message_history=history, deps=deps)
+        policies: list[int] = []
+        summaries: list[int] = []
+        prompts: list[list[str]] = []
+        for turn in range(5):
+            result = await agent.run(f"turn {turn}", message_history=history, deps=deps)
             messages = result.all_messages()
-            counts.append(
+            parts = [part for message in messages for part in message.parts]
+            policies.append(
                 sum(
                     1
-                    for message in messages
-                    for part in message.parts
+                    for part in parts
                     if isinstance(part, SystemPromptPart) and part.content.startswith("POLICY")
                 )
             )
+            summaries.append(
+                sum(
+                    1
+                    for part in parts
+                    if isinstance(part, SystemPromptPart) and part.content.startswith("Summary")
+                )
+            )
+            prompts.append(
+                [
+                    part.content
+                    for part in parts
+                    if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+                ]
+            )
             history = [*messages, *_mixed_history(8)]
-        return counts, summarizations
+        return policies, summaries, prompts, summarizations
 
-    async def test_copies_accumulate_while_compaction_fires(self, tmp_path: Path) -> None:
-        counts, summarizations = await self._copies_per_turn(tmp_path, preserve=True)
-        assert summarizations >= 2, "compaction did not fire; the measurement is the wrong one"
-        # Strictly increasing, which is the unbounded part. The rate is not asserted
-        # because it moves with target_tokens and the history's shape.
-        assert counts == sorted(counts)
-        assert counts[-1] > counts[0]
-
-    async def test_turning_off_first_message_preservation_stops_the_growth(
-        self, tmp_path: Path
+    @pytest.mark.parametrize("preserve", [True, False], ids=["preserving", "not-preserving"])
+    async def test_one_policy_copy_and_one_summary_however_many_compactions(
+        self, tmp_path: Path, preserve: bool
     ) -> None:
-        counts, summarizations = await self._copies_per_turn(tmp_path, preserve=False)
-        assert summarizations >= 2, "compaction did not fire; the measurement is the wrong one"
-        assert counts[-1] == counts[0], counts
+        policies, summaries, _, summarizations = await self._per_turn(tmp_path, preserve=preserve)
+        assert summarizations >= 3, "compaction did not keep firing; the measurement is vacuous"
+        assert policies == [1] * len(policies)
+        assert summaries == [0] + [1] * (len(summaries) - 1)
+
+    async def test_the_policy_still_leads_the_conversation(self, tmp_path: Path) -> None:
+        """Provenance: the kept copy is the original part, and it comes first."""
+        settings = _settings(tmp_path, target=1000)
+        seen: list[list[ModelMessage]] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if "summarization assistant" in (info.instructions or ""):
+                return ModelResponse(parts=[TextPart(content="## Intent\nledger")])
+            seen.append(messages)
+            return ModelResponse(parts=[TextPart(content="ok")])
+
+        agent: Agent[EljaDeps, str] = Agent(
+            FunctionModel(script),
+            deps_type=EljaDeps,
+            system_prompt=self.POLICY,
+            capabilities=build_compaction(settings),
+        )
+        deps = EljaDeps.from_settings(settings)
+        first = await agent.run("turn 0", deps=deps)
+        (original,) = [
+            part
+            for message in first.all_messages()
+            for part in message.parts
+            if isinstance(part, SystemPromptPart)
+        ]
+        history = [*first.all_messages(), *_mixed_history(8)]
+        for turn in range(1, 3):
+            result = await agent.run(f"turn {turn}", message_history=history, deps=deps)
+            history = [*result.all_messages(), *_mixed_history(8)]
+        leading = seen[-1][0].parts[0]
+        assert leading == original
+
+    async def test_no_user_prompt_is_ever_removed(self, tmp_path: Path) -> None:
+        """Only compaction's own copies go: every prompt the user wrote is still there.
+
+        These ARE protected-content growth — pydantic-ai merges each compacted turn's
+        prompt into the preserved first request on replay — but they are distinct
+        messages the user wrote, not copies, so they are kept and the floor
+        measurement counts them instead.
+        """
+        _, _, prompts, summarizations = await self._per_turn(tmp_path, preserve=True)
+        assert summarizations >= 3
+        for turn, kept in enumerate(prompts):
+            assert [f"turn {n}" for n in range(turn + 1)] == [
+                p for p in kept if p.startswith("turn")
+            ]

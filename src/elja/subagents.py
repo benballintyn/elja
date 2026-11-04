@@ -20,7 +20,7 @@ from pydantic_ai.tools import ToolFuncEither
 from pydantic_ai.toolsets import FunctionToolset
 
 from elja.application import build_application_agent
-from elja.compaction import build_compaction
+from elja.compaction import build_compaction, proceed_over_target
 from elja.deps import EljaDeps, notify
 from elja.model import build_model
 from elja.permissions import build_permission_gate
@@ -112,7 +112,10 @@ def _make_delegate(
         deps_type=EljaDeps,
         instructions=cfg.instructions,
         toolsets=[_child_toolset(settings, name, cfg)],
-        capabilities=[*build_compaction(settings), build_permission_gate(settings)],
+        capabilities=[
+            *build_compaction(settings, on_unfit=proceed_over_target),
+            build_permission_gate(settings),
+        ],
     )
 
     async def delegate(ctx: RunContext[EljaDeps], task: str) -> str:

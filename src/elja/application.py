@@ -27,10 +27,14 @@ elja's own pieces remain available, by opting in rather than by default:
   no workspace, so the recovery route does not exist. Pass your own wording —
   ``build_compaction(settings, cleared_placeholder="... retrieve the saved
   result ...")`` — and put any ``ReportContextUsage`` *after* compaction in the
-  list, or it measures a request that was never sent. If you replace the policy
-  wholesale instead, copy ``build_compaction``'s body rather than the upstream
-  defaults — in particular its ``keep_tokens``, without which an irreducible
-  tail above the target re-fires a **paid** summarizer call on every request.
+  list, or it measures a request that was never sent. By default a request
+  compaction cannot bring under its target is not sent at all: it raises
+  :class:`~elja.compaction.TargetUnreachableError`, typed, carrying a report —
+  pass ``on_unfit=`` to decide otherwise. If you replace the policy wholesale
+  instead, copy ``build_compaction``'s body rather than the upstream defaults —
+  its ``keep_tokens``, and above all :class:`~elja.compaction.BoundedTieredCompaction`
+  rather than upstream's ``TieredCompaction``, which re-fires a **paid** summarizer
+  call on every request once protected content exceeds the target.
 - **Skills**: ``capabilities=load_skills(settings)`` if you want markdown
   skills; that one does read a directory, which is why it is not implicit.
 - **Permissions**: :class:`~elja.permissions.PermissionGate` reads

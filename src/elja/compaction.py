@@ -21,7 +21,7 @@ Strategy (see the project's compaction research, 2026-08):
 pydantic-ai, so they are never subject to compaction. A **system prompt** is a
 different matter and the distinction is load-bearing: ``Agent(system_prompt=...)``
 puts a ``SystemPromptPart`` *into* the first request, i.e. into history, where
-compaction does see it — and duplicates it (see "irreducible content" below).
+compaction does see it and has to keep it (see "protected content" below).
 Loaded skill BODIES, however, travel as tool returns inside history: if the
 summarization tier drops a load, the skill silently unloads (the catalog
 survives, so the model can re-load it) — the summary prompt is extended to
@@ -42,9 +42,13 @@ a server:
   the model knows its memory of earlier work is secondhand. With a capability
   implementing the harness's ``TranscriptHandleProvider`` protocol attached, the
   receipt also carries a handle for the persisted transcript.
+- ``on_unfit`` decides what happens to a request compaction cannot bring under
+  the target: ``None`` raises :class:`TargetUnreachableError`, a gate that returns
+  sends it. See "The summarizer is bounded" below.
 - Replacing the policy wholesale is always available: pass your own
-  ``TieredCompaction``/``ClearToolResults``/``SummarizingCompaction`` as
-  ``capabilities=`` instead of calling this factory at all.
+  ``BoundedTieredCompaction`` with your own tiers as ``capabilities=`` instead of
+  calling this factory. Upstream's plain ``TieredCompaction`` works too, and has no
+  bound.
 
 **Ordering matters, and it is list order.** None of these capabilities declare
 an ordering, so ``ReportContextUsage`` measures whatever the capabilities before
@@ -55,69 +59,96 @@ before it ~6k, for the same run — a six-fold difference in what the host is
 shown. Put reporting last.
 
 **What survives, verified rather than assumed.** Pinned parts
-(``pydantic_ai_harness.compaction.pin``) survive every tier, because
-``TieredCompaction`` re-injects them after each one. Tool call/result pairing
-stays valid across both tiers. There is no upstream signal for "the target could
-not be reached": nothing is silently dropped, but a host that needs to know
-should compare a post-compaction ``ReportContextUsage`` reading against its own
-target.
+(``pydantic_ai_harness.compaction.pin``) survive every tier, because the
+orchestrator re-injects them after each one. Tool call/result pairing stays valid
+across both tiers. The current request, the first user message (when preserved),
+leading system policy and every part's own metadata survive too — on the path where
+compaction fits the target and on the one where it cannot.
 
-**Keep every piece of irreducible content well under the target.** This is the
-one cost rule that matters, and it is about *any* content compaction cannot reduce
-— not only a pin. If what survives every tier is itself larger than
-``target_tokens``, the post-compaction estimate can never fall to target and the
-summarizing tier fires again on **every** model request for the rest of the run,
-one paid LLM call each. Measured over a six-step turn: one summarizer call in the
-ordinary case, **six** when something irreducible exceeds target — one-to-one with
-requests, and unbounded.
+**The summarizer is bounded, and "cannot fit" is typed.** Some content no tier may
+remove: instructions and tool definitions, leading system policy, the first user
+message (``preserve_first_user_message``, on by default because dropping the
+original task is how a long run forgets what it was asked to do), pins, and the
+current request. Upstream re-injects or preserves all of it *after* the tail is
+trimmed, so ``keep_tokens`` cannot bound it, and when it alone exceeds
+``target_tokens`` the estimate can never reach target. Before 0.6 the summarizing
+tier then fired again on every model request for the rest of the run — six paid
+calls over a six-step turn, one-to-one and unbounded. :class:`BoundedTieredCompaction`
+replaces that with four rules:
 
-Three things are irreducible, and the ones a host trips over are the last two:
+- at most ``CompactionConfig.max_summarizer_requests`` summarizer requests per run,
+  counted at the model so a retry inside the summarizer counts too;
+- no summary is paid for when that protected floor alone exceeds the target —
+  measured first, reported as ``protected_floor``;
+- a summary that ends over target latches the run into overflow mode, where the
+  summarizer runs again only once the summarizable remainder exceeds a whole target
+  — reported as ``no_progress``;
+- every request that would go out over target is put to ``on_unfit`` with a
+  :class:`TargetUnreachable` report. With no gate that raises
+  :class:`TargetUnreachableError`, so nothing is sent over target unless the host
+  said so. ``elja chat`` passes :func:`proceed_over_target`, a status line and send.
 
-- **A pin.** Re-injection happens *after* the tail is trimmed, so ``keep_tokens``
-  cannot bound it.
-- **The first user message**, which elja preserves on the host's behalf —
-  ``preserve_first_user_message``, on by default because dropping the original task
-  is how a long run forgets what it was asked to do. A server-side agent whose first
-  message is a task brief, a ticket body or a pasted document reaches this with no
-  pin anywhere. Measured: a 20k-character first user message at
-  ``target_tokens=1000`` gives six summarizer calls over six requests, and the same
-  turn with ``preserve_first_user_message=False`` gives one.
-- **A ``SystemPromptPart`` sitting in caller-owned history**, which is what
-  ``Agent(system_prompt=...)`` produces. This one *grows*: ``_extract_system_prompts``
-  copies every leading system part into the summary message on each compaction, and
-  ``preserve_first_user_message`` keeps the original request carrying it as well, so
-  each compaction leaves more copies for the next one to find. The rate is
-  configuration-dependent — one more copy per compaction in one measured setup, two in
-  another — so the number to rely on is the direction, not a figure: **copies grow
-  without bound while compaction keeps firing, and stop growing with
-  ``preserve_first_user_message=False``**. A policy that starts comfortably under
-  target therefore reaches the unbounded regime by growth alone.
+All of that state is per run; a new run starts fresh. The target is a *soft*
+compaction target, never the provider's input limit — the report carries the
+model's window separately, when it can be resolved.
 
-Remedies, in order of preference. **Carry policy in ``instructions=``, not
-``system_prompt=``** — instructions live outside message history, so compaction never
-sees them and nothing accumulates. (elja's own paths use ``instructions=``, which is
-why the CLI never hits this.) Failing that, ``preserve_first_user_message=False``
-stops the *growth* but does not help a single copy that is already above target; for
-that, raise ``target_tokens`` above it. elja does not *bound* any of this; doing so
-needs a latch that refuses to re-enter the summarizing tier once it has failed to
-reach target, which is not built.
+**Protected content no longer grows.** A ``SystemPromptPart`` in caller-owned
+history (what ``Agent(system_prompt=...)`` produces) used to multiply: the harness
+copies leading system parts into each new summary message, first-message
+preservation keeps the original too, and pydantic-ai merges consecutive requests on
+replay, so each compacting turn left one more policy copy and one more stale summary
+for the next to preserve. elja now removes exactly those copies after each summary
+(:func:`_drop_compaction_copies`) and never touches a user-authored message. What
+still accumulates, by design, is the user's own prompts: pydantic-ai's merge folds
+each compacted turn's prompt into the preserved first request, and they are real
+messages, so they stay — the floor measurement counts them.
+
+Remedies when the floor is the problem, in order of preference. **Carry policy in
+``instructions=``, not ``system_prompt=``** — it is still protected (it is sent on
+every request), but it lives outside history, so nothing about it can accumulate.
+(elja's own paths use ``instructions=``.) For a large first message, raise
+``target_tokens`` or pass ``preserve_first_user_message=False`` and carry the task in
+the instructions. For a pin, keep pinned sets small; a pin is the host's own choice
+of what is irreducible.
 """
 
 import inspect
 import re
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from functools import cache
 from string import Formatter
-from typing import Any
+from typing import Any, Literal, TypeGuard, TypeVar
 
+from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.models import Model
+from pydantic_ai.exceptions import AgentRunError
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    SystemPromptPart,
+    TextContent,
+    UserPromptPart,
+)
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters, StreamedResponse
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.usage import RequestUsage
 from pydantic_ai_harness.compaction import (
     ClearToolResults,
     SummarizingCompaction,
     TieredCompaction,
+    estimate_context_tokens,
+    estimate_token_count,
+    is_pinned,
+    reinject_pinned,
+    resolve_context_window,
 )
 
+from elja.deps import notify
 from elja.settings import EljaSettings
 
 CLEARED_PLACEHOLDER = (
@@ -299,6 +330,646 @@ def check_summary_prompt(summary_prompt: str) -> None:
     )
 
 
+# --- Bounded compaction ------------------------------------------------------------
+#
+# Upstream's `TieredCompaction` stops escalating when the history fits and otherwise
+# returns what its last tier produced. Nothing remembers that the summarizing tier
+# already failed, so a history whose irreducible part exceeds the target pays for a
+# summary before every model request of the run. Everything below exists to make that
+# impossible, without a second agent loop: it is the same orchestrator, with a budget,
+# a prediction, a latch, and a typed way to say "this cannot fit".
+
+DepsT = TypeVar("DepsT")
+
+UnfitReason = Literal["protected_floor", "no_progress", "budget_exhausted"]
+"""Why compaction could not bring a request under ``target_tokens``.
+
+- ``protected_floor``: the content no tier may remove is itself larger than the target.
+  Detected *before* any summarizer request is paid for.
+- ``no_progress``: a summary was written this run and the request still does not fit, so
+  the run is in overflow mode (see :class:`BoundedTieredCompaction`); or there is no
+  summarizing tier and the free tiers cannot reach the target.
+- ``budget_exhausted``: the run has spent its ``max_summarizer_requests``.
+"""
+
+# The harness's own markers, spelled out rather than imported from its private modules,
+# so a harness patch that moves them cannot make `import elja` fail. Each one is pinned
+# against the harness's real behavior in tests/test_compaction_bounds.py, so drift fails
+# CI instead of quietly changing what counts as protected.
+_SUMMARY_PREFIX = "Summary of previous conversation:\n\n"
+_RECEIPT_METADATA = "pydantic-ai-harness.compaction.receipt.v1"
+
+
+@dataclass(frozen=True)
+class TargetUnreachable:
+    """A typed report that compaction cannot bring this request under its target.
+
+    **This is about a soft target, not a hard limit.** ``target_tokens`` is elja's
+    compaction target (``CompactionConfig.target_tokens``), chosen well below any real
+    context window. Exceeding it costs prefill time and quality, not a refused request.
+    The provider's input limit is ``window_tokens`` when pydantic-ai can resolve it, and
+    elja never claims to know it otherwise. A host deciding whether a request is safe to
+    send compares ``estimated_tokens`` with that, not with the target.
+
+    Every number is an *estimate*, in the same units the target is compared against:
+    provider-reported usage where the history carries it (``anchored``), the harness's
+    characters-per-token heuristic where it does not.
+    """
+
+    reason: UnfitReason
+    """Why the target cannot be met. See :data:`UnfitReason`."""
+
+    target_tokens: int
+    """The soft target compaction was aiming for."""
+
+    estimated_tokens: int
+    """The request's estimate when compaction gave up on it.
+
+    For ``protected_floor`` this is measured before the summarizing tier, because the
+    report is made before paying for a summary. A host that returns from
+    ``on_unfit`` may still get one summary that shrinks the request further, so the
+    request actually sent is at most this; a ``ReportContextUsage`` placed after
+    compaction reads the exact figure.
+    """
+
+    protected_tokens: int
+    """What no tier may remove: instructions and tool definitions, leading system
+    policy, the first user message when it is preserved, pins, and the current
+    request. A summary cannot make the request smaller than this."""
+
+    summarizer_requests: int
+    """Summarizer requests dispatched in this run. One refused at the budget is not
+    counted: it was never sent, so it cost nothing."""
+
+    max_summarizer_requests: int
+    """The run's budget (``CompactionConfig.max_summarizer_requests``)."""
+
+    occurrence: int
+    """1 for the first unreachable report in a run, 2 for the next, and so on. A gate
+    that should act once per run (a status line, a log entry) checks for 1."""
+
+    anchored: bool
+    """Whether the estimates rest on provider-reported usage rather than the heuristic."""
+
+    window_tokens: int | None
+    """The request model's context window, when pydantic-ai can resolve it; else None."""
+
+    def describe(self) -> str:
+        """One line for a log or a status display."""
+        why = {
+            "protected_floor": (
+                f"its protected content alone is ~{self.protected_tokens} tokens "
+                "(instructions, system policy, the first user message, pins and the "
+                "current request)"
+            ),
+            "no_progress": "a summary this run could not bring it under",
+            "budget_exhausted": (
+                f"this run has spent its {self.max_summarizer_requests} summarizer requests"
+            ),
+        }[self.reason]
+        window = (
+            f"; the model's window is {self.window_tokens}"
+            if self.window_tokens is not None
+            else ""
+        )
+        return (
+            f"context ~{self.estimated_tokens} tokens is over the compaction target of "
+            f"{self.target_tokens}: {why}{window}"
+        )
+
+
+class TargetUnreachableError(AgentRunError):
+    """Raised before a request is sent over the target, when no ``on_unfit`` gate is set.
+
+    The default, so nothing is sent over target without the host deciding it should
+    be. Carries the :class:`TargetUnreachable` report as ``report``; read that, not
+    the message.
+    """
+
+    def __init__(self, report: TargetUnreachable) -> None:
+        """Wrap a report."""
+        self.report = report
+        super().__init__(report.describe())
+
+
+OnUnfit = Callable[[RunContext[DepsT], TargetUnreachable], Awaitable[None] | None]
+"""A host's gate for a request compaction cannot fit: raise to stop, return to send."""
+
+
+async def proceed_over_target(ctx: RunContext[Any], report: TargetUnreachable) -> None:
+    """The convenience path's gate: say so once per run, then send the request.
+
+    Used by ``elja chat`` and by configured sub-agents, whose target is a conservative
+    fraction of a local model's window. It reports through ``deps.on_status`` when the
+    deps have one, which is where the CLI shows tool activity, and is otherwise silent
+    — so it is NOT the right gate for a host that must account for every over-target
+    request. Such a host passes its own, or none, to get :class:`TargetUnreachableError`.
+    """
+    if report.occurrence == 1:
+        notify(getattr(ctx.deps, "on_status", None), report.describe())
+
+
+@dataclass
+class _RunState:
+    """Everything the bound remembers, and only for one run."""
+
+    spent: int = 0
+    overflow: bool = False
+    reports: int = 0
+
+
+class _SummarizerBudgetSpentError(Exception):
+    """A summarizer request refused at the budget, before it reached the host's guard."""
+
+
+class _MeteredSummarizer(WrapperModel):
+    """Counts every request the summarizer makes, and refuses one past the budget.
+
+    The bound has to be on *requests*, not on summarization attempts: a summarizer
+    reply with no text makes pydantic-ai's private summary agent retry once, so one
+    attempt can be two paid requests. Wrapping the model the summarizer was going to
+    use anyway catches that retry and anything else upstream might add. It sits
+    *outside* the host's guard and delegates to it, so the guard still admits every
+    dispatch that happens, and a refused one never reaches the guard at all.
+    ``WrapperModel`` forwards settings, profile and request preparation, so what the
+    summarizer sends is unchanged.
+    """
+
+    def __init__(self, wrapped: Model, state: _RunState, limit: int) -> None:
+        """Meter ``wrapped`` against the run's ``state``."""
+        super().__init__(wrapped)
+        self._state = state
+        self._limit = limit
+
+    def _admit(self, *, spend: bool) -> None:
+        if self._state.spent >= self._limit:
+            raise _SummarizerBudgetSpentError
+        if spend:
+            self._state.spent += 1
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        """Spend one request from the budget, then delegate."""
+        self._admit(spend=True)
+        return await super().request(messages, model_settings, model_request_parameters)
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        """The streamed path spends from the same budget."""
+        self._admit(spend=True)
+        async with super().request_stream(
+            messages, model_settings, model_request_parameters, run_context
+        ) as stream:
+            yield stream
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """A pre-request count is refused once the budget is spent, and costs nothing."""
+        self._admit(spend=False)
+        return await super().count_tokens(messages, model_settings, model_request_parameters)
+
+
+def _is_summary(part: ModelRequestPart) -> TypeGuard[SystemPromptPart]:
+    """A summary the harness wrote, recognized by the prefix it writes with."""
+    return isinstance(part, SystemPromptPart) and part.content.startswith(_SUMMARY_PREFIX)
+
+
+def _is_harness_marker(part: ModelRequestPart) -> bool:
+    """A pin or a compaction receipt: user-role bookkeeping, not a user turn."""
+    return is_pinned(part) or (
+        isinstance(part, UserPromptPart)
+        and not isinstance(part.content, str)
+        and any(
+            isinstance(item, TextContent) and item.metadata == _RECEIPT_METADATA
+            for item in part.content
+        )
+    )
+
+
+def _leading_system_parts(messages: list[ModelMessage]) -> list[SystemPromptPart]:
+    """The system parts the summarizer copies into its summary message.
+
+    Mirrors the harness's ``_extract_system_prompts``: leading requests only, skipping
+    pins and receipts, stopping at the first summary or ordinary part.
+    """
+    parts: list[SystemPromptPart] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest):
+            break
+        for part in message.parts:
+            if isinstance(part, SystemPromptPart) and not _is_summary(part):
+                parts.append(part)
+            elif not _is_harness_marker(part):
+                return parts
+    return parts
+
+
+def _first_user_message(messages: list[ModelMessage]) -> ModelRequest | None:
+    """The request ``preserve_first_user_message`` keeps, as the harness finds it."""
+    for message in messages:
+        if isinstance(message, ModelRequest) and any(
+            isinstance(part, UserPromptPart) and not _is_harness_marker(part)
+            for part in message.parts
+        ):
+            return message
+    return None
+
+
+def _protected_floor(
+    messages: list[ModelMessage], *, preserve_first_user_message: bool
+) -> list[ModelMessage]:
+    """What survives every tier, as messages the estimator can measure.
+
+    A lower bound on any summarized result, not a guess: the summarizer keeps the
+    leading system parts, the first user message when preserving it, every pin (the
+    orchestrator re-injects them) and at least the last message, and adds a summary
+    on top. Each part is counted once — copies collapse, and superseded summaries are
+    dropped by :func:`_drop_compaction_copies` — and the latest instructions are
+    carried so the estimator counts them as it does for the real request.
+    """
+    first = _first_user_message(messages) if preserve_first_user_message else None
+    last = messages[-1]
+    candidates: list[ModelRequestPart] = [
+        *_leading_system_parts(messages),
+        *(first.parts if first is not None else []),
+        *(
+            part
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if is_pinned(part)
+        ),
+        *(last.parts if isinstance(last, ModelRequest) else []),
+    ]
+    kept: list[ModelRequestPart] = []
+    for candidate in candidates:
+        if not _is_summary(candidate) and not any(candidate == other for other in kept):
+            kept.append(candidate)
+    instructions = next(
+        (
+            message.instructions
+            for message in reversed(messages)
+            if isinstance(message, ModelRequest) and message.instructions
+        ),
+        None,
+    )
+    floor: list[ModelMessage] = [ModelRequest(parts=kept, instructions=instructions)]
+    # A response last only happens on the manual path; it is kept verbatim there too.
+    return [*floor, last] if isinstance(last, ModelResponse) else floor
+
+
+def _single_previous_summary(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Fold several earlier summaries into one, so the summarizer's anchor holds them all.
+
+    Histories written before :func:`_drop_compaction_copies` existed carry one summary
+    per compacting turn, merged into the preserved first request. The harness anchors
+    an incremental summary on the *last* one in document order, which is the oldest,
+    and drops the rest from the transcript it summarizes — so the newer summaries'
+    content would be lost the first time copies are dropped. Folding them, newest
+    first, into the first summary's place makes it the only anchor.
+    """
+    summaries = [
+        part
+        for message in messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if _is_summary(part)
+    ]
+    if len(summaries) < 2:
+        return messages
+    folded = replace(
+        summaries[0],
+        content=_SUMMARY_PREFIX
+        + "\n\n".join(part.content.removeprefix(_SUMMARY_PREFIX) for part in summaries),
+    )
+    result: list[ModelMessage] = []
+    for message in messages:
+        if isinstance(message, ModelRequest) and any(_is_summary(p) for p in message.parts):
+            parts = [
+                folded if part is summaries[0] else part
+                for part in message.parts
+                if not _is_summary(part) or part is summaries[0]
+            ]
+            message = replace(message, parts=parts)
+        result.append(message)
+    return result
+
+
+def _drop_compaction_copies(
+    before: list[ModelMessage], after: list[ModelMessage]
+) -> list[ModelMessage]:
+    """Remove what the summarizing tier copied, so protected content cannot grow.
+
+    The harness copies every leading system part into its new summary message, and
+    ``preserve_first_user_message`` keeps the original first request too. pydantic-ai
+    merges consecutive requests when a history is replayed, so on the next turn that
+    "first request" also holds the previous summary and the previous copy — and the
+    harness preserves all of it again. Each compaction left one more policy copy and
+    one more summary for the next to find.
+
+    Two rules, both limited to content compaction itself manufactured:
+
+    - **A system part appearing twice is a copy.** Only the first occurrence is kept,
+      which is the one leading the summary message, so policy still opens the
+      conversation. Matched by exact equality — content, timestamp and dynamic ref —
+      so two system parts that merely say the same thing are both kept.
+    - **A summary this compaction did not write is superseded.** The new summary was
+      written from it (as the incremental anchor, or from the transcript), so it is
+      dropped rather than preserved alongside its replacement.
+
+    User prompts, pins, receipts, tool parts and every message's own metadata are
+    never touched. A message left with no parts carried only copies and is dropped.
+    """
+    seen = {id(part) for message in before for part in message.parts}
+    if not any(
+        _is_summary(part) and id(part) not in seen
+        for message in after
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    ):
+        return after
+    policy: list[SystemPromptPart] = []
+    result: list[ModelMessage] = []
+    for message in after:
+        if not isinstance(message, ModelRequest):
+            result.append(message)
+            continue
+        parts: list[ModelRequestPart] = []
+        for part in message.parts:
+            if _is_summary(part) and id(part) in seen:
+                continue
+            if isinstance(part, SystemPromptPart) and not _is_summary(part):
+                if any(part == other for other in policy):
+                    continue
+                policy.append(part)
+            parts.append(part)
+        if len(parts) == len(message.parts):
+            result.append(message)
+        elif parts:
+            result.append(replace(message, parts=parts))
+    return result
+
+
+@dataclass
+class BoundedTieredCompaction(TieredCompaction[DepsT]):
+    """``TieredCompaction`` that cannot pay for summaries without limit.
+
+    The tiers run exactly as upstream's do, cheap to expensive, stopping once the
+    request fits ``target_tokens``. Four things are added, all of them about the
+    summarizing tier — the one that makes a paid request:
+
+    1. **A budget.** At most ``max_summarizer_requests`` summarizer requests per run,
+       counted at the model, so a hidden retry inside the summarizer counts too and is
+       refused before dispatch once the budget is spent.
+    2. **A prediction.** Before paying, the protected floor — what no tier may remove,
+       see :attr:`TargetUnreachable.protected_tokens` — is measured. If it alone
+       exceeds the target, a summary cannot help, and the gate is consulted before
+       anything is spent.
+    3. **A latch.** A summary that ends over the target puts the run in *overflow
+       mode*: further summaries happen only when the summarizable remainder (estimate
+       minus floor) exceeds a whole ``target_tokens`` — real progress, not a re-summary
+       of the summary on every request. A later request that compacts back under the
+       target leaves overflow mode. The floor-exceeded case behaves the same way.
+    4. **A gate.** Every request that would go out over the target is put to
+       ``on_unfit`` with a :class:`TargetUnreachable` report. ``None`` (the default)
+       raises :class:`TargetUnreachableError`; a gate that returns lets the request go
+       as compacted, and a gate that raises stops the run with its own exception.
+
+    **Scope of the state.** All of it is per run: ``for_run`` hands each run a fresh
+    copy, so the budget, the latch and the report count reset when a new run starts,
+    and two concurrent runs of one agent cannot see each other's. A manual
+    ``compact_now`` call is its own run. Nesting this as a tier of another
+    orchestrator makes each of its compactions a run.
+
+    After each summary, copies the harness manufactured are removed (see
+    :func:`_drop_compaction_copies`), so protected content does not grow turn by turn.
+
+    Only ``SummarizingCompaction`` tiers given directly are metered, and their
+    ``model`` must be ``None`` (inherit the request's model) or a ``Model`` instance:
+    a model *name* would make the summarizer build its own client, outside the bound.
+    """
+
+    max_summarizer_requests: int = field(default=3, kw_only=True)
+    """Paid summarizer requests allowed per run. 0 means masking only."""
+
+    on_unfit: OnUnfit[DepsT] | None = field(default=None, kw_only=True)
+    """Gate for a request compaction cannot fit. ``None`` raises."""
+
+    _state: _RunState = field(default_factory=_RunState, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        """Validate upstream's fields, then this class's own."""
+        super().__post_init__()
+        if self.max_summarizer_requests < 0:
+            raise ValueError("max_summarizer_requests must be non-negative.")
+        for tier in self.tiers:
+            if isinstance(tier, SummarizingCompaction) and isinstance(tier.model, str):
+                raise ValueError(
+                    "a summarizing tier's model must be None or a Model instance, not the "
+                    f"name {tier.model!r}: a name makes the summarizer build its own "
+                    "provider client, outside both the host's guard and this bound."
+                )
+
+    async def for_run(self, ctx: RunContext[DepsT]) -> "BoundedTieredCompaction[DepsT]":
+        """A fresh copy per run, so no run inherits another's budget or latch."""
+        return replace(self)
+
+    async def compact(
+        self, messages: list[ModelMessage], ctx: RunContext[DepsT]
+    ) -> list[ModelMessage]:
+        """The manual path (``compact_now``, or use as a tier): one call, one run."""
+        run = replace(self)
+        target = run._target(ctx.model)
+        return messages if target is None else await run._escalate_bounded(messages, ctx, target)
+
+    async def before_model_request(
+        self, ctx: RunContext[DepsT], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        """Upstream's hook, driving the bounded escalation instead of its own.
+
+        Overridden whole rather than by replacing upstream's private ``_escalate``: if a
+        harness release renamed that, an override would silently stop being called and
+        the bound with it. The helpers imported here are what keep receipts, the
+        ``compact_messages`` span and ``ReportContextUsage``'s correction identical to
+        upstream's; a rename of any of them fails at the first compaction, loudly, and
+        not at ``import elja``.
+        """
+        from pydantic_ai_harness.compaction._shared import (
+            compact_with_span,
+            context_for_request,
+            record_compaction_reclaim,
+        )
+
+        messages: list[ModelMessage] = list(request_context.messages)
+        request_ctx = context_for_request(ctx, request_context)
+        target = self._target(request_ctx.model)
+        parameters = request_context.model_request_parameters
+        if target is None or (
+            estimate_context_tokens(messages, self.tokenizer, model_request_parameters=parameters)
+            <= target
+        ):
+            return request_context
+        compacted = await compact_with_span(
+            request_ctx,
+            # Upstream's name, so a dashboard filtering compaction spans keeps working.
+            strategy="TieredCompaction",
+            messages=messages,
+            compact=lambda: self._escalate_bounded(messages, request_ctx, target, parameters),
+            tokenizer=self.tokenizer,
+        )
+        record_compaction_reclaim(
+            request_context,
+            estimate_token_count(messages, self.tokenizer),
+            estimate_token_count(compacted, self.tokenizer),
+        )
+        request_context.messages = compacted
+        return request_context
+
+    async def _escalate_bounded(
+        self,
+        messages: list[ModelMessage],
+        ctx: RunContext[DepsT],
+        target: int,
+        parameters: ModelRequestParameters | None = None,
+    ) -> list[ModelMessage]:
+        """Upstream's escalation loop, with the budget, prediction, latch and gate."""
+        original = messages
+        # Measured the way upstream measures: the anchored baseline, minus the
+        # heuristic reclaim of what the tiers removed. The floor is measured in the same
+        # frame, so the overhead the heuristic cannot see (tool definitions in an
+        # anchored count) is part of it — as it is part of every request.
+        baseline = estimate_context_tokens(
+            messages, self.tokenizer, model_request_parameters=parameters
+        )
+        offset = baseline - estimate_token_count(messages, self.tokenizer)
+
+        def measure(candidate: list[ModelMessage]) -> int:
+            return max(offset + estimate_token_count(candidate, self.tokenizer), 0)
+
+        estimate = baseline
+        protected: int | None = None
+        reported = summarized = metered = False
+        for tier in self.tiers:
+            if estimate <= target:
+                break
+            if not isinstance(tier, SummarizingCompaction):
+                compacted = await tier.compact(messages, ctx)
+            else:
+                metered = True
+                protected = measure(
+                    _protected_floor(
+                        messages,
+                        # Upstream: `keep_user_messages` supersedes first-message
+                        # preservation, and keeps truncated copies instead.
+                        preserve_first_user_message=tier.preserve_first_user_message
+                        and not tier.keep_user_messages,
+                    )
+                )
+                if protected > target:
+                    await self._unreachable(
+                        ctx, "protected_floor", target, estimate, protected, original
+                    )
+                    reported = True
+                if (reported or self._state.overflow) and estimate - protected <= target:
+                    continue
+                if self._state.spent >= self.max_summarizer_requests:
+                    continue
+                compacted = await self._summarize(tier, messages, ctx)
+                summarized = summarized or compacted is not messages
+            messages = reinject_pinned(original, compacted)
+            estimate = measure(messages)
+        if estimate <= target:
+            self._state.overflow = False
+            return messages
+        self._state.overflow = self._state.overflow or summarized
+        if not reported:
+            exhausted = metered and self._state.spent >= self.max_summarizer_requests
+            reason: UnfitReason = (
+                "budget_exhausted" if exhausted and not self._state.overflow else "no_progress"
+            )
+            if protected is None:
+                protected = measure(_protected_floor(messages, preserve_first_user_message=False))
+            await self._unreachable(ctx, reason, target, estimate, protected, original)
+        return messages
+
+    async def _summarize(
+        self,
+        tier: SummarizingCompaction[DepsT],
+        messages: list[ModelMessage],
+        ctx: RunContext[DepsT],
+    ) -> list[ModelMessage]:
+        """One metered summarizing pass, with manufactured copies removed after it.
+
+        Returns ``messages`` itself when nothing was summarized — the tier found nothing
+        before its cutoff, or its request was refused at the budget — so the caller can
+        tell a pass that happened from one that did not.
+        """
+        if tier.model is not None:
+            assert isinstance(tier.model, Model)  # names are refused in __post_init__
+            tier = replace(
+                tier,
+                model=_MeteredSummarizer(tier.model, self._state, self.max_summarizer_requests),
+            )
+        elif isinstance(ctx.model, Model):
+            ctx = replace(
+                ctx,
+                model=_MeteredSummarizer(ctx.model, self._state, self.max_summarizer_requests),
+            )
+        prepared = _single_previous_summary(messages)
+        try:
+            compacted = await tier.compact(prepared, ctx)
+        except _SummarizerBudgetSpentError:
+            return messages
+        if compacted is prepared:
+            return messages
+        return _drop_compaction_copies(prepared, compacted)
+
+    async def _unreachable(
+        self,
+        ctx: RunContext[DepsT],
+        reason: UnfitReason,
+        target: int,
+        estimate: int,
+        protected: int,
+        original: list[ModelMessage],
+    ) -> None:
+        """Report to the gate, which raises to stop or returns to send."""
+        self._state.reports += 1
+        report = TargetUnreachable(
+            reason=reason,
+            target_tokens=target,
+            estimated_tokens=estimate,
+            protected_tokens=protected,
+            summarizer_requests=self._state.spent,
+            max_summarizer_requests=self.max_summarizer_requests,
+            occurrence=self._state.reports,
+            anchored=any(
+                isinstance(message, ModelResponse) and bool(message.usage.input_tokens)
+                for message in original
+            ),
+            window_tokens=resolve_context_window(ctx.model),
+        )
+        if self.on_unfit is None:
+            raise TargetUnreachableError(report)
+        outcome = self.on_unfit(ctx, report)
+        if inspect.isawaitable(outcome):
+            await outcome
+
+
 def build_compaction(
     settings: EljaSettings,
     *,
@@ -308,8 +979,15 @@ def build_compaction(
     summary_prompt: str | None = None,
     receipts: bool = False,
     preserve_first_user_message: bool = True,
+    on_unfit: OnUnfit[Any] | None = None,
 ) -> list[AbstractCapability[Any]]:
     """Build the compaction capability from settings (empty list if disabled).
+
+    The capability is a :class:`BoundedTieredCompaction`: masking, then summarization,
+    with at most ``settings.compaction.max_summarizer_requests`` paid summarizer
+    requests per run, no summary paid for when the protected content alone exceeds
+    the target, and no re-summarizing of a history that a summary already failed to
+    fit. Its upstream type is unchanged, so ``isinstance(cap, TieredCompaction)`` holds.
 
     Args:
         settings: Resolved elja settings.
@@ -355,14 +1033,19 @@ def build_compaction(
             once the receipt has been merged into a mixed-parts message.
         preserve_first_user_message: Keep the run's original task verbatim through
             every tier. On by default, because dropping it is how a long run forgets
-            what it was asked to do. **Turn it off when that message is large.** It
-            is irreducible content, so a first message bigger than
-            ``target_tokens`` makes the summarizing tier fire on every model
-            request for the rest of the run — one paid LLM call each, unbounded.
-            Measured: a 20k-character first user message at ``target_tokens=1000``
-            gives six summarizer calls over six requests; the same turn with this
-            off gives one. A host turning it off should carry the task in its own
-            instructions instead, where compaction cannot reach it.
+            what it was asked to do. It is protected content, so a first message
+            bigger than ``target_tokens`` makes the target unreachable: elja detects
+            that before paying for a summary and puts it to ``on_unfit`` with reason
+            ``protected_floor``. (Before 0.6 it paid for a summary on every model
+            request instead.) A host whose first message is a large document either
+            raises the target or turns this off and carries the task in its own
+            instructions, where compaction cannot reach it.
+        on_unfit: The gate for a request compaction cannot bring under the target,
+            called with the run context and a :class:`TargetUnreachable` report.
+            Raise to stop the run; return to send the request as compacted. ``None``
+            (the default) raises :class:`TargetUnreachableError`, so nothing goes out
+            over target unless the host decided it should. The convenience path
+            passes :func:`proceed_over_target`.
 
     Returns:
         A single tiered compaction capability, or ``[]`` when disabled.
@@ -383,7 +1066,7 @@ def build_compaction(
     if not cfg.enabled:
         return []
     return [
-        TieredCompaction(
+        BoundedTieredCompaction(
             tiers=[
                 # max_tokens=1 / max_messages=1 are always-eligible sentinels:
                 # inside TieredCompaction the orchestrator's target_tokens is
@@ -400,9 +1083,10 @@ def build_compaction(
                     model=summarizer_model,
                     max_messages=1,
                     keep_messages=cfg.keep_messages,
-                    # Token-bound the verbatim tail so the target is always
-                    # reachable — otherwise an irreducible tail above target
-                    # re-fires a summarizer LLM call on EVERY request.
+                    # Token-bound the verbatim tail, so the ordinary tail can never be
+                    # what keeps a request over target. What it cannot bound — pins,
+                    # the first user message, system policy — is the protected floor,
+                    # which BoundedTieredCompaction measures before paying.
                     keep_tokens=cfg.target_tokens // 3,
                     preserve_first_user_message=preserve_first_user_message,
                     incremental=True,
@@ -414,5 +1098,7 @@ def build_compaction(
                 ),
             ],
             target_tokens=cfg.target_tokens,
+            max_summarizer_requests=cfg.max_summarizer_requests,
+            on_unfit=on_unfit,
         )
     ]

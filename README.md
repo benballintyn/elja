@@ -110,7 +110,11 @@ elja's own capabilities stay available by opting in, e.g.
 `capabilities=build_compaction(load_settings(), cleared_placeholder=...)` — pass
 your own placeholder, because the default tells the model to *re-run* a cleared
 tool and names `.elja/spill/`, and neither is right for a host with
-side-effecting tools and no workspace. `elja/application.py` covers how `None`
+side-effecting tools and no workspace. Compaction is bounded: at most
+`max_summarizer_requests` paid summaries per run, none at all when the protected
+content (instructions, policy, first message, pins, current request) alone exceeds
+the target, and a typed `TargetUnreachableError` rather than a silent over-target
+request — or pass `on_unfit=` to choose. `elja/application.py` covers how `None`
 and empty differ between the two paths; `elja/compaction.py` covers composing
 the policy and why reporting goes last; and
 `docs/EMBEDDING.md` covers metering, admission control, events, checkpoints,
@@ -195,6 +199,7 @@ enabled = true
 target_tokens = 24000  # load the LM Studio model with at least this + headroom
 keep_tool_pairs = 10   # recent tool results kept verbatim by the masking tier
 keep_messages = 20     # verbatim tail if the summarization fallback fires
+max_summarizer_requests = 3  # paid summaries per run; then a status line, not more
 
 # Skills: markdown files in <workspace>/skills/ (or [skills] dir = "...") with
 # YAML frontmatter (id, description) + an instructions body. The model loads

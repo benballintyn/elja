@@ -25,11 +25,13 @@ What the host owns, and why elja does not:
 - **Cancellation.** pydantic-ai's own cancellation channel stops a run; elja adds
   none of its own. See :func:`run_with_deadline` for why that beats wrapping the
   call in ``asyncio.timeout``.
-- **Compaction is silent.** Nothing notifies the host that history was rewritten:
-  the only callback the harness package offers is
-  :class:`ReportContextUsage.on_usage`, which carries a reading and no messages.
-  A host that wants to show "history compacted" infers it from a reading that
-  drops, or from its own copy of the transcript.
+- **Compaction is silent when it works, and typed when it cannot.** Nothing
+  notifies the host that history was rewritten: the only callback the harness
+  package offers is :class:`ReportContextUsage.on_usage`, which carries a reading
+  and no messages. But a request compaction cannot bring under its target is never
+  sent quietly: :func:`run_turn_within_capacity` turns elja's
+  :class:`~elja.compaction.TargetUnreachableError` into an :class:`OverCapacity`
+  value the host returns to its client, with the checkpoint beside it.
 
 What elja provides is the construction door
 (:func:`elja.build_application_agent`), the compaction policy
@@ -79,7 +81,12 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_ai_harness.compaction import ContextUsage, ReportContextUsage
 
 from elja import build_application_agent
-from elja.compaction import build_compaction
+from elja.compaction import (
+    OnUnfit,
+    TargetUnreachable,
+    TargetUnreachableError,
+    build_compaction,
+)
 from elja.settings import EljaSettings
 
 # Masked tool results must not invite the model to repeat a side effect. elja's
@@ -169,6 +176,7 @@ def build_host_agent(
     *,
     settings: EljaSettings | None = None,
     on_context: Callable[[ContextUsage], None] | None = None,
+    on_unfit: OnUnfit[HostDeps] | None = None,
 ) -> Agent[HostDeps, str | DeferredToolRequests]:
     """Build the host's agent.
 
@@ -179,6 +187,10 @@ def build_host_agent(
         on_context: Receives a context reading per request. Attached LAST, so it
             measures the request that was actually sent; placed earlier it would
             report one that never existed.
+        on_unfit: elja's gate for a request compaction cannot fit. ``None`` keeps
+            elja's default, which raises — what :func:`run_turn_within_capacity`
+            expects. A host that would rather send over its soft target passes a
+            gate that returns.
 
     Returns:
         An agent whose output is either the final answer or a typed request for
@@ -186,7 +198,9 @@ def build_host_agent(
     """
     capabilities: list[Any] = []
     if settings is not None:
-        capabilities.extend(build_compaction(settings, cleared_placeholder=CLEARED))
+        capabilities.extend(
+            build_compaction(settings, cleared_placeholder=CLEARED, on_unfit=on_unfit)
+        )
     if on_context is not None:
         capabilities.append(ReportContextUsage(on_usage=on_context))
     return build_application_agent(
@@ -298,6 +312,55 @@ async def run_turn(
         raise RuntimeError("the event stream ended without a result")
     recorder.record("turn_finished")
     return final, messages
+
+
+@dataclass(frozen=True)
+class OverCapacity:
+    """What the host answers with when the conversation cannot be compacted to fit.
+
+    A value, not an exception and not prose. ``report.reason`` is the branch a host
+    takes: ``protected_floor`` means the protected content — the task brief, a pin,
+    the policy, or the current request — is itself over the target, so the user is
+    asked for something shorter or a fresh conversation; the other two mean this
+    turn outgrew what compaction could do with its budget. ``report.window_tokens``,
+    when known, says how far the request is from the provider's real limit, because
+    the target is a soft one.
+    """
+
+    report: TargetUnreachable
+    checkpoint: list[ModelMessage]
+    """What the turn completed before it stopped, already repaired for replay — so a
+    write that happened before the capacity outcome is on record, and is not
+    repeated by a model that has no memory of it."""
+
+
+async def run_turn_within_capacity(
+    agent: Agent[HostDeps, str | DeferredToolRequests],
+    deps: HostDeps,
+    prompt: str | None = None,
+    *,
+    history: Sequence[ModelMessage] = (),
+    recorder: TurnRecorder,
+    usage_limits: UsageLimits | None = None,
+) -> tuple[str | DeferredToolRequests | OverCapacity, list[ModelMessage]]:
+    """:func:`run_turn`, with elja's capacity outcome as a typed result.
+
+    Nothing was sent over the target: elja raised before the request left, and before
+    paying for a summary that could not have helped. The run's completed work is in
+    ``recorder.partial`` exactly as for any other failure, because the error travels
+    the same path; this only stops it being a crash.
+
+    Returns:
+        The final output, a typed request for the human, or :class:`OverCapacity` —
+        and the messages to persist in each case.
+    """
+    try:
+        return await run_turn(
+            agent, deps, prompt, history=history, recorder=recorder, usage_limits=usage_limits
+        )
+    except TargetUnreachableError as error:
+        recorder.record("over_capacity", error.report.reason)
+        return OverCapacity(report=error.report, checkpoint=recorder.partial), recorder.partial
 
 
 # pydantic-ai marks the returns it synthesizes for interrupted calls with this

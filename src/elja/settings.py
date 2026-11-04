@@ -474,11 +474,18 @@ class CompactionConfig(_Section):
     target_tokens: int = Field(default=24_000, ge=1000)
     # Recent tool call/result pairs kept verbatim by the masking tier.
     keep_tool_pairs: int = Field(default=10, ge=1)
+    # Hard cap on PAID summarizer requests per agent run, counted at the model so a
+    # retry inside the summarizer counts too. A backstop, not the main defence: no
+    # summary is paid for when the protected content alone exceeds the target, and a
+    # summary that fails to fit stops further ones until there is real progress to
+    # make. 0 means masking only. Resets at the start of every run. See
+    # elja.compaction.BoundedTieredCompaction.
+    max_summarizer_requests: int = Field(default=3, ge=0)
     # INERT under elja's configuration, and kept only so a host reading upstream's
     # docs is not surprised by its absence. Upstream reads it in two places: when
     # `keep_tokens is None`, and inside `if self.keep_user_messages:`. elja always
-    # passes `keep_tokens = target_tokens // 3` (without which an irreducible tail
-    # re-fires the summarizer on every request) and never passes
+    # passes `keep_tokens = target_tokens // 3` (so the verbatim tail alone can
+    # never keep a request over target) and never passes
     # `keep_user_messages`, so neither branch is reachable. Measured: the model's
     # view is 15 messages and 7 tool calls at keep_messages = 1, 2, 20 and 1000
     # alike. Changing it does nothing in either direction.
