@@ -7,7 +7,7 @@ from pydantic_ai.toolsets import AbstractToolset
 from pydantic_ai.usage import UsageLimits
 
 from elja.application import build_application_agent
-from elja.compaction import build_compaction
+from elja.compaction import build_compaction, proceed_over_target
 from elja.deps import EljaDeps
 from elja.mcp import build_mcp_toolsets
 from elja.model import build_model
@@ -58,7 +58,10 @@ def build_agent(
         ],
         capabilities=[
             *load_skills(settings),
-            *build_compaction(settings),
+            # A local workspace's target is a conservative slice of the model's
+            # window, so an unreachable one is worth a status line, not a dead turn.
+            # Embedded hosts get the raising default instead.
+            *build_compaction(settings, on_unfit=proceed_over_target),
             build_permission_gate(settings),
         ],
     )

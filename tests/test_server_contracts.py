@@ -48,6 +48,7 @@ from pydantic_ai.models.function import (
 )
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import RunUsage, UsageLimits
+from pydantic_ai_harness.compaction import ReportContextUsage, TieredCompaction
 from pytest_mock import MockerFixture
 
 from elja.application import build_application_agent
@@ -55,6 +56,7 @@ from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
 from examples.server_agent import (
     CLEARED,
     HostDeps,
+    OverCapacity,
     TurnRecorder,
     _checkpoint,
     build_host_agent,
@@ -62,6 +64,7 @@ from examples.server_agent import (
     foreign_thinking_parts,
     household_toolset,
     run_turn,
+    run_turn_within_capacity,
     run_with_deadline,
     serialize,
 )
@@ -416,13 +419,15 @@ class TestContextReporting:
         agent = build_host_agent(
             _saving_then_answering(), settings=settings, on_context=lambda _usage: None
         )
+        # By upstream type, not class name: elja's compaction is a subclass, and a
+        # name filter silently skipped it.
         capabilities = [
             capability
             for capability in agent.root_capability.capabilities
-            if type(capability).__name__ in {"TieredCompaction", "ReportContextUsage"}
+            if isinstance(capability, (TieredCompaction, ReportContextUsage))
         ]
         assert [type(c).__name__ for c in capabilities] == [
-            "TieredCompaction",
+            "BoundedTieredCompaction",
             "ReportContextUsage",
         ]
 
@@ -1014,6 +1019,83 @@ class TestCancellation:
             for message in recorder.partial
             for part in message.parts
         )
+
+
+class TestTheCapacityOutcomeIsTyped:
+    """E4's embedded-host example: an unreachable target is a value the host returns.
+
+    Driven through the example's own ``run_turn_within_capacity``, so the documented
+    handling cannot rot. The settings are tight on purpose: a 1000-token target that a
+    pasted brief, or a tool result read back into the current request, exceeds alone.
+    """
+
+    SETTINGS = EljaSettings(compaction=CompactionConfig(target_tokens=1000))
+
+    async def test_a_brief_too_large_to_fit_is_answered_not_sent(self) -> None:
+        calls: list[int] = []
+
+        async def stream(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            calls.append(1)  # pragma: no cover - the point is that this never runs
+            yield "noted"  # pragma: no cover
+
+        recorder = TurnRecorder()
+        agent = build_host_agent(FunctionModel(stream_function=stream), settings=self.SETTINGS)
+        outcome, _ = await run_turn_within_capacity(
+            agent, _deps(), "BRIEF " * 2000, recorder=recorder
+        )
+        assert isinstance(outcome, OverCapacity)
+        assert outcome.report.reason == "protected_floor"
+        assert outcome.report.summarizer_requests == 0
+        assert calls == [], "the request went out over target"
+        assert recorder.kinds()[-1] == "over_capacity"
+
+    async def test_a_write_before_the_outcome_is_in_the_checkpoint(self) -> None:
+        """Recoverable write-result information survives the cannot-fit path.
+
+        The turn saves a fact and reads back a stored brief in one step. The read's
+        result is the next request's current content and is over the target alone,
+        so the turn stops there — after the write. The write's receipt is in the
+        checkpoint, so a replay knows it happened and does not do it again.
+        """
+
+        async def stream(
+            messages: list[ModelMessage], info: AgentInfo
+        ) -> AsyncIterator[StreamItem]:
+            yield {
+                1: DeltaToolCall(name="save_fact", json_args='{"key": "vet", "value": "tuesday"}'),
+                2: DeltaToolCall(name="read_fact", json_args='{"key": "brief"}'),
+            }
+
+        deps = HostDeps(tenant="acme", store={"acme:brief": "BRIEF " * 1500})
+        recorder = TurnRecorder()
+        agent = build_host_agent(FunctionModel(stream_function=stream), settings=self.SETTINGS)
+        outcome, checkpoint = await run_turn_within_capacity(
+            agent, deps, "remember the vet", recorder=recorder
+        )
+        assert isinstance(outcome, OverCapacity)
+        assert outcome.report.reason == "protected_floor"
+        assert deps.store["acme:vet"] == "tuesday"
+        receipts = [
+            part.content
+            for message in checkpoint
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "save_fact"
+        ]
+        assert receipts == ["acme:vet"]
+        assert outcome.checkpoint is checkpoint
+
+    async def test_an_ordinary_turn_is_unaffected(self) -> None:
+        """The positive control: compaction attached, nothing over target, a real answer."""
+        recorder = TurnRecorder()
+        agent = build_host_agent(_saving_then_answering(), settings=self.SETTINGS)
+        outcome, messages = await run_turn_within_capacity(
+            agent, _deps(), "remember the vet", recorder=recorder
+        )
+        assert outcome == "saved the vet appointment"
+        assert messages
+        assert "over_capacity" not in recorder.kinds()
 
 
 class TestTheHostsPlaceholderReachesCompaction:

@@ -11,8 +11,9 @@ This document covers what elja guarantees for a host that meters paid
 requests, and — just as important — what it does not.
 
 Versions these statements were verified against: pydantic-ai-slim **2.36.0**,
-pydantic-ai-harness **0.27.0**, Python 3.12. Every claim below was measured at
-those versions against the installed packages.
+pydantic-ai-harness **0.27.0**, Python 3.12 (and 3.13 for the bounded-compaction
+section, added in 0.6). Every claim below was measured at those versions against
+the installed packages; CI runs the suite on 3.11, 3.12 and 3.13.
 
 The pins are ranges (`pydantic-ai-slim >=2.36,<3`, `pydantic-ai-harness
 >=0.27,<0.28`), so *measured* and *regression-guarded* are not the same thing and
@@ -98,7 +99,12 @@ What elja guarantees:
   leaves the summarization tier's `model=None`, which makes
   `SummarizingCompaction` inherit `ModelRequestContext.model`, so compaction's
   private request is admitted by the same wrapper as the main request. Verified,
-  not inferred. One caveat upstream states and this inherits: that context model
+  not inferred. To enforce its per-run budget, elja wraps that model — yours, or
+  the one you pass as `summarizer_model` — in a counting `WrapperModel` for the
+  duration of one summary. It sits *outside* your guard and delegates to it: every
+  summarizer request that is dispatched still goes through your guard with the
+  same messages and settings, and one refused at elja's budget never reaches your
+  guard at all. One caveat upstream states and this inherits: that context model
   *starts* as the run's model and differs only where a capability replaced it. The
   embedded path invites `capabilities=[...]`, so if you attach one that swaps the
   model, this guarantee is the thing it swaps away.
@@ -258,9 +264,12 @@ because the defaults are tuned for a local workspace:
 | `summary_prompt` | The default carries a note about reloading elja skills, which a host without skills has no reason to ship. This is the summarizer's *user* turn; upstream's `instructions` (its system prompt) is not exposed. Must *substitute* `{messages}`, checked at construction by rendering it twice — a doubled `{{messages}}` is a literal and is refused, while `{messages!r}` and `{messages:>10}` are fine. |
 | `summarizer_model` | A different provider, a cheaper model, or separate budget attribution (see above). |
 | `receipts` | Leaves a deterministic note where history was summarized away. With a capability implementing the harness's `TranscriptHandleProvider` protocol attached, the receipt carries a handle to your persisted transcript. Note one accumulates per compaction across a long caller-owned history, each with its own dropped-message count. |
+| `on_unfit` | What happens to a request compaction cannot bring under the target. `None` (the default) raises `TargetUnreachableError`; a gate that returns sends the request. See "The summarizer is bounded" below. |
 
 Replacing the policy wholesale is always available: build your own
-`TieredCompaction` and pass it as a capability instead of calling the factory.
+`BoundedTieredCompaction` (from `elja.compaction`) with your own tiers and pass it
+as a capability instead of calling the factory. Upstream's plain `TieredCompaction`
+works too, and is unbounded.
 
 **Put `ReportContextUsage` last.** None of these capabilities declare an
 ordering, so list order decides what reporting measures. Measured on the same
@@ -271,20 +280,119 @@ numbers.
 
 **What survives, measured not assumed.** Pinned parts
 (`pydantic_ai_harness.compaction.pin`) survive every tier. Tool call/result
-pairing stays valid across both tiers. There is no upstream signal for "the
-target could not be reached": nothing is silently dropped, but a host that needs
-to know should compare a post-compaction `ReportContextUsage` reading against its
-own target.
+pairing stays valid across both tiers. So do the current request, the first user
+message when it is preserved, leading system policy, your placeholder text,
+receipts, and each part's own metadata (a `TextContent.metadata`, a
+`ToolReturnPart.metadata`) — pinned on the path where compaction fits and on the
+one where it cannot (`tests/test_compaction_bounds.py`). Message-level `metadata`
+is a different matter and not compaction's doing: pydantic-ai drops it when it
+merges consecutive requests on replay, by design (`_merge_consecutive_messages`).
 
-**Keep a pinned set well under the target.** Re-injection happens *after* the
-tail is trimmed, so `keep_tokens` cannot bound a pin. If the pinned text's own
-estimate exceeds `target_tokens`, the post-compaction estimate never falls to
-target and the summarizing tier fires again on **every** model request for the
-rest of the run. Measured over a six-step turn: one paid summarizer call with no
-pin or a small pin, **six** with an oversized one — one-to-one with requests, and
-unbounded. Treat an oversized pin as a host-side error. elja does not yet bound
-it; that needs a latch refusing to re-enter the summarizing tier once it has
-failed to reach target, which is not built.
+## The summarizer is bounded
+
+Some content no tier may remove. elja calls it the **protected floor**:
+instructions and tool definitions (sent on every request), leading system policy,
+the first user message when `preserve_first_user_message` is on, pins, and the
+current request. Upstream re-injects or preserves all of it *after* the tail is
+trimmed, so `keep_tokens` cannot bound it — and when the floor alone exceeds
+`target_tokens`, the estimate can never reach target. In 0.5.0 the summarizing
+tier then fired before **every** model request for the rest of the run: measured
+over a six-step turn, six paid summarizer calls where an ordinary history needs
+one.
+
+`build_compaction` now returns a `BoundedTieredCompaction`, which is upstream's
+`TieredCompaction` (an `isinstance` check still holds) with four additions:
+
+1. **A budget.** At most `CompactionConfig.max_summarizer_requests` summarizer
+   requests per run (default 3; 0 means masking only). Counted at the model, not
+   per attempt, because a summarizer reply with no text makes pydantic-ai's
+   private summary agent retry once — one attempt, two paid requests. A request
+   past the budget is refused before it reaches your guard.
+2. **A prediction.** Before paying for a summary, the floor is measured in the
+   same units as the target. If it alone exceeds the target, no summary is paid
+   for, and the request is reported as `protected_floor`.
+3. **A latch.** A summary that ends over the target puts the run in *overflow
+   mode*: from then on the summarizer runs only once the summarizable remainder
+   (estimate minus floor) exceeds a whole `target_tokens` — real progress, not a
+   re-summary of the summary on every request. Reported as `no_progress`. The
+   floor-exceeded case behaves the same way for a host that chose to proceed.
+4. **A gate.** Every request that would go out over target is put to
+   `on_unfit(ctx, report)` with a typed `TargetUnreachable`. With no gate (the
+   default) elja raises `TargetUnreachableError(report)` and **nothing is sent**.
+   A gate that returns lets the request go as compacted; one that raises stops
+   the run with its own exception.
+
+**Soft target, not hard limit.** `TargetUnreachable` is about `target_tokens`,
+elja's compaction target, set well below any real window. The provider's input
+limit is reported separately as `window_tokens` when pydantic-ai can resolve it,
+and is `None` otherwise — elja never guesses it. All numbers are estimates in the
+units the target is compared against: provider-reported usage where the history
+carries it (`anchored=True`), the characters-per-token heuristic where it does not.
+
+| field | meaning |
+| --- | --- |
+| `reason` | `protected_floor`, `no_progress` or `budget_exhausted` |
+| `estimated_tokens` | the request when compaction gave up on it. For `protected_floor` that is before the summarizing tier, since the report comes before any payment; a host that proceeds may still get one summary that shrinks it, so a `ReportContextUsage` placed after compaction reads the exact figure |
+| `protected_tokens` | the floor; a summary cannot go below it |
+| `summarizer_requests` / `max_summarizer_requests` | spent this run, and the budget |
+| `occurrence` | 1 for the first report in a run, then 2, 3, … — check for 1 to act once per run |
+| `anchored`, `window_tokens` | the estimate's reliability, and the hard limit when known |
+
+**When the state resets.** All of it — budget, latch, report count — belongs to
+one run. `for_run` gives each run a fresh copy, so a new `agent.run` starts with
+the whole budget again, and two concurrent runs of one agent do not share one. A
+manual `compact_now` call is its own run. Within a run:
+
+- the floor is measured afresh on every request, so a huge tool result is
+  protected only while it *is* the current request; a step later masking may
+  clear it and the run fits again, with nothing paid for;
+- overflow mode ends on the first request that compacts under the target again,
+  and from there the run is back to ordinary compaction;
+- the budget does not refill.
+
+So a host that proceeds past `protected_floor` pays nothing more for unchanged
+content: a summary only when the reducible part has grown by a whole target since
+the last one, and never more than the budget. One that raises pays nothing at
+all. The one case with a cost per run is `no_progress` on a fresh run: the floor
+fits but floor plus summary does not, which the prediction cannot know before the
+summary exists — at most one summary per run, then the outcome.
+
+**Handling it.** `examples/server_agent.py`'s `run_turn_within_capacity` turns the
+error into a typed `OverCapacity` value with the checkpoint beside it. A write
+that completed earlier in the turn is in that checkpoint, receipt and all, so a
+replay does not repeat it:
+
+```python
+try:
+    output, history = await run_turn(agent, deps, prompt, history=history, recorder=recorder)
+except TargetUnreachableError as error:
+    if error.report.reason == "protected_floor":
+        ...  # the brief, pin, policy or current request is itself too big: ask for less
+    else:
+        ...  # this turn outgrew its compaction budget: start fresh, or raise the budget
+    history = recorder.partial  # what completed, repaired for replay
+```
+
+`elja chat` and configured sub-agents pass `proceed_over_target` instead: one
+status line per run, then send. Their target is a conservative slice of a local
+model's window, so a dead turn would be the worse outcome there — and it is the
+wrong gate for a host that must account for every over-target request.
+
+**Protected content no longer grows.** A `SystemPromptPart` in caller-owned
+history — what `Agent(system_prompt=...)` produces — used to multiply: the harness
+copies leading system parts into each new summary message, first-message
+preservation keeps the original as well, and pydantic-ai merges consecutive
+requests on replay, so each compacting turn left one more policy copy and one more
+superseded summary for the next to preserve. elja now removes exactly those after
+each summary: a system part seen twice by exact equality (content, timestamp and
+dynamic ref, so two parts that merely say the same thing are both kept; the
+leading copy stays), and summaries a newer one replaced. User prompts are never
+touched. What still accumulates is the user's own prompts — the same merge folds
+each compacted turn's prompt into the preserved first request — and since those
+are real messages they stay, and the floor counts them.
+
+Prefer `instructions=` for policy anyway: it is still protected (it goes on every
+request), but it lives outside history, where nothing can accumulate.
 
 **`cleared_placeholder` covers the compaction placeholder only.** If you also use
 elja's built-in toolset, its output-capping message separately names
@@ -409,14 +517,44 @@ wrapping the call in `asyncio.timeout`:
   timeout scope to unwind, so a host on that path has to re-raise and recover the
   state from the exception chain with `RunCancelled.from_cancellation`.
 
-**Compaction tells the host nothing.** There is no "history was rewritten"
-callback: the only one the harness package offers is
+**Compaction that works tells the host nothing.** There is no "history was
+rewritten" callback: the only one the harness package offers is
 `ReportContextUsage.on_usage`, which carries a reading and no messages. A host
 that wants to surface "history compacted" infers it from a reading that drops, or
-from its own copy of the transcript. Related, and a trap for anything billing on
+from its own copy of the transcript. Compaction that *cannot* reach its target is
+the exception, and it is loud and typed — see "The summarizer is bounded". Related, and a trap for anything billing on
 it: readings are taken in `before_model_request`, which runs *upstream* of the
 usage-limit check, so a turn that trips its limit reports one more reading than
 it made requests.
 
 `examples/server_agent.py` is all of the above as running code, driven by
 `tests/test_server_contracts.py` so it cannot rot.
+
+## Upgrading from 0.5.0
+
+Release notes for the bounded-compaction change, verified against pydantic-ai-slim
+2.36.0 and pydantic-ai-harness 0.27.0 (Python 3.13 locally; CI runs 3.11–3.13).
+
+- **Intentional behavior change, for safety.** A request compaction cannot bring
+  under `target_tokens` is no longer sent after a summary paid for on every
+  request. With `build_compaction(settings)` and no `on_unfit`, the run raises
+  `TargetUnreachableError` — before any summary is paid for when the protected
+  floor alone is too big. A host that relied on the old behavior, and can afford
+  over-target requests, passes a gate that returns (`proceed_over_target`, or its
+  own). `elja chat` and sub-agents do this already, so the CLI keeps answering and
+  shows one status line per run instead.
+- **New budget.** `[compaction] max_summarizer_requests` (default 3) caps paid
+  summarizer requests per run. A run that legitimately needs more than that many
+  summaries now gets `budget_exhausted` instead of a fourth; raise it if your runs
+  are that long.
+- **New types**, all in `elja.compaction`: `BoundedTieredCompaction`,
+  `TargetUnreachable`, `TargetUnreachableError` (an `AgentRunError`), `OnUnfit`,
+  `UnfitReason`, `proceed_over_target`.
+- **Type name.** The capability is `BoundedTieredCompaction`, a subclass of
+  `TieredCompaction`. `isinstance` checks are unaffected; a check on
+  `type(cap).__name__` is not. The `compact_messages` span still says
+  `TieredCompaction`.
+- **Histories shrink, not grow.** Copies of system policy and superseded
+  summaries that 0.5.0 left in caller-owned histories are removed at the next
+  compaction. Several old summaries are folded into one anchor first, so nothing
+  they said is lost.

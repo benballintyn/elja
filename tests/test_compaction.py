@@ -17,12 +17,15 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai_harness.compaction import TieredCompaction
 
 import elja
 from elja.compaction import (
+    BoundedTieredCompaction,
     build_compaction,
     default_summary_prompt,
     extend_summary_prompt,
+    proceed_over_target,
 )
 from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, WorkspaceConfig
@@ -64,14 +67,31 @@ class TestConfig:
         assert cfg.target_tokens == 24_000
         assert cfg.keep_tool_pairs == 10
         assert cfg.keep_messages == 20
+        assert cfg.max_summarizer_requests == 3
+
+    def test_the_summarizer_budget_cannot_be_negative(self) -> None:
+        with pytest.raises(ValueError, match="max_summarizer_requests"):
+            CompactionConfig(max_summarizer_requests=-1)
 
     def test_disabled_builds_nothing(self) -> None:
         settings = EljaSettings(compaction=CompactionConfig(enabled=False))
         assert build_compaction(settings) == []
 
-    def test_enabled_builds_one_tiered_capability(self) -> None:
+    def test_enabled_builds_one_bounded_tiered_capability(self) -> None:
+        """Still a ``TieredCompaction`` to anything checking the upstream type."""
         (cap,) = build_compaction(EljaSettings())
-        assert type(cap).__name__ == "TieredCompaction"
+        assert isinstance(cap, TieredCompaction)
+        assert isinstance(cap, BoundedTieredCompaction)
+        assert cap.max_summarizer_requests == 3
+        # The embedded default raises rather than sending over target.
+        assert cap.on_unfit is None
+
+    def test_the_budget_and_the_gate_come_from_the_caller(self) -> None:
+        settings = EljaSettings(compaction=CompactionConfig(max_summarizer_requests=7))
+        (cap,) = build_compaction(settings, on_unfit=proceed_over_target)
+        assert isinstance(cap, BoundedTieredCompaction)
+        assert cap.max_summarizer_requests == 7
+        assert cap.on_unfit is proceed_over_target
 
 
 class TestSummaryPromptExtension:
