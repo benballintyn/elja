@@ -525,8 +525,8 @@ wrapping the call in `asyncio.timeout`:
   state from the exception chain with `RunCancelled.from_cancellation`.
 
 **Compaction that works tells the host nothing.** There is no "history was
-rewritten" callback: the only one the harness package offers is
-`ReportContextUsage.on_usage`, which carries a reading and no messages. A host
+rewritten" callback: what the harness package offers is a reading with no
+messages, `ContextUsageEvent` (or the deprecated `ReportContextUsage.on_usage`). A host
 that wants to surface "history compacted" infers it from a reading that drops, or
 from its own copy of the transcript. Compaction that *cannot* reach its target is
 the exception, and it is loud and typed — see "The summarizer is bounded". Related, for anything billing on
@@ -585,7 +585,8 @@ not from a choice elja made:
 - **Saved sessions.** From pydantic-ai 2.60 a saved `RetryPromptPart` loads as
   `ToolReturnPart(outcome='retried')` when it answers a tool call and as
   `RetryFeedbackPart` when it does not. A session saved after that may not load on
-  older pydantic-ai: 2.59 and 0.5.0's 2.36 both refuse `outcome='retried'`.
+  older pydantic-ai: 2.59 and 0.5.0's 2.36 both refuse `outcome='retried'` and
+  `RetryFeedbackPart`.
 - **`ReportContextUsage`** takes no reading for a request refused at the request
   limit (0.5.0 took one), and its `on_usage` callback is deprecated on every
   supported harness in favour of `ContextUsageEvent`; it still works, with a
@@ -595,5 +596,7 @@ not from a choice elja made:
   `anthropic>=1.12.1` and `openai>=3.26`.
 - **A banner.** pydantic-ai 2.59+ prints a one-time banner to stderr at a
   process's first agent run when stderr is a terminal or a coding agent's pipe;
-  never under pytest, in CI, or once instrumentation is configured.
+  never under pytest, in CI, or once instrumentation is configured, and from
+  2.64 not when the run is started from an installed package (`elja` installed
+  with pip or `uv tool`).
   `PYDANTIC_AI_NO_BANNER=1` or `pydantic_ai.BANNER_ENABLED = False` turns it off.

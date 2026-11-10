@@ -621,6 +621,10 @@ class TestSummarizerComposition:
         # The harness's section headings, plus elja's own skills warning.
         assert "## Key decisions" in prompts[0]
         assert "load_capability" in prompts[0]
+        # From harness 0.62 a summary keeps loaded skills, so the note must not
+        # tell the agent they were unloaded (that would cost it a re-load call).
+        assert "whose instructions no longer appear" in prompts[0]
+        assert "no longer loaded" not in prompts[0]
 
     async def test_receipts_leave_a_note_where_history_was_summarized_away(
         self, tmp_path: Path
