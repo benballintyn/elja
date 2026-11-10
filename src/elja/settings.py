@@ -484,11 +484,13 @@ class CompactionConfig(_Section):
     # INERT under elja's configuration, and kept only so a host reading upstream's
     # docs is not surprised by its absence. Upstream reads it in two places: when
     # `keep_tokens is None`, and inside `if self.keep_user_messages:`. elja always
-    # passes `keep_tokens = target_tokens // 3` (so the verbatim tail alone can
-    # never keep a request over target) and never passes
-    # `keep_user_messages`, so neither branch is reachable. Measured: the model's
-    # view is 15 messages and 7 tool calls at keep_messages = 1, 2, 20 and 1000
-    # alike. Changing it does nothing in either direction.
+    # sets `keep_tokens = target_tokens // 3` (so the verbatim tail alone can
+    # never keep a request over target) and never sets `keep_user_messages`;
+    # BoundedTieredCompaction then hands the tier a message count of its own,
+    # computed from `keep_tokens`, so this value is never the one upstream reads.
+    # Measured: the model's view is 15 messages and 7 tool calls at
+    # keep_messages = 1, 2, 20 and 1000 alike. Changing it does nothing in either
+    # direction.
     # Pinned by test_keep_messages_cannot_bind_because_of_two_settings_elja_chooses.
     keep_messages: int = Field(default=20, ge=1)
 

@@ -581,10 +581,14 @@ def _is_retry(event: FunctionToolResultEvent) -> bool:
     """Whether a tool result was a retry prompt rather than a value.
 
     A retry prompt is how a tool's ModelRetry reaches the model, so a host that
-    wants "the tool errored" in its log reads the part's type — there is no
-    separate error event to subscribe to.
+    wants "the tool errored" in its log reads the part — there is no separate
+    error event to subscribe to. Since pydantic-ai 2.60 it is a ``ToolReturnPart``
+    with ``outcome='retried'``; before, a ``RetryPromptPart``.
     """
-    return isinstance(event.part, RetryPromptPart)
+    part = event.part
+    return isinstance(part, RetryPromptPart) or (
+        isinstance(part, ToolReturnPart) and part.outcome == "retried"
+    )
 
 
 def serialize(messages: Sequence[ModelMessage]) -> bytes:

@@ -10,16 +10,22 @@ path: it assembles **nothing you did not ask for** and hands back a native
 This document covers what elja guarantees for a host that meters paid
 requests, and — just as important — what it does not.
 
-Versions these statements were verified against: pydantic-ai-slim **2.36.0**,
+Versions these statements were measured against: pydantic-ai-slim **2.36.0**,
 pydantic-ai-harness **0.27.0**, Python 3.12 (and 3.13 for the bounded-compaction
 section, added in 0.6). Every claim below was measured at those versions against
-the installed packages; CI runs the suite on 3.11, 3.12 and 3.13.
+the installed packages. They have not all been re-measured since elja moved to
+pydantic-ai-slim **2.59+** and pydantic-ai-harness **0.59+**: the suite passes at
+the locked **2.66.0** and **0.66.0** (locally on 3.11 and 3.13; CI runs it on 3.11,
+3.12 and 3.13) and passed once locally at the floor, **2.59.0** and **0.59.0** (3.11;
+CI does not test the floor), so what it guards holds at both ends, and the two claims
+below that the suite showed had changed are corrected.
 
-The pins are ranges (`pydantic-ai-slim >=2.36,<3`, `pydantic-ai-harness
->=0.27,<0.28`), so *measured* and *regression-guarded* are not the same thing and
-this document distinguishes them. `tests/test_metering.py` guards the subset named
-under "Metering and admission control" below — `request`, `request_stream` and
-`count_tokens`, each with a positive control. Everything else here is marked
+The pins are ranges (`pydantic-ai-slim >=2.59,<3`, `pydantic-ai-harness
+>=0.59,<0.67`; each harness release pins one exact pydantic-ai-slim, 0.59.0 to
+2.59.0 and 0.66.0 to 2.66.0), so *measured* and *regression-guarded* are not the
+same thing and this document distinguishes them. `tests/test_metering.py` guards
+the subset named under "Metering and admission control" below — `request`,
+`request_stream` and `count_tokens`, each with a positive control. Everything else here is marked
 **measured, not guarded**: true at these versions, and a minor release could
 change it with the suite still green. `merge_model_settings`' own source carries
 `# Note: we may want merge recursively if/when we add non-primitive values`, which
@@ -387,9 +393,10 @@ superseded summary for the next to preserve. elja now removes exactly those afte
 each summary: a system part seen twice by exact equality (content, timestamp and
 dynamic ref, so two parts that merely say the same thing are both kept; the
 leading copy stays), and summaries a newer one replaced. User prompts are never
-touched. What still accumulates is the user's own prompts — the same merge folds
-each compacted turn's prompt into the preserved first request — and since those
-are real messages they stay, and the floor counts them.
+touched. The same merge folds each compacted turn's prompt into the preserved first
+request. Through pydantic-ai-harness 0.61 those prompts stay there, as real
+messages, and the floor counts them; from 0.62 the harness summarizes what follows
+a summary in that request, so they do not accumulate.
 
 Prefer `instructions=` for policy anyway: it is still protected (it goes on every
 request), but it lives outside history, where nothing can accumulate.
@@ -522,10 +529,11 @@ rewritten" callback: the only one the harness package offers is
 `ReportContextUsage.on_usage`, which carries a reading and no messages. A host
 that wants to surface "history compacted" infers it from a reading that drops, or
 from its own copy of the transcript. Compaction that *cannot* reach its target is
-the exception, and it is loud and typed — see "The summarizer is bounded". Related, and a trap for anything billing on
-it: readings are taken in `before_model_request`, which runs *upstream* of the
-usage-limit check, so a turn that trips its limit reports one more reading than
-it made requests.
+the exception, and it is loud and typed — see "The summarizer is bounded". Related, for anything billing on
+it: readings are taken in `before_model_request`, after pydantic-ai's request-limit
+check at the start of the step, so a request refused at the limit is not read. (On
+2.36 the check came after the hook, and such a turn reported one more reading than
+it made requests.)
 
 `examples/server_agent.py` is all of the above as running code, driven by
 `tests/test_server_contracts.py` so it cannot rot.
@@ -533,7 +541,9 @@ it made requests.
 ## Upgrading from 0.5.0
 
 Release notes for the bounded-compaction change, verified against pydantic-ai-slim
-2.36.0 and pydantic-ai-harness 0.27.0 (Python 3.13 locally; CI runs 3.11–3.13).
+2.36.0 and pydantic-ai-harness 0.27.0 (Python 3.13 locally; CI runs 3.11–3.13). The
+same release requires pydantic-ai-slim 2.59+ and pydantic-ai-harness 0.59+; the
+suite passes at the locked 2.66.0 and 0.66.0 and, run locally, at 2.59.0 and 0.59.0.
 
 - **Intentional behavior change, for safety.** A request compaction cannot bring
   under `target_tokens` is no longer sent after a summary paid for on every

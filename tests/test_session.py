@@ -7,6 +7,7 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
+    ModelRequestPart,
     ModelResponse,
     RetryPromptPart,
     TextPart,
@@ -28,6 +29,19 @@ def _some_messages() -> list[ModelMessage]:
     return list(result.all_messages())
 
 
+def _retry_part() -> ModelRequestPart:
+    """A retry bound to no tool, as the installed pydantic-ai records one.
+
+    A ``RetryFeedbackPart`` since pydantic-ai 2.60, a ``RetryPromptPart`` before; the
+    deprecated class no longer round-trips as itself, so the history uses the current one.
+    """
+    try:
+        from pydantic_ai.messages import RetryFeedbackPart, RetryInfo
+    except ImportError:  # pydantic-ai < 2.60
+        return RetryPromptPart(content="try again")
+    return RetryFeedbackPart(content="try again", retry=RetryInfo(cause="model_retry"))
+
+
 def _gnarly_messages() -> list[ModelMessage]:
     """A synthetic history covering the part kinds that must round-trip verbatim."""
     return [
@@ -44,7 +58,7 @@ def _gnarly_messages() -> list[ModelMessage]:
         ModelRequest(
             parts=[
                 ToolReturnPart(tool_name="read_file", content={"data": [1, 2]}, tool_call_id="c1"),
-                RetryPromptPart(content="try again"),
+                _retry_part(),
             ]
         ),
         ModelResponse(parts=[TextPart(content="done")]),
@@ -74,6 +88,28 @@ def test_tool_and_thinking_parts_roundtrip_verbatim(tmp_path: Path) -> None:
     session2 = Session(tmp_path / "again.json")
     session2.save(loaded)
     assert session2.path.read_bytes() == session.path.read_bytes()
+
+
+def test_a_session_saved_before_the_retry_split_still_loads(tmp_path: Path) -> None:
+    """A file elja 0.5.0 wrote (pydantic-ai 2.36), with both kinds of retry prompt.
+
+    Since pydantic-ai 2.60 these load as the parts they meant: a ``RetryFeedbackPart``
+    for the one bound to no tool, a retried ``ToolReturnPart`` for the other. The
+    text is kept either way.
+    """
+    path = tmp_path / "old.json"
+    path.write_text(
+        '[{"parts":[{"content":"try again","tool_name":null,"tool_call_id":"r1",'
+        '"timestamp":"2026-01-02T03:04:05Z","part_kind":"retry-prompt"},'
+        '{"content":"bad args","tool_name":"read_file","tool_call_id":"c1",'
+        '"timestamp":"2026-01-02T03:04:05Z","part_kind":"retry-prompt"}],'
+        '"timestamp":"2026-01-02T03:04:05Z","instructions":null,"kind":"request",'
+        '"run_id":null,"conversation_id":null,"metadata":null,"state":"complete"}]'
+    )
+    (request,) = Session(path).load()
+    assert isinstance(request, ModelRequest)
+    assert [getattr(part, "content", None) for part in request.parts] == ["try again", "bad args"]
+    assert getattr(request.parts[1], "tool_call_id", None) == "c1"
 
 
 def test_corrupt_file_raises_actionable_error(tmp_path: Path) -> None:

@@ -98,10 +98,11 @@ copies leading system parts into each new summary message, first-message
 preservation keeps the original too, and pydantic-ai merges consecutive requests on
 replay, so each compacting turn left one more policy copy and one more stale summary
 for the next to preserve. elja now removes exactly those copies after each summary
-(:func:`_drop_compaction_copies`) and never touches a user-authored message. What
-still accumulates, by design, is the user's own prompts: pydantic-ai's merge folds
-each compacted turn's prompt into the preserved first request, and they are real
-messages, so they stay — the floor measurement counts them.
+(:func:`_drop_compaction_copies`) and never touches a user-authored message. The same
+merge folds each compacted turn's prompt into the preserved first request. Through
+harness 0.61 those prompts stay there, as real messages, and the floor measurement
+counts them; from 0.62 the harness summarizes what follows a summary in that
+request, and the floor leaves it out.
 
 Remedies when the floor is the problem, in order of preference. **Carry policy in
 ``instructions=``, not ``system_prompt=``** — it is still protected (it is sent on
@@ -125,6 +126,7 @@ from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import AgentRunError
 from pydantic_ai.messages import (
+    CompactionPart,
     ModelMessage,
     ModelRequest,
     ModelRequestPart,
@@ -356,7 +358,13 @@ UnfitReason = Literal["protected_floor", "no_progress", "budget_exhausted"]
 # so a harness patch that moves them cannot make `import elja` fail. Each one is pinned
 # against the harness's real behavior in tests/test_compaction_bounds.py, so drift fails
 # CI instead of quietly changing what counts as protected.
+#
+# A summary has two shapes. Through harness 0.61 it is a `SystemPromptPart` opening with
+# `_SUMMARY_PREFIX`; from 0.62 it is a `CompactionPart` in a request of its own, marked
+# with `_SUMMARY_METADATA`, and the older shape is still recognized in histories saved
+# before then. elja recognizes both on every supported release.
 _SUMMARY_PREFIX = "Summary of previous conversation:\n\n"
+_SUMMARY_METADATA = "pydantic-ai-harness.compaction.summary.v1"
 _RECEIPT_METADATA = "pydantic-ai-harness.compaction.receipt.v1"
 
 
@@ -543,14 +551,44 @@ class _MeteredSummarizer(WrapperModel):
         return await super().count_tokens(messages, model_settings, model_request_parameters)
 
 
-def _is_summary(part: ModelRequestPart) -> TypeGuard[SystemPromptPart]:
-    """A summary the harness wrote, recognized by the prefix it writes with."""
+def _is_legacy_summary(part: ModelRequestPart) -> TypeGuard[SystemPromptPart]:
+    """A summary written through harness 0.61, recognized by the prefix it opens with."""
     return isinstance(part, SystemPromptPart) and part.content.startswith(_SUMMARY_PREFIX)
 
 
-def _is_harness_marker(part: ModelRequestPart) -> bool:
-    """A pin or a compaction receipt: user-role bookkeeping, not a user turn."""
-    return is_pinned(part) or (
+def _is_marked_summary(part: ModelRequestPart) -> TypeGuard[CompactionPart]:
+    """A summary written by harness 0.62 or later, as the harness's ``is_summary_part`` sees it.
+
+    The marker is in the part's metadata; a provider's own compaction carries provider
+    data instead and is never one. ``getattr``: ``CompactionPart`` has no ``metadata``
+    before pydantic-ai 2.62, and no summary of this shape exists there.
+    """
+    if not isinstance(part, CompactionPart):
+        return False
+    metadata = getattr(part, "metadata", None)
+    return (
+        isinstance(metadata, dict)
+        and metadata.get(_SUMMARY_METADATA) is True
+        and part.provider_name is None
+        and part.id is None
+        and part.provider_details is None
+        and bool(part.content)
+    )
+
+
+def _is_summary(part: ModelRequestPart) -> TypeGuard[SystemPromptPart | CompactionPart]:
+    """A summary the harness wrote, in either shape."""
+    return _is_legacy_summary(part) or _is_marked_summary(part)
+
+
+def _summary_text(part: SystemPromptPart | CompactionPart) -> str:
+    """What a summary says, without the prefix the older shape opens with."""
+    return (part.content or "").removeprefix(_SUMMARY_PREFIX)
+
+
+def _is_receipt(part: ModelRequestPart) -> bool:
+    """A compaction receipt, recognized by the metadata the harness writes it with."""
+    return (
         isinstance(part, UserPromptPart)
         and not isinstance(part.content, str)
         and any(
@@ -558,6 +596,11 @@ def _is_harness_marker(part: ModelRequestPart) -> bool:
             for item in part.content
         )
     )
+
+
+def _is_harness_marker(part: ModelRequestPart) -> bool:
+    """A pin or a compaction receipt: user-role bookkeeping, not a user turn."""
+    return is_pinned(part) or _is_receipt(part)
 
 
 def _leading_system_parts(messages: list[ModelMessage]) -> list[SystemPromptPart]:
@@ -589,6 +632,41 @@ def _first_user_message(messages: list[ModelMessage]) -> ModelRequest | None:
     return None
 
 
+def _kept_first_message_parts(
+    message: ModelRequest, leading: list[SystemPromptPart]
+) -> list[ModelRequestPart]:
+    """What of the first user message the summarizer keeps, as the harness decides it.
+
+    Mirrors the harness's ``_kept_first_user_message``. Receipts, summaries and copies of
+    the leading system parts are dropped, on every supported release. From harness 0.62
+    the request is also cut at the first summary after the user's turn: pydantic-ai
+    merges consecutive requests when a history is replayed, so what follows that summary
+    belongs to later turns, and the new summary covers them. No summary of that shape
+    exists before 0.62, so there the cut never applies.
+    """
+    carried = {part.content for part in leading}
+    parts = message.parts
+    turn = next(
+        (
+            index
+            for index, part in enumerate(parts)
+            if isinstance(part, UserPromptPart) and not _is_harness_marker(part)
+        ),
+        0,
+    )
+    end = next(
+        (index for index in range(turn, len(parts)) if _is_marked_summary(parts[index])),
+        len(parts),
+    )
+    return [
+        part
+        for part in parts[:end]
+        if not _is_receipt(part)
+        and not _is_summary(part)
+        and not (isinstance(part, SystemPromptPart) and part.content in carried)
+    ]
+
+
 def _protected_floor(
     messages: list[ModelMessage], *, preserve_first_user_message: bool
 ) -> list[ModelMessage]:
@@ -603,9 +681,10 @@ def _protected_floor(
     """
     first = _first_user_message(messages) if preserve_first_user_message else None
     last = messages[-1]
+    leading = _leading_system_parts(messages)
     candidates: list[ModelRequestPart] = [
-        *_leading_system_parts(messages),
-        *(first.parts if first is not None else []),
+        *leading,
+        *(_kept_first_message_parts(first, leading) if first is not None else []),
         *(
             part
             for message in messages
@@ -632,38 +711,70 @@ def _protected_floor(
     return [*floor, last] if isinstance(last, ModelResponse) else floor
 
 
+def _capped_tail_start(
+    messages: list[ModelMessage], keep_tokens: int, tokenizer: Callable[[str], int] | None
+) -> int:
+    """Where the longest tail of at most ``keep_tokens`` begins, keeping at least one message.
+
+    How harness 0.27 read ``keep_tokens``. Every harness this release supports (0.59+)
+    reads it as a *minimum* instead: the shortest tail holding at least that many tokens,
+    which keeps one message past the bound however large it is, so a single big tool
+    result could keep every request over target. :class:`BoundedTieredCompaction` hands
+    the tier this tail as a message count, which the harness then moves earlier only to
+    keep tool pairs whole, as 0.27 did.
+    """
+    if estimate_token_count(messages, tokenizer) <= keep_tokens:
+        return 0
+    low, high = 0, len(messages)
+    while low < high:
+        middle = (low + high) // 2
+        if estimate_token_count(messages[middle:], tokenizer) <= keep_tokens:
+            high = middle
+        else:
+            low = middle + 1
+    return min(low, len(messages) - 1)
+
+
 def _single_previous_summary(messages: list[ModelMessage]) -> list[ModelMessage]:
     """Fold several earlier summaries into one, so the summarizer's anchor holds them all.
 
     Histories written before :func:`_drop_compaction_copies` existed carry one summary
-    per compacting turn, merged into the preserved first request. The harness anchors
-    an incremental summary on the *last* one in document order, which is the oldest,
-    and drops the rest from the transcript it summarizes — so the newer summaries'
-    content would be lost the first time copies are dropped. Folding them, newest
-    first, into the first summary's place makes it the only anchor.
+    per compacting turn. The harness anchors an incremental summary on the newest and
+    leaves every other summary out of the transcript it summarizes, so their content
+    would be lost the first time copies are dropped. Folding them all, newest first,
+    into the anchor's place makes it the only anchor. The newest is the last summary of
+    the newer shape if there is one, else the first of the older shape, which each pass
+    put ahead of the ones before it: the harness's own choice, in both shapes.
     """
-    summaries = [
+    found: list[SystemPromptPart | CompactionPart] = [
         part
         for message in messages
         if isinstance(message, ModelRequest)
         for part in message.parts
         if _is_summary(part)
     ]
-    if len(summaries) < 2:
+    newest_first: list[SystemPromptPart | CompactionPart] = [
+        *reversed([part for part in found if _is_marked_summary(part)]),
+        *(part for part in found if _is_legacy_summary(part)),
+    ]
+    if len(newest_first) < 2:
         return messages
+    anchor = newest_first[0]
+    text = "\n\n".join(_summary_text(part) for part in newest_first)
     folded = replace(
-        summaries[0],
-        content=_SUMMARY_PREFIX
-        + "\n\n".join(part.content.removeprefix(_SUMMARY_PREFIX) for part in summaries),
+        anchor, content=text if isinstance(anchor, CompactionPart) else _SUMMARY_PREFIX + text
     )
     result: list[ModelMessage] = []
     for message in messages:
         if isinstance(message, ModelRequest) and any(_is_summary(p) for p in message.parts):
             parts = [
-                folded if part is summaries[0] else part
+                folded if part is anchor else part
                 for part in message.parts
-                if not _is_summary(part) or part is summaries[0]
+                if not _is_summary(part) or part is anchor
             ]
+            if not parts:
+                # A summary of the newer shape is a request of its own.
+                continue
             message = replace(message, parts=parts)
         result.append(message)
     return result
@@ -761,6 +872,11 @@ class BoundedTieredCompaction(TieredCompaction[DepsT]):
     Only ``SummarizingCompaction`` tiers given directly are metered, and their
     ``model`` must be ``None`` (inherit the request's model) or a ``Model`` instance:
     a model *name* would make the summarizer build its own client, outside the bound.
+
+    A metered tier's ``keep_tokens`` caps its verbatim tail (see
+    :func:`_capped_tail_start`), as it did on harness 0.27; the harness itself now reads
+    it as a minimum. A tier with ``keep_user_messages`` keeps the harness's reading,
+    since its retention rules are built around it.
     """
 
     max_summarizer_requests: int = field(default=3, kw_only=True)
@@ -814,7 +930,10 @@ class BoundedTieredCompaction(TieredCompaction[DepsT]):
             record_compaction_reclaim,
         )
 
-        messages: list[ModelMessage] = list(request_context.messages)
+        # The run's history, as upstream reads it. On every supported pydantic-ai a hook's
+        # `request_context.messages` is a request-only copy, so the history to compact and
+        # to write back is `ctx.messages`.
+        messages: list[ModelMessage] = list(ctx.messages)
         request_ctx = context_for_request(ctx, request_context)
         target = self._target(request_ctx.model)
         parameters = request_context.model_request_parameters
@@ -831,13 +950,16 @@ class BoundedTieredCompaction(TieredCompaction[DepsT]):
             compact=lambda: self._escalate_bounded(messages, request_ctx, target, parameters),
             tokenizer=self.tokenizer,
         )
+        # Assigning `request_context.messages` no longer persists anything: the compacted
+        # history is written to the run's own list, so the next request and the run's
+        # result carry it, and the request goes out with it.
+        ctx.messages[:] = compacted
         record_compaction_reclaim(
-            request_context,
+            ctx,
             estimate_token_count(messages, self.tokenizer),
             estimate_token_count(compacted, self.tokenizer),
         )
-        request_context.messages = compacted
-        return request_context
+        return replace(request_context, messages=compacted)
 
     async def _escalate_bounded(
         self,
@@ -930,6 +1052,13 @@ class BoundedTieredCompaction(TieredCompaction[DepsT]):
                 model=_MeteredSummarizer(ctx.model, self._state, self.max_summarizer_requests),
             )
         prepared = _single_previous_summary(messages)
+        if tier.keep_tokens is not None and not tier.keep_user_messages:
+            tier = replace(
+                tier,
+                keep_tokens=None,
+                keep_messages=len(prepared)
+                - _capped_tail_start(prepared, tier.keep_tokens, tier.tokenizer),
+            )
         try:
             compacted = await tier.compact(prepared, ctx)
         except _SummarizerBudgetSpentError:
@@ -1086,7 +1215,9 @@ def build_compaction(
                     # Token-bound the verbatim tail, so the ordinary tail can never be
                     # what keeps a request over target. What it cannot bound — pins,
                     # the first user message, system policy — is the protected floor,
-                    # which BoundedTieredCompaction measures before paying.
+                    # which BoundedTieredCompaction measures before paying. A cap only
+                    # because BoundedTieredCompaction makes it one: the harness alone
+                    # reads keep_tokens as a minimum.
                     keep_tokens=cfg.target_tokens // 3,
                     preserve_first_user_message=preserve_first_user_message,
                     incremental=True,

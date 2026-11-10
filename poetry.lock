@@ -29,23 +29,24 @@ files = [
 
 [[package]]
 name = "anthropic"
-version = "1.2.0"
+version = "1.15.0"
 description = "The official Python library for the anthropic API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main", "dev"]
 files = [
-    {file = "anthropic-1.2.0-py3-none-any.whl", hash = "sha256:b60642b3e3cd6b8e3e328a2d3f2863ad2b6e743f1037e42cc0143f7df99f63c6"},
-    {file = "anthropic-1.2.0.tar.gz", hash = "sha256:12f8eedee7b7fb5685837b1371b7bfae1b281703f62355f4632598ec2fc53b34"},
+    {file = "anthropic-1.15.0-py3-none-any.whl", hash = "sha256:10189a7993c5c71a0a2d4bb80020ca6a2fd27679f51e627405da37251d15ff49"},
+    {file = "anthropic-1.15.0.tar.gz", hash = "sha256:90caa9df83e2fc8bddb4ddeb83b7191bce255f635c03eae055deec521741df08"},
 ]
 markers = {main = "extra == \"anthropic\""}
 
 [package.dependencies]
-anyio = ">=3.5.0,<5"
+anyio = ">=4.1.0,<5"
 docstring-parser = ">=0.15,<1"
 httpx2 = ">=2.0.0,<3"
 jiter = ">=0.4.0,<1"
-pydantic = ">=1.9.0,<3"
+opentelemetry-api = ">=1.1.0,<2"
+pydantic = ">=1.10.0,<3"
 sniffio = ">=1,<2"
 typing-extensions = ">=4.14,<5"
 
@@ -978,14 +979,14 @@ files = [
 
 [[package]]
 name = "genai-prices"
-version = "0.1.4"
+version = "0.1.13"
 description = "Calculate prices for calling LLM inference APIs."
 optional = false
 python-versions = ">=3.10"
 groups = ["main", "dev"]
 files = [
-    {file = "genai_prices-0.1.4-py3-none-any.whl", hash = "sha256:1d1b01cc7ab1adfa17c3a1121f4c13990bd0a4377640ecd37ebfde5836768240"},
-    {file = "genai_prices-0.1.4.tar.gz", hash = "sha256:f3b8a0bf0c21b01f5af3ca42babcab2f17728bf3c602f87f42b72d1d2bf61d98"},
+    {file = "genai_prices-0.1.13-py3-none-any.whl", hash = "sha256:6d2b40760a2f7f5e207bac9b98de0af80e60c58ead497872a5331a7cee610477"},
+    {file = "genai_prices-0.1.13.tar.gz", hash = "sha256:76c9e2dd3917fdacdf3bc562297c4591384142ea2283c477e1512fafa4e3a384"},
 ]
 
 [package.dependencies]
@@ -1028,14 +1029,14 @@ urllib3 = ["packaging (>=20.0)", "urllib3 (>=1.26.15,<3.0.0)"]
 
 [[package]]
 name = "google-genai"
-version = "2.20.0"
+version = "2.30.1"
 description = "GenAI Python SDK"
 optional = false
 python-versions = ">=3.10"
 groups = ["main", "dev"]
 files = [
-    {file = "google_genai-2.20.0-py3-none-any.whl", hash = "sha256:49bddeccd29a4e6bf1706c5de67735f7115f537f08b6c36a70b8023c99399095"},
-    {file = "google_genai-2.20.0.tar.gz", hash = "sha256:d382186f024e9050a7a4b25af6eacba9aa16c6e09594f5d1b530f22ff7f9d76f"},
+    {file = "google_genai-2.30.1-py3-none-any.whl", hash = "sha256:1bb8961c60f7100439a45067a32764a18da0f8d0f95954ffc777d1f8225a2469"},
+    {file = "google_genai-2.30.1.tar.gz", hash = "sha256:a348b28b86a98fbc8e0bea759e14ae3ac807954355df8638079715d027cd14d5"},
 ]
 markers = {main = "extra == \"google\""}
 
@@ -2134,19 +2135,19 @@ files = [
 
 [[package]]
 name = "openai"
-version = "3.6.0"
+version = "3.31.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.6.0-py3-none-any.whl", hash = "sha256:508e2158bf971687f953b62e44b02f207792c815aac306816386d7ba34d37f5f"},
-    {file = "openai-3.6.0.tar.gz", hash = "sha256:18fe3f6e96390ef41ee27b152fc9effefca321c33673bd9b956a572493d3ab9b"},
+    {file = "openai-3.31.0-py3-none-any.whl", hash = "sha256:e5839f6670483f368de40ce3422f524c1afaf12ff8660539f53489e200db8d78"},
+    {file = "openai-3.31.0.tar.gz", hash = "sha256:58110edba9acaf29cb2a675a1cbcccdd9f2fdb4932baed474dc847a7639e5d02"},
 ]
 
 [package.dependencies]
 anyio = ">=4.10.0,<5"
-httpx2 = ">=2.7.0,<3"
+httpx2 = ">=2.12.0,<3"
 jiter = ">=0.16.0,<1"
 pydantic = ">=1.10.13,<2.0.dev0 || >=2.4.dev0,<3"
 sniffio = "*"
@@ -2434,109 +2435,139 @@ timezone = ["tzdata ; python_version >= \"3.9\" and platform_system == \"Windows
 
 [[package]]
 name = "pydantic-ai-harness"
-version = "0.27.0"
+version = "0.66.0"
 description = "The official capability library and harness for Pydantic AI"
 optional = false
-python-versions = ">=3.10"
+python-versions = ">=3.11"
 groups = ["main"]
 files = [
-    {file = "pydantic_ai_harness-0.27.0-py3-none-any.whl", hash = "sha256:3bd4d44c26a50b15be37ddb341a8e8ed6466d979e5bab114054bbdc885f54555"},
-    {file = "pydantic_ai_harness-0.27.0.tar.gz", hash = "sha256:c3ed6cd4adef9530e325477079b3d761d6d859e9113cf041e7702a2d2b4162a5"},
+    {file = "pydantic_ai_harness-0.66.0-py3-none-any.whl", hash = "sha256:d98e2e8c57dd34560ad0a83c5611d9b57c30c7572f2bde276d3b99c4d99ab025"},
+    {file = "pydantic_ai_harness-0.66.0.tar.gz", hash = "sha256:d646caf7cf0f83ced707d88dbc387bd73f3ff78cd6e34722665cf527dcfe6674"},
 ]
 
 [package.dependencies]
 genai-prices = ">=0.0.71"
 httpx = ">=0.28.1"
-pydantic-ai-slim = ">=2.33.0"
+pydantic-ai-slim = "2.66.0"
 
 [package.extras]
+absurd = ["absurd-sdk (>=0.5.0,<1)"]
 acp = ["agent-client-protocol (>=0.11,<0.12)"]
-anthropic = ["pydantic-ai-slim[anthropic] (>=2.33.0)"]
+anthropic = ["pydantic-ai-slim[anthropic] (==2.66.0)"]
+aws-lambda = ["aws-durable-execution-sdk-python (>=1.7.0,<2) ; python_full_version >= \"3.11.0\""]
+azure-durable-task = ["durabletask (>=1.13.0,<2)", "durabletask-azuremanaged (>=1.13.0,<2)"]
+boxd = ["boxd (>=0.2.20,<0.3)"]
+boxlite = ["boxlite (>=0.10.7,<0.11) ; python_full_version < \"3.15.0\" and (sys_platform == \"darwin\" and platform_machine == \"arm64\" or sys_platform == \"linux\" and (platform_machine == \"x86_64\" or platform_machine == \"aarch64\"))"]
 browser-use = ["browser-use (>=0.13.6,<0.14) ; python_full_version >= \"3.11.0\""]
-cli = ["pydantic-ai-slim[cli] (>=2.33.0)"]
-code-mode = ["pydantic-ai-slim[duckduckgo] (>=2.33.0)", "pydantic-monty (>=0.0.19)"]
-codemode = ["pydantic-ai-slim[duckduckgo] (>=2.33.0)", "pydantic-monty (>=0.0.19)"]
-dbos = ["pydantic-ai-slim[dbos]"]
-dynamic-workflow = ["pydantic-monty (>=0.0.19)"]
+cli = ["pydantic-ai-slim[cli] (==2.66.0)"]
+code-mode = ["pydantic-ai-slim[duckduckgo] (==2.66.0)", "pydantic-monty (>=1.4.0,<2)"]
+codemode = ["pydantic-ai-slim[duckduckgo] (==2.66.0)", "pydantic-monty (>=1.4.0,<2)"]
+coder = ["json-repair (>=0.58.0)", "ripgrep (==14.1.0) ; sys_platform != \"android\""]
+day-ai = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+daytona = ["daytona (>=0.226.1,<1)"]
+dbos = ["pydantic-ai-slim[dbos] (==2.66.0)"]
+dynamic-workflow = ["pydantic-monty (>=1.0.0,<2)"]
+e2b = ["e2b (>=2.48.0)"]
 exa = ["exa-py (>=2.16.0)"]
-logfire = ["logfire (>=4.31.0)", "pydantic-ai-slim[spec] (>=2.18.0)"]
-modal = ["modal (>=1.5.0)"]
+github = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+google-workspace = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+grain = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+ipython = ["ipykernel (>=6.29.0)", "jupyter-client (>=8.6.3)"]
+linear = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+logfire = ["logfire (>=4.31.0)", "pydantic-ai-slim[spec] (==2.66.0)", "pydantic-handlebars (>=0.2.1)"]
+logfire-mcp = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+modal = ["modal (>=1.5.2)"]
 mongodb = ["pymongo (>=4.17.0)"]
+notion = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+opensandbox = ["opensandbox (>=1.1.1,<2)"]
+ordinal = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+pgtask = ["pgtask (>=0.2.0,<1)"]
+pixeltable = ["pixeltable (>=0.7.21) ; python_full_version >= \"3.11.0\" and python_version < \"3.15\""]
 playwright = ["idna (>=3.4)", "playwright (>=1.61.0)"]
+posthog = ["pydantic-ai-slim[mcp] (==2.66.0)"]
 prompt-injection-defender = ["stackone-defender (>=0.7.3,<0.8) ; python_full_version >= \"3.11.0\""]
-prompt-injection-defender-ml = ["stackone-defender[onnx] (>=0.7.3,<0.8) ; python_full_version >= \"3.11.0\""]
-researcher = ["pydantic-ai-slim[duckduckgo,web-fetch] (>=2.33.0)"]
+prompt-injection-defender-ml = ["stackone-defender (>=0.7.3,<0.8) ; python_full_version >= \"3.11.0\"", "stackone-defender[onnx] (>=0.7.3,<0.8) ; python_full_version >= \"3.11.0\" and python_version < \"3.15\""]
+pylon = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+render = ["render (>=1.6.0)"]
+repair-tool-arguments = ["json-repair (>=0.58.0)"]
+researcher = ["pydantic-ai-slim[duckduckgo,web-fetch] (==2.66.0)"]
 skills = ["pyyaml (>=6.0.2)"]
-stackone = ["fastmcp (>=3.4.5,<4)", "pydantic-ai-slim[mcp] (>=2.18.0)"]
-temporal = ["pydantic-ai-slim[temporal]"]
-youdotcom = ["youdotcom (>=3.1.1,<4)"]
+slack = ["pydantic-ai-slim[mcp] (==2.66.0)"]
+smol = ["smolmachines (>=1.22.2,<2) ; sys_platform == \"darwin\" and platform_machine == \"arm64\" or sys_platform == \"linux\" and (platform_machine == \"x86_64\" or platform_machine == \"aarch64\")"]
+sprites = ["sprites-py (>=0.7.0,<0.8)"]
+stackone = ["beartype (>=0.23.0rc2) ; python_version >= \"3.15\"", "fastmcp (>=3.4.5,<4)", "pydantic-ai-slim[mcp] (==2.66.0)"]
+temporal = ["pydantic-ai-slim[temporal] (==2.66.0)"]
+youdotcom = ["youdotcom (>=3.1.2,<3.2)"]
 
 [[package]]
 name = "pydantic-ai-slim"
-version = "2.36.0"
+version = "2.66.0"
 description = "AI Agent Framework, the Pydantic way, slim package"
 optional = false
-python-versions = ">=3.10"
+python-versions = ">=3.11"
 groups = ["main", "dev"]
 files = [
-    {file = "pydantic_ai_slim-2.36.0-py3-none-any.whl", hash = "sha256:90957c37c99d3bfbfab4be632b733bf50d563686fbfbf8a2e42b6c91a4fca877"},
-    {file = "pydantic_ai_slim-2.36.0.tar.gz", hash = "sha256:43b53401099352bbb0d1a1ecbcf8855bb7c3d0c680311ba006c5549ed6d61039"},
+    {file = "pydantic_ai_slim-2.66.0-py3-none-any.whl", hash = "sha256:c47bbd0abe6f51e5400308a53b4f7e3409a582b1459140c381e3d4701a205608"},
+    {file = "pydantic_ai_slim-2.66.0.tar.gz", hash = "sha256:78968fa75086ddae9039bdaa3939e9510f15a40d5f1f58fb3ded04386f9292f2"},
 ]
 
 [package.dependencies]
-anthropic = {version = ">=1.0.0", optional = true, markers = "extra == \"anthropic\""}
+anthropic = {version = ">=1.15.0", optional = true, markers = "extra == \"anthropic\""}
 anyio = ">=4.7.0"
 fastmcp-slim = {version = ">=3.3.0,<5", extras = ["client"], optional = true, markers = "extra == \"mcp\""}
-genai-prices = ">=0.1.4"
-google-genai = {version = ">=2.18.0", optional = true, markers = "extra == \"google\""}
+genai-prices = ">=0.1.13"
+google-genai = {version = ">=2.30.0", optional = true, markers = "extra == \"google\""}
 griffelib = ">=2.0"
 httpx2 = ">=2.7"
-openai = {version = ">=3.0.0", optional = true, markers = "extra == \"openai\""}
+openai = {version = ">=3.31.0", optional = true, markers = "extra == \"openai\""}
 opentelemetry-api = ">=1.28.0"
 pydantic = ">=2.12"
-pydantic-graph = "2.36.0"
+pydantic-graph = "2.66.0"
 tiktoken = {version = ">=0.12.0", optional = true, markers = "extra == \"openai\""}
 typing-inspection = ">=0.4.0"
 
 [package.extras]
 ag-ui = ["ag-ui-protocol (>=0.1.10)", "starlette (>=0.46.2)"]
-anthropic = ["anthropic (>=1.0.0)"]
+anthropic = ["anthropic (>=1.15.0)"]
 bedrock = ["boto3 (>=1.42.63)"]
-bedrock-mantle = ["botocore (>=1.42.63)", "openai (>=3.0.0)"]
-cerebras = ["openai (>=3.0.0)"]
+bedrock-mantle = ["botocore (>=1.42.63)", "openai (>=3.31.0)"]
+cerebras = ["openai (>=3.31.0)"]
 cli = ["argcomplete (>=3.5.0)", "prompt-toolkit (>=3)", "pyperclip (>=1.9.0)", "pyyaml (>=6.0.2)", "rich (>=13)"]
 cohere = ["cohere (>=5.20.6) ; platform_system != \"Emscripten\""]
-crusoe = ["openai (>=3.0.0)"]
+crusoe = ["openai (>=3.31.0)"]
 dbos = ["dbos (>=2.10.0)"]
 duckduckgo = ["ddgs (>=9.0.0)"]
-evals = ["pydantic-evals (==2.36.0)"]
+elevenlabs-agents-realtime = ["websockets (>=14.0)"]
+elevenlabs-realtime = ["openai (>=3.31.0)", "tiktoken (>=0.12.0)", "websockets (>=14.0)"]
+evals = ["pydantic-evals (==2.66.0)"]
 exa = ["exa-py (>=2.0.0)"]
-google = ["google-genai (>=2.18.0)"]
-google-realtime = ["google-genai (>=2.18.0)", "websockets (>=14.0)"]
+google = ["google-genai (>=2.30.0)"]
+google-realtime = ["google-genai (>=2.30.0)", "websockets (>=14.0)"]
 groq = ["groq (>=0.25.0)"]
 huggingface = ["hf-xet (<1.5.0) ; platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\"", "huggingface-hub (>=1.3.4,<2.0.0)"]
 logfire = ["logfire[httpx] (>=4.39.0)", "opentelemetry-instrumentation-httpx (>=0.65b0)"]
 mcp = ["fastmcp-slim[client] (>=3.3.0,<5)"]
 mcp-tasks = ["fastmcp-slim[client] (>=4.0.0b1,<5)", "fastmcp-tasks (>=4.0.0b1,<5)"]
-mistral = ["mistralai (>=2.9.2)"]
-openai = ["openai (>=3.0.0)", "tiktoken (>=0.12.0)"]
-openai-realtime = ["openai (>=3.0.0)", "tiktoken (>=0.12.0)", "websockets (>=14.0)"]
-openrouter = ["openai (>=3.0.0)"]
-prefect = ["prefect (>=3.7.5)"]
+mistral = ["mistralai (>=3.1.0)"]
+openai = ["openai (>=3.31.0)", "tiktoken (>=0.12.0)"]
+openai-realtime = ["openai (>=3.31.0)", "tiktoken (>=0.12.0)", "websockets (>=14.0)"]
+openrouter = ["openai (>=3.31.0)"]
+prefect = ["prefect (>=3.9.0)"]
 realtime = ["websockets (>=14.0)"]
 retries = ["httpx (>=0.27)", "tenacity (>=8.2.3)"]
 sentence-transformers = ["sentence-transformers (>=5.2.0) ; python_version < \"3.14\""]
-snowflake = ["openai (>=3.0.0)"]
+snowflake = ["openai (>=3.31.0)"]
 spec = ["pydantic-handlebars (>=0.1.0)", "pyyaml (>=6.0.2)"]
 tavily = ["tavily-python (>=0.5.0)"]
-temporal = ["temporalio (>=1.24.0)"]
+temporal = ["temporalio (>=1.27.0)"]
+typesafe = ["typesafe-sdk (>=0.6.0)"]
 ui = ["starlette (>=0.46.2)"]
 voyageai = ["voyageai (>=0.3.7) ; python_version < \"3.14\""]
 web = ["starlette (>=1.3.1)", "uvicorn (>=0.38.0)"]
 web-fetch = ["markdownify (>=1.2)"]
-xai = ["xai-sdk (>=1.14.0)"]
-xai-realtime = ["openai (>=3.0.0)", "tiktoken (>=0.12.0)", "websockets (>=14.0)", "xai-sdk (>=1.14.0)"]
-zai = ["openai (>=3.0.0)"]
+xai = ["xai-sdk (>=1.16.0)"]
+xai-realtime = ["openai (>=3.31.0)", "tiktoken (>=0.12.0)", "websockets (>=14.0)", "xai-sdk (>=1.16.0)"]
+zai = ["openai (>=3.31.0)"]
 
 [[package]]
 name = "pydantic-core"
@@ -2673,14 +2704,14 @@ typing-extensions = ">=4.14.1"
 
 [[package]]
 name = "pydantic-graph"
-version = "2.36.0"
+version = "2.66.0"
 description = "Graph and state machine library"
 optional = false
-python-versions = ">=3.10"
+python-versions = ">=3.11"
 groups = ["main", "dev"]
 files = [
-    {file = "pydantic_graph-2.36.0-py3-none-any.whl", hash = "sha256:c0c7cddb87038298b367036d799b4b605b2a23858869b2b661706df6e1b811f2"},
-    {file = "pydantic_graph-2.36.0.tar.gz", hash = "sha256:1222b50a141f88bca299dc21e94694277e6ef60d6f1bbbf490f2f2796851594a"},
+    {file = "pydantic_graph-2.66.0-py3-none-any.whl", hash = "sha256:5b2a0aafc569c00fdb36879b1e80bed06ed5926979e2c1d44533222f208fd2ec"},
+    {file = "pydantic_graph-2.66.0.tar.gz", hash = "sha256:af31fd3ad5f3446556a270b14e1a43b12996f4bb52a0511f58f739dbacadb3f9"},
 ]
 
 [package.dependencies]
@@ -3936,4 +3967,4 @@ google = ["pydantic-ai-slim"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "a8c951fc16858832424c3b5b10498ed08fcd714348c8f6ff7d37ed27355f41ac"
+content-hash = "fb6e825f6f50783b58f97cca3b329ac8f8e674c1560ea13ba019b66ce9dbc868"

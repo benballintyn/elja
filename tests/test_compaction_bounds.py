@@ -18,14 +18,16 @@ was written against. Where anchoring itself is the point, the test says so.
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic_ai import Agent, CancellationToken, RunContext
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import RunCancelled, UnexpectedModelBehavior
 from pydantic_ai.messages import (
+    CompactionPart,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -36,7 +38,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model, ModelRequestParameters
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
@@ -49,6 +51,7 @@ from pydantic_ai_harness.compaction import (
     SummarizingCompaction,
     TieredCompaction,
     compact_now,
+    estimate_token_count,
     is_pinned,
     pin,
 )
@@ -61,14 +64,19 @@ from elja.compaction import (
     TargetUnreachable,
     TargetUnreachableError,
     UnfitReason,
+    _capped_tail_start,
     _drop_compaction_copies,
     _first_user_message,
     _is_harness_marker,
+    _is_summary,
+    _kept_first_message_parts,
     _leading_system_parts,
     _MeteredSummarizer,
     _protected_floor,
     _RunState,
+    _single_previous_summary,
     _SummarizerBudgetSpentError,
+    _summary_text,
     build_compaction,
     proceed_over_target,
 )
@@ -76,6 +84,27 @@ from elja.deps import EljaDeps
 from elja.settings import CompactionConfig, EljaSettings, SubagentConfig, WorkspaceConfig
 
 NO_ANCHOR = RequestUsage(output_tokens=1)
+
+# Harness 0.62 writes a summary as a marked `CompactionPart` in a request of its own, and
+# `CompactionPart` takes no `metadata` before pydantic-ai 2.62. Tests that build a summary
+# of that shape by hand run only where one can exist.
+needs_marked_summaries = pytest.mark.skipif(
+    "metadata" not in {field.name for field in fields(CompactionPart)},
+    reason="no summary of the newer shape before pydantic-ai-harness 0.62",
+)
+
+
+def _marked_summary(body: str) -> ModelRequest:
+    """A summary as harness 0.62+ writes it."""
+    return ModelRequest(
+        parts=[
+            CompactionPart(
+                content=body, metadata={"pydantic-ai-harness.compaction.summary.v1": True}
+            )
+        ]
+    )
+
+
 HOST_PLACEHOLDER = "[result cleared; retrieve the saved evidence by its receipt id]"
 
 
@@ -678,6 +707,46 @@ class TestWhatSurvivesBothPaths:
         assert history == snapshot
 
 
+class TestWhatCompactionWritesBack:
+    async def test_the_runs_history_is_compacted_not_a_request_only_change(
+        self, tmp_path: Path
+    ) -> None:
+        """A hook's ``request_context.messages`` is request-only on every supported pydantic-ai.
+
+        So, as upstream's own hook does, compaction reads and writes back the run's history
+        (``ctx.messages``): a message an earlier capability added to this request alone is
+        never persisted by it.
+        """
+        note = "REQUEST-ONLY NOTE"
+
+        @dataclass(kw_only=True)
+        class RequestOnlyNote(AbstractCapability[EljaDeps]):
+            async def before_model_request(
+                self, ctx: RunContext[EljaDeps], request_context: ModelRequestContext
+            ) -> ModelRequestContext:
+                extra = ModelRequest(parts=[UserPromptPart(content=note)])
+                return replace(request_context, messages=[*request_context.messages, extra])
+
+        settings = _settings(tmp_path)
+        agent = Agent(
+            _script([], steps=1),
+            deps_type=EljaDeps,
+            capabilities=[RequestOnlyNote(), *build_compaction(settings, on_unfit=_recording([]))],
+        )
+        history = _history(8)
+        result = await agent.run(
+            "carry on", message_history=history, deps=EljaDeps.from_settings(settings)
+        )
+        persisted = result.all_messages()
+        # Compaction did fire and write back, so the absence below is a real constraint.
+        assert estimate_token_count(persisted) < estimate_token_count(history)
+        assert not any(
+            isinstance(part, UserPromptPart) and part.content == note
+            for message in persisted
+            for part in message.parts
+        )
+
+
 class TestReportingAfterCompaction:
     async def test_the_reading_is_the_request_that_was_sent(self, tmp_path: Path) -> None:
         """Over target on the cannot-fit path, and at most what the report predicted."""
@@ -923,11 +992,49 @@ class TestTheHarnessMarkersAreTheHarnesss:
     """elja spells these out rather than importing private modules; drift fails here."""
 
     def test_the_summary_prefix(self) -> None:
-        from pydantic_ai_harness.compaction import _summarizing_compaction
+        from pydantic_ai_harness.compaction import _summarizing_compaction as module
 
         from elja.compaction import _SUMMARY_PREFIX
 
-        assert _summarizing_compaction._SUMMARY_PREFIX == _SUMMARY_PREFIX
+        # Renamed from `_SUMMARY_PREFIX` in 0.60; still how 0.62+ recognizes an older summary.
+        harness = getattr(module, "SUMMARY_PREFIX", None) or getattr(
+            module, "_SUMMARY_PREFIX", None
+        )
+        assert harness == _SUMMARY_PREFIX
+
+    @needs_marked_summaries
+    def test_the_summary_marker(self) -> None:
+        from pydantic_ai_harness.compaction._summary import SUMMARY_METADATA_KEY, is_summary_part
+
+        from elja.compaction import _SUMMARY_METADATA
+
+        assert SUMMARY_METADATA_KEY == _SUMMARY_METADATA
+        (part,) = _marked_summary("s").parts
+        assert isinstance(part, CompactionPart)
+        # A provider's own compaction carries provider data, and is not a summary.
+        provider = replace(part, provider_name="anthropic")
+        assert not is_summary_part(provider) and not _is_summary(provider)
+        unmarked = CompactionPart(content="s")
+        assert not is_summary_part(unmarked) and not _is_summary(unmarked)
+        assert is_summary_part(part) and _is_summary(part)
+
+    async def test_what_the_summarizer_writes_is_a_summary_to_elja(self) -> None:
+        """Whichever shape the installed harness writes, elja recognizes it."""
+        roles: list[str] = []
+        compacted = await compact_now(
+            SummarizingCompaction(max_messages=1, keep_messages=1),
+            _history(4),
+            model=_script(roles, summaries=lambda n: "## Intent\nwritten"),
+        )
+        written = [
+            part
+            for message in compacted
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if _is_summary(part)
+        ]
+        assert roles == ["summarizer"]
+        assert [_summary_text(part) for part in written] == ["## Intent\nwritten"]
 
     def test_receipts_and_pins_are_markers_and_user_turns_are_not(self) -> None:
         assert _is_harness_marker(make_receipt_part("[History before this point ...]"))
@@ -968,6 +1075,49 @@ class TestTheHarnessMarkersAreTheHarnesss:
 
         assert _leading_system_parts(messages) == _extract_system_prompts(messages)
         assert _first_user_message(messages) is find_first_user_message(messages)
+
+    @pytest.mark.parametrize("messages", CORPUS, ids=[str(i) for i in range(len(CORPUS))])
+    def test_the_kept_first_message_agrees(self, messages: list[ModelMessage]) -> None:
+        from pydantic_ai_harness.compaction._summarizing_compaction import (
+            _kept_first_user_message,
+        )
+
+        first = _first_user_message(messages)
+        if first is None:
+            return
+        leading = _leading_system_parts(messages)
+        assert _kept_first_message_parts(first, leading) == list(
+            _kept_first_user_message(first, leading).parts
+        )
+
+    @needs_marked_summaries
+    def test_a_summary_of_the_newer_shape_ends_the_kept_first_message(self) -> None:
+        """Replay merges the turn after a summary into the first request; 0.62+ summarizes it.
+
+        So the floor must not count it: a large later prompt there would otherwise read as
+        protected and refuse a summary that would have fit.
+        """
+        from pydantic_ai_harness.compaction._summarizing_compaction import (
+            _kept_first_user_message,
+        )
+
+        policy = SystemPromptPart(content="P")
+        later = UserPromptPart(content="a later turn " * 300)
+        first = ModelRequest(
+            parts=[policy, UserPromptPart(content="task"), *_marked_summary("s").parts, later]
+        )
+        messages: list[ModelMessage] = [first, *_history(1)[1:]]
+        leading = _leading_system_parts(messages)
+        kept = _kept_first_message_parts(first, leading)
+        assert kept == list(_kept_first_user_message(first, leading).parts)
+        assert kept == [first.parts[1]]
+        floor = _protected_floor(messages, preserve_first_user_message=True)
+        assert not any(part is later for message in floor for part in message.parts)
+
+        # A summary AHEAD of the user's turn (written while it was not kept) cuts nothing.
+        ahead = ModelRequest(parts=[*_marked_summary("s").parts, UserPromptPart(content="task")])
+        kept = _kept_first_message_parts(ahead, [])
+        assert kept == list(_kept_first_user_message(ahead, []).parts) == [ahead.parts[1]]
 
 
 def _summary(body: str) -> SystemPromptPart:
@@ -1012,9 +1162,10 @@ class TestCopyNormalization:
     ) -> None:
         """A history written before the fix carries one summary per compacting turn.
 
-        The harness would anchor on the oldest and skip the rest, so their content
-        would be lost the moment copies are dropped. Folded, the summarizer is handed
-        all of them, and what comes back has one summary.
+        The harness anchors on one and leaves the rest out of the transcript, so their
+        content would be lost the moment copies are dropped. Folded, the summarizer is
+        handed all of them, and what comes back has one summary, in whichever shape the
+        installed harness writes.
         """
         anchors: list[str] = []
 
@@ -1045,11 +1196,90 @@ class TestCopyNormalization:
         summaries = [
             p
             for m in result.all_messages()
+            if isinstance(m, ModelRequest)
             for p in m.parts
-            if isinstance(p, SystemPromptPart) and p.content.startswith("Summary of")
+            if _is_summary(p)
         ]
         assert len(summaries) == 1
-        assert "folded" in summaries[0].content
+        assert _summary_text(summaries[0]) == "## Intent\nfolded"
+
+    @needs_marked_summaries
+    def test_summaries_of_either_shape_fold_into_the_newest(self) -> None:
+        """The newer shape's newest is its last; any of it is newer than the older shape."""
+        history: list[ModelMessage] = [
+            ModelRequest(parts=[_summary("LEGACY facts"), UserPromptPart(content="the task")]),
+            _marked_summary("OLDER facts"),
+            ModelResponse(parts=[TextPart(content="r")]),
+            _marked_summary("NEWER facts"),
+            ModelRequest(parts=[UserPromptPart(content="now")]),
+        ]
+        folded = _single_previous_summary(history)
+        (summary,) = [
+            p for m in folded if isinstance(m, ModelRequest) for p in m.parts if _is_summary(p)
+        ]
+        assert isinstance(summary, CompactionPart)
+        assert summary.content == "NEWER facts\n\nOLDER facts\n\nLEGACY facts"
+        # The newest keeps its place; a request that held only a folded summary is gone.
+        assert folded[0].parts == [history[0].parts[1]]
+        assert folded[1] is history[2] and folded[2].parts == [summary]
+        assert len(folded) == len(history) - 1
+
+
+class TestTheVerbatimTailIsCapped:
+    """``keep_tokens`` caps the verbatim tail, on every supported harness.
+
+    Every supported harness (0.59+) reads it as a minimum, which keeps one message past
+    it however large; so the bound hands the tier the capped tail as a message count.
+    """
+
+    def test_a_history_within_the_cap_is_kept_whole(self) -> None:
+        history = _history(3)
+        size = estimate_token_count(history)
+        assert _capped_tail_start(history, size, None) == 0
+        assert _capped_tail_start(history, size - 1, None) > 0
+        assert _capped_tail_start([], 0, None) == 0
+
+    def test_the_tail_is_the_longest_that_fits(self) -> None:
+        history = _history(3)
+        cap = estimate_token_count(history[-2:])
+        assert _capped_tail_start(history, cap, None) == len(history) - 2
+        assert _capped_tail_start(history, cap - 1, None) == len(history) - 1
+
+    def test_the_newest_message_is_kept_however_large(self) -> None:
+        history = _history(3)
+        assert estimate_token_count(history[-1:]) > 0
+        assert _capped_tail_start(history, 0, None) == len(history) - 1
+
+    async def test_the_tier_is_handed_the_capped_tail_as_a_message_count(
+        self, mocker: MockerFixture
+    ) -> None:
+        spy = mocker.spy(SummarizingCompaction, "compact")
+        cap = BoundedTieredCompaction(
+            tiers=[SummarizingCompaction(max_messages=1, keep_tokens=2000)],
+            target_tokens=1000,
+            on_unfit=_recording([]),
+        )
+        await compact_now(cap, _history(4), model=_script([]))
+        tier, handed = spy.call_args.args[:2]
+        assert tier.keep_tokens is None
+        assert tier.keep_messages == len(handed) - _capped_tail_start(handed, 2000, None)
+        # Several messages fit, and not all: the count is the cap's, not a sentinel.
+        assert 1 < tier.keep_messages < len(handed)
+
+    async def test_a_tier_keeping_user_turns_reads_keep_tokens_as_its_harness_does(
+        self, mocker: MockerFixture
+    ) -> None:
+        """Its retention rules are built around ``keep_tokens``; translating it would mix two."""
+        spy = mocker.spy(SummarizingCompaction, "compact")
+        cap = BoundedTieredCompaction(
+            tiers=[
+                SummarizingCompaction(max_messages=1, keep_tokens=333, keep_user_messages=True)
+            ],
+            target_tokens=1000,
+            on_unfit=_recording([]),
+        )
+        await compact_now(cap, _history(4), model=_script([]))
+        assert spy.call_args.args[0].keep_tokens == 333
 
 
 class TestTheMeteringWrapper:
