@@ -51,6 +51,7 @@ from pydantic_ai_harness.compaction import (
     SummarizingCompaction,
     TieredCompaction,
     compact_now,
+    estimate_context_tokens,
     estimate_token_count,
     is_pinned,
     pin,
@@ -772,6 +773,55 @@ class TestReportingAfterCompaction:
         assert report.window_tokens is None
         assert report.anchored is False
 
+    async def test_an_anchored_reading_subtracts_what_compaction_removed(
+        self, tmp_path: Path
+    ) -> None:
+        """A provider anchor that survives compaction still counts what was cleared.
+
+        The anchor's ``input_tokens`` measured the bulky tool results that masking then
+        cleared, so the reporter takes the anchor and subtracts the reclaim compaction
+        recorded. Without that record (or with its two sizes swapped) the host is shown
+        the history as it was before compaction: over five times the target here, for a
+        request that fit. Every other reading in this suite is unanchored, where no
+        correction applies, which is how both mutants survived it.
+        """
+        readings: list[ContextUsage] = []
+        sent: list[list[ModelMessage]] = []
+
+        def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            sent.append(list(messages))
+            return ModelResponse(parts=[TextPart(content="ok")], usage=NO_ANCHOR)
+
+        history = _history(8)
+        last_call = history[-2]
+        assert isinstance(last_call, ModelResponse)
+        # An honest anchor: what the provider was sent for that request, by the heuristic.
+        history[-2] = replace(
+            last_call,
+            usage=RequestUsage(input_tokens=estimate_token_count(history[:-2]), output_tokens=1),
+        )
+        # A small last result, so masking alone fits and the anchor is kept in place.
+        history[-1] = ModelRequest(
+            parts=[ToolReturnPart(tool_name="read_row", content="row7", tool_call_id="c7")]
+        )
+        settings = _settings(tmp_path)
+        agent = _agent(
+            FunctionModel(script), settings, extra=[ReportContextUsage(on_usage=readings.append)]
+        )
+        await agent.run("carry on", message_history=history, deps=EljaDeps.from_settings(settings))
+        (reading,) = readings
+        (request,) = sent
+        target = settings.compaction.target_tokens
+        before = [*history, ModelRequest(parts=[UserPromptPart(content="carry on")])]
+        # The anchor survived, and taken alone it overstates the request several times over.
+        assert any(isinstance(m, ModelResponse) and m.usage.input_tokens for m in request)
+        assert estimate_context_tokens(request) > 4 * target
+        # The reading is the anchored size less the heuristic reclaim: the frame compaction
+        # judged the request in, so the host sees the number that decided it fit.
+        reclaimed = estimate_token_count(before) - estimate_token_count(request)
+        assert reading.used_tokens == estimate_context_tokens(before) - reclaimed
+        assert reading.used_tokens <= target
+
     async def test_no_reading_is_taken_for_a_request_that_was_never_sent(
         self, tmp_path: Path
     ) -> None:
@@ -1062,6 +1112,18 @@ class TestTheHarnessMarkersAreTheHarnesss:
         ],
         [ModelResponse(parts=[TextPart(content="r")])],
         [ModelRequest(parts=[SystemPromptPart(content="only")])],
+        # Replay merges consecutive requests, so on harness 0.59-0.61 a receipt and the
+        # older summary shape can land inside the first user's request.
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content="task"),
+                    make_receipt_part("[History before this point]"),
+                    SystemPromptPart(content="Summary of previous conversation:\n\nold"),
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="r")]),
+        ],
     ]
 
     @pytest.mark.parametrize("messages", CORPUS, ids=[str(i) for i in range(len(CORPUS))])

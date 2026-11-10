@@ -365,8 +365,9 @@ async def run_turn_within_capacity(
 
 # pydantic-ai marks the returns it synthesizes for interrupted calls with this
 # metadata key, so repairing a history the way it would leaves nothing for its own
-# repair pass to redo. Spelled out rather than imported: the constant lives in
-# `pydantic_ai._agent_graph`, and an example should not reach into a private module.
+# repair pass to redo. The key is public, with this value, as
+# `pydantic_ai.messages.SYNTHESIZED_TOOL_RETURN_METADATA_KEY` on every supported
+# pydantic-ai (2.59+).
 _SYNTHESIZED_RETURN = "pydantic_ai_synthesized_tool_return"
 
 

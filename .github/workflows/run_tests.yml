@@ -54,3 +54,61 @@ jobs:
           poetry run pytest -m "not integration"
           --cov=src/elja --cov=examples
           --cov-report=xml --cov-report=term --cov-fail-under=100
+
+  floor:
+    # The matrix above tests the lock only. This job tests the lowest
+    # pydantic-ai-harness and pydantic-ai-slim that pyproject.toml admits: it installs
+    # the locked environment, pins the floor over it, and runs the unit suite. No
+    # coverage gate here: some branches only run on newer releases.
+    name: test (floor, 3.11)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: |
+          pipx install poetry
+
+      - name: Cache virtualenv
+        # Its own key: this venv ends up holding the floor, which the matrix's
+        # cached lock venv must never be restored from.
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-floor-${{ runner.os }}-py3.11-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction
+
+      - name: Pin the dependency floor
+        run: >
+          poetry run python -m pip install
+          "pydantic-ai-harness==0.59.0"
+          "pydantic-ai-slim[openai,mcp,anthropic,google]==2.59.0"
+          "pydantic-graph==2.59.0"
+
+      - name: Check the floor is what is installed
+        # Fails the job if the pin did not take, so the suite below cannot quietly
+        # test the lock again.
+        run: |
+          poetry run python - <<'PY'
+          from importlib.metadata import version
+
+          want = {
+              "pydantic-ai-harness": "0.59.0",
+              "pydantic-ai-slim": "2.59.0",
+              "pydantic-graph": "2.59.0",
+          }
+          got = {name: version(name) for name in want}
+          print(got)
+          assert got == want, f"the floor did not take: {got}"
+          PY
+
+      - name: Run tests
+        run: poetry run pytest -m "not integration" --no-cov

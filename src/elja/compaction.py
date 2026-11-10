@@ -22,10 +22,12 @@ pydantic-ai, so they are never subject to compaction. A **system prompt** is a
 different matter and the distinction is load-bearing: ``Agent(system_prompt=...)``
 puts a ``SystemPromptPart`` *into* the first request, i.e. into history, where
 compaction does see it and has to keep it (see "protected content" below).
-Loaded skill BODIES, however, travel as tool returns inside history: if the
-summarization tier drops a load, the skill silently unloads (the catalog
-survives, so the model can re-load it) — the summary prompt is extended to
-call this out.
+Skill BODIES, however, are loaded by a ``load_capability`` exchange inside
+history. On harness 0.59-0.61 a summary that drops the exchange silently unloads
+the skill (the catalog survives, so the model can re-load it); from 0.62 the
+harness records the load again after the summary and the skill stays loaded. The
+summary prompt is extended with a note that holds either way: re-load a skill
+whose instructions are no longer in view.
 
 **Composing this for a host application.** Every piece of the policy above is
 an argument, because the defaults are right for a local workspace and wrong for
@@ -158,13 +160,14 @@ CLEARED_PLACEHOLDER = (
     "(large outputs may also be preserved under .elja/spill/)]"
 )
 
-# The harness's structured summary prompt, extended with a skills warning:
-# loaded skill bodies travel inside history as tool returns, so a summary
-# that drops the load silently unloads the skill.
+# The harness's structured summary prompt, extended with a skills warning. A skill
+# is loaded by a load_capability exchange in history: on harness 0.59-0.61 a summary
+# that drops it unloads the skill, while 0.62+ records the load again after the
+# summary. The summarizer cannot tell which, so the wording holds for both.
 _SKILLS_WARNING = (
-    "If any skills were loaded via load_capability in the conversation, state under "
-    "'## Open questions' that they are no longer loaded and must be re-loaded via "
-    "load_capability before use.\n\n"
+    "If any skills were loaded via load_capability in the conversation, name them under "
+    "'## Open questions' and note that a skill whose instructions no longer appear in the "
+    "conversation must be re-loaded via load_capability before use.\n\n"
 )
 _ANCHOR = "<messages>"
 _FIELD = "messages"
@@ -211,9 +214,11 @@ def _substitutes_whole_transcript(summary_prompt: str) -> bool:
 def extend_summary_prompt(harness_default: str) -> str:
     """Insert elja's skills warning into the harness's summary prompt.
 
-    Loaded skill bodies travel as tool returns inside history, so a summary that
-    drops the load silently unloads the skill. The catalog survives, so the model
-    can re-load it — if it is told.
+    A skill is loaded by a ``load_capability`` exchange inside history. On harness
+    0.59-0.61 a summary that drops the exchange silently unloads the skill; the
+    catalog survives, so the model can re-load it, if it is told. From 0.62 the
+    harness records the load again after the summary, so the warning only asks for a
+    re-load where the instructions are gone.
 
     Args:
         harness_default: The harness's own ``summary_prompt`` default.
@@ -931,8 +936,10 @@ class BoundedTieredCompaction(TieredCompaction[DepsT]):
         )
 
         # The run's history, as upstream reads it. On every supported pydantic-ai a hook's
-        # `request_context.messages` is a request-only copy, so the history to compact and
-        # to write back is `ctx.messages`.
+        # `request_context.messages` is, during the before-chain, a HistoryMirroringMessages:
+        # assigning it changes only the request, while `append`/`extend` still write to
+        # history (deprecated). So the history to compact and to write back is
+        # `ctx.messages`.
         messages: list[ModelMessage] = list(ctx.messages)
         request_ctx = context_for_request(ctx, request_context)
         target = self._target(request_ctx.model)
@@ -1052,6 +1059,10 @@ class BoundedTieredCompaction(TieredCompaction[DepsT]):
                 model=_MeteredSummarizer(ctx.model, self._state, self.max_summarizer_requests),
             )
         prepared = _single_previous_summary(messages)
+        # With keep_tokens=None upstream also skips its "nothing to summarize" early
+        # return and its protected_tail, both keyed on keep_tokens. So one summarizer
+        # request may re-summarize only standing content (a summary, the kept first
+        # message); the budget and the latch bound that, and harness 0.27 did the same.
         if tier.keep_tokens is not None and not tier.keep_user_messages:
             tier = replace(
                 tier,
@@ -1150,16 +1161,16 @@ def build_compaction(
         summary_prompt: Replaces the summarization instruction — the summarizer's
             *user* turn, not its system prompt (upstream's ``instructions``,
             which elja does not expose). ``None`` keeps elja's, which is the
-            harness default plus a note about skills unloading; a host with no
+            harness default plus a note about re-loading skills; a host with no
             skills has no reason to carry that note. Must SUBSTITUTE
             ``{messages}``; see :func:`check_summary_prompt` for why that is
             refused at construction rather than at first use.
         receipts: Leave a deterministic receipt where history was summarized
             away, so the model treats its memory of earlier work as secondhand.
-            Off by default, as upstream has it. Note one receipt accumulates per
-            compaction across a long caller-owned history, each with its own
-            dropped-message count — upstream's de-accumulation does not match
-            once the receipt has been merged into a mixed-parts message.
+            Off by default, as upstream has it. A caller-owned history carries one
+            receipt however many compactions it has been through: each compaction
+            replaces the previous receipt, so its dropped-message count describes
+            the latest compaction only.
         preserve_first_user_message: Keep the run's original task verbatim through
             every tier. On by default, because dropping it is how a long run forgets
             what it was asked to do. It is protected content, so a first message

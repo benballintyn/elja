@@ -630,8 +630,9 @@ class TestSummarizerComposition:
             settings, list(build_compaction(settings, receipts=True)), _mixed_history(8)
         )
         assert "summarizer" in roles
-        # Structural and a COUNT, not a match on upstream's wording: receipts
-        # accumulate one per compaction across a long caller-owned history.
+        # Structural and a COUNT, not a match on upstream's wording: a caller-owned
+        # history carries one receipt, replaced at each compaction (measured over five
+        # turns on harness 0.59, 0.61, 0.62 and 0.66).
         assert len(_receipts(views)) == 1
 
     async def test_receipts_are_off_by_default(self, tmp_path: Path) -> None:
