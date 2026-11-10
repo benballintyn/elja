@@ -41,6 +41,7 @@ from elja.compaction import (
     OnUnfit,
     TargetUnreachable,
     TargetUnreachableError,
+    _is_summary,
     build_compaction,
     default_summary_prompt,
 )
@@ -620,6 +621,10 @@ class TestSummarizerComposition:
         # The harness's section headings, plus elja's own skills warning.
         assert "## Key decisions" in prompts[0]
         assert "load_capability" in prompts[0]
+        # From harness 0.62 a summary keeps loaded skills, so the note must not
+        # tell the agent they were unloaded (that would cost it a re-load call).
+        assert "whose instructions no longer appear" in prompts[0]
+        assert "no longer loaded" not in prompts[0]
 
     async def test_receipts_leave_a_note_where_history_was_summarized_away(
         self, tmp_path: Path
@@ -629,8 +634,9 @@ class TestSummarizerComposition:
             settings, list(build_compaction(settings, receipts=True)), _mixed_history(8)
         )
         assert "summarizer" in roles
-        # Structural and a COUNT, not a match on upstream's wording: receipts
-        # accumulate one per compaction across a long caller-owned history.
+        # Structural and a COUNT, not a match on upstream's wording: a caller-owned
+        # history carries one receipt, replaced at each compaction (measured over five
+        # turns on harness 0.59, 0.61, 0.62 and 0.66).
         assert len(_receipts(views)) == 1
 
     async def test_receipts_are_off_by_default(self, tmp_path: Path) -> None:
@@ -1075,14 +1081,16 @@ class TestASystemPromptInHistoryDoesNotGrow:
 
     async def _per_turn(
         self, tmp_path: Path, *, preserve: bool
-    ) -> tuple[list[int], list[int], list[list[str]], int]:
+    ) -> tuple[list[int], list[int], list[list[str]], int, list[str]]:
         settings = _settings(tmp_path, target=1000)
         summarizations = 0
+        transcripts: list[str] = []
 
         def script(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             nonlocal summarizations
             if "summarization assistant" in (info.instructions or ""):
                 summarizations += 1
+                transcripts.append(str(messages))
                 return ModelResponse(
                     parts=[TextPart(content=f"## Intent\nledger {summarizations}")]
                 )
@@ -1102,7 +1110,12 @@ class TestASystemPromptInHistoryDoesNotGrow:
         for turn in range(5):
             result = await agent.run(f"turn {turn}", message_history=history, deps=deps)
             messages = result.all_messages()
-            parts = [part for message in messages for part in message.parts]
+            parts = [
+                part
+                for message in messages
+                if isinstance(message, ModelRequest)
+                for part in message.parts
+            ]
             policies.append(
                 sum(
                     1
@@ -1110,13 +1123,9 @@ class TestASystemPromptInHistoryDoesNotGrow:
                     if isinstance(part, SystemPromptPart) and part.content.startswith("POLICY")
                 )
             )
-            summaries.append(
-                sum(
-                    1
-                    for part in parts
-                    if isinstance(part, SystemPromptPart) and part.content.startswith("Summary")
-                )
-            )
+            # Either shape: a prefixed system part through harness 0.61, a marked
+            # `CompactionPart` from 0.62.
+            summaries.append(sum(1 for part in parts if _is_summary(part)))
             prompts.append(
                 [
                     part.content
@@ -1125,13 +1134,15 @@ class TestASystemPromptInHistoryDoesNotGrow:
                 ]
             )
             history = [*messages, *_mixed_history(8)]
-        return policies, summaries, prompts, summarizations
+        return policies, summaries, prompts, summarizations, transcripts
 
     @pytest.mark.parametrize("preserve", [True, False], ids=["preserving", "not-preserving"])
     async def test_one_policy_copy_and_one_summary_however_many_compactions(
         self, tmp_path: Path, preserve: bool
     ) -> None:
-        policies, summaries, _, summarizations = await self._per_turn(tmp_path, preserve=preserve)
+        policies, summaries, _, summarizations, _ = await self._per_turn(
+            tmp_path, preserve=preserve
+        )
         assert summarizations >= 3, "compaction did not keep firing; the measurement is vacuous"
         assert policies == [1] * len(policies)
         assert summaries == [0] + [1] * (len(summaries) - 1)
@@ -1169,16 +1180,21 @@ class TestASystemPromptInHistoryDoesNotGrow:
         assert leading == original
 
     async def test_no_user_prompt_is_ever_removed(self, tmp_path: Path) -> None:
-        """Only compaction's own copies go: every prompt the user wrote is still there.
+        """Only compaction's own copies go: every prompt the user wrote is kept or summarized.
 
-        These ARE protected-content growth — pydantic-ai merges each compacted turn's
-        prompt into the preserved first request on replay — but they are distinct
-        messages the user wrote, not copies, so they are kept and the floor
-        measurement counts them instead.
+        pydantic-ai merges each compacted turn's prompt into the preserved first request
+        on replay. Through harness 0.61 those prompts are kept there, so they are
+        protected-content growth and the floor measurement counts them. From 0.62 the
+        harness summarizes what follows a summary in that request, so they reach the
+        summarizer instead. Either way elja's copy removal never takes one, and the task
+        and the prompt being answered are always kept verbatim.
         """
-        _, _, prompts, summarizations = await self._per_turn(tmp_path, preserve=True)
+        _, _, prompts, summarizations, transcripts = await self._per_turn(tmp_path, preserve=True)
         assert summarizations >= 3
         for turn, kept in enumerate(prompts):
-            assert [f"turn {n}" for n in range(turn + 1)] == [
-                p for p in kept if p.startswith("turn")
-            ]
+            in_history = [p for p in kept if p.startswith("turn")]
+            assert in_history[0] == "turn 0"
+            assert in_history[-1] == f"turn {turn}"
+            for n in range(turn + 1):
+                prompt = f"turn {n}"
+                assert prompt in in_history or any(prompt in t for t in transcripts)

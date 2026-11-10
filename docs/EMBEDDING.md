@@ -10,16 +10,22 @@ path: it assembles **nothing you did not ask for** and hands back a native
 This document covers what elja guarantees for a host that meters paid
 requests, and — just as important — what it does not.
 
-Versions these statements were verified against: pydantic-ai-slim **2.36.0**,
+Versions these statements were measured against: pydantic-ai-slim **2.36.0**,
 pydantic-ai-harness **0.27.0**, Python 3.12 (and 3.13 for the bounded-compaction
 section, added in 0.6). Every claim below was measured at those versions against
-the installed packages; CI runs the suite on 3.11, 3.12 and 3.13.
+the installed packages. They have not all been re-measured since elja moved to
+pydantic-ai-slim **2.59+** and pydantic-ai-harness **0.59+**: the suite passes at
+the locked **2.66.0** and **0.66.0** (locally on 3.11 and 3.13; CI runs it on 3.11,
+3.12 and 3.13) and passed once locally at the floor, **2.59.0** and **0.59.0** (3.11;
+CI does not test the floor), so what it guards holds at both ends, and the two claims
+below that the suite showed had changed are corrected.
 
-The pins are ranges (`pydantic-ai-slim >=2.36,<3`, `pydantic-ai-harness
->=0.27,<0.28`), so *measured* and *regression-guarded* are not the same thing and
-this document distinguishes them. `tests/test_metering.py` guards the subset named
-under "Metering and admission control" below — `request`, `request_stream` and
-`count_tokens`, each with a positive control. Everything else here is marked
+The pins are ranges (`pydantic-ai-slim >=2.59,<3`, `pydantic-ai-harness
+>=0.59,<0.67`; each harness release pins one exact pydantic-ai-slim, 0.59.0 to
+2.59.0 and 0.66.0 to 2.66.0), so *measured* and *regression-guarded* are not the
+same thing and this document distinguishes them. `tests/test_metering.py` guards
+the subset named under "Metering and admission control" below — `request`,
+`request_stream` and `count_tokens`, each with a positive control. Everything else here is marked
 **measured, not guarded**: true at these versions, and a minor release could
 change it with the suite still green. `merge_model_settings`' own source carries
 `# Note: we may want merge recursively if/when we add non-primitive values`, which
@@ -261,9 +267,9 @@ because the defaults are tuned for a local workspace:
 | argument | why a host changes it |
 | --- | --- |
 | `cleared_placeholder` | The default says "re-run the tool if you need it again" and names `.elja/spill/`. Safe for idempotent reads in a workspace; an invitation to double-write anywhere else. Point it at your own store. |
-| `summary_prompt` | The default carries a note about reloading elja skills, which a host without skills has no reason to ship. This is the summarizer's *user* turn; upstream's `instructions` (its system prompt) is not exposed. Must *substitute* `{messages}`, checked at construction by rendering it twice — a doubled `{{messages}}` is a literal and is refused, while `{messages!r}` and `{messages:>10}` are fine. |
+| `summary_prompt` | The default carries a note telling the model to re-load an elja skill whose instructions are gone (a summary unloads skills on harness 0.59–0.61; from 0.62 the harness keeps them loaded), which a host without skills has no reason to ship. This is the summarizer's *user* turn; upstream's `instructions` (its system prompt) is not exposed. Must *substitute* `{messages}`, checked at construction by rendering it twice — a doubled `{{messages}}` is a literal and is refused, while `{messages!r}` and `{messages:>10}` are fine. |
 | `summarizer_model` | A different provider, a cheaper model, or separate budget attribution (see above). |
-| `receipts` | Leaves a deterministic note where history was summarized away. With a capability implementing the harness's `TranscriptHandleProvider` protocol attached, the receipt carries a handle to your persisted transcript. Note one accumulates per compaction across a long caller-owned history, each with its own dropped-message count. |
+| `receipts` | Leaves a deterministic note where history was summarized away. With a capability implementing the harness's `TranscriptHandleProvider` protocol attached, the receipt carries a handle to your persisted transcript. A caller-owned history carries one receipt however many compactions it has been through: each replaces the last, so its dropped-message count describes the latest compaction only. |
 | `on_unfit` | What happens to a request compaction cannot bring under the target. `None` (the default) raises `TargetUnreachableError`; a gate that returns sends the request. See "The summarizer is bounded" below. |
 
 Replacing the policy wholesale is always available: build your own
@@ -387,9 +393,10 @@ superseded summary for the next to preserve. elja now removes exactly those afte
 each summary: a system part seen twice by exact equality (content, timestamp and
 dynamic ref, so two parts that merely say the same thing are both kept; the
 leading copy stays), and summaries a newer one replaced. User prompts are never
-touched. What still accumulates is the user's own prompts — the same merge folds
-each compacted turn's prompt into the preserved first request — and since those
-are real messages they stay, and the floor counts them.
+touched. The same merge folds each compacted turn's prompt into the preserved first
+request. Through pydantic-ai-harness 0.61 those prompts stay there, as real
+messages, and the floor counts them; from 0.62 the harness summarizes what follows
+a summary in that request, so they do not accumulate.
 
 Prefer `instructions=` for policy anyway: it is still protected (it goes on every
 request), but it lives outside history, where nothing can accumulate.
@@ -518,14 +525,15 @@ wrapping the call in `asyncio.timeout`:
   state from the exception chain with `RunCancelled.from_cancellation`.
 
 **Compaction that works tells the host nothing.** There is no "history was
-rewritten" callback: the only one the harness package offers is
-`ReportContextUsage.on_usage`, which carries a reading and no messages. A host
+rewritten" callback: what the harness package offers is a reading with no
+messages, `ContextUsageEvent` (or the deprecated `ReportContextUsage.on_usage`). A host
 that wants to surface "history compacted" infers it from a reading that drops, or
 from its own copy of the transcript. Compaction that *cannot* reach its target is
-the exception, and it is loud and typed — see "The summarizer is bounded". Related, and a trap for anything billing on
-it: readings are taken in `before_model_request`, which runs *upstream* of the
-usage-limit check, so a turn that trips its limit reports one more reading than
-it made requests.
+the exception, and it is loud and typed — see "The summarizer is bounded". Related, for anything billing on
+it: readings are taken in `before_model_request`, after pydantic-ai's request-limit
+check at the start of the step, so a request refused at the limit is not read. (On
+2.36 the check came after the hook, and such a turn reported one more reading than
+it made requests.)
 
 `examples/server_agent.py` is all of the above as running code, driven by
 `tests/test_server_contracts.py` so it cannot rot.
@@ -533,7 +541,10 @@ it made requests.
 ## Upgrading from 0.5.0
 
 Release notes for the bounded-compaction change, verified against pydantic-ai-slim
-2.36.0 and pydantic-ai-harness 0.27.0 (Python 3.13 locally; CI runs 3.11–3.13).
+2.36.0 and pydantic-ai-harness 0.27.0 (Python 3.13 locally; CI runs 3.11–3.13). The
+same release requires pydantic-ai-slim 2.59+ and pydantic-ai-harness 0.59+; the
+suite passes at the locked 2.66.0 and 0.66.0 and at the 2.59.0 and 0.59.0 floor,
+which CI's floor job tests.
 
 - **Intentional behavior change, for safety.** A request compaction cannot bring
   under `target_tokens` is no longer sent after a summary paid for on every
@@ -558,3 +569,34 @@ Release notes for the bounded-compaction change, verified against pydantic-ai-sl
   summaries that 0.5.0 left in caller-owned histories are removed at the next
   compaction. Several old summaries are folded into one anchor first, so nothing
   they said is lost.
+
+The dependency range brings these too; they come from pydantic-ai and the harness,
+not from a choice elja made:
+
+- **Summary shape, from harness 0.62.** A summary is a marked `CompactionPart` in
+  a request of its own, sent to the model as framed user text, where it was a
+  `SystemPromptPart`. A saved history's summaries of the older shape are still
+  recognized, and replaced at its next compaction.
+- **Earlier prompts are summarized, from harness 0.62.** Replaying a history merges
+  consecutive requests, so later prompts can sit in the first request; 0.62+
+  summarizes them instead of keeping them verbatim with the original task.
+- **Skills stay loaded across a summary, from harness 0.62.** On 0.59–0.61 a
+  summary that drops a skill's `load_capability` exchange unloads the skill.
+- **Saved sessions.** From pydantic-ai 2.60 a saved `RetryPromptPart` loads as
+  `ToolReturnPart(outcome='retried')` when it answers a tool call and as
+  `RetryFeedbackPart` when it does not. A session saved after that may not load on
+  older pydantic-ai: 2.59 and 0.5.0's 2.36 both refuse `outcome='retried'` and
+  `RetryFeedbackPart`.
+- **`ReportContextUsage`** takes no reading for a request refused at the request
+  limit (0.5.0 took one), and its `on_usage` callback is deprecated on every
+  supported harness in favour of `ContextUsageEvent`; it still works, with a
+  `HarnessDeprecationWarning`.
+- **Provider SDK floors.** At the lock, pydantic-ai-slim's extras require
+  `anthropic>=1.15`, `openai>=3.31` and `google-genai>=2.30`; slim 2.59 asks
+  `anthropic>=1.12.1` and `openai>=3.26`.
+- **A banner.** pydantic-ai 2.59+ prints a one-time banner to stderr at a
+  process's first agent run when stderr is a terminal or a coding agent's pipe;
+  never under pytest, in CI, or once instrumentation is configured, and from
+  2.64 not when the run is started from an installed package (`elja` installed
+  with pip or `uv tool`).
+  `PYDANTIC_AI_NO_BANNER=1` or `pydantic_ai.BANNER_ENABLED = False` turns it off.

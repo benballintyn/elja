@@ -461,14 +461,14 @@ class TestContextReporting:
         assert readings[0].resolved is True
         assert readings[0].window_tokens > 0
 
-    async def test_a_reading_is_taken_before_the_limit_is_checked(self) -> None:
-        """Readings outnumber requests on a limit trip, so they are not a meter.
+    async def test_a_request_refused_at_the_limit_is_not_measured(self) -> None:
+        """One reading per request sent, on a limit trip too.
 
-        `ReportContextUsage` measures in `before_model_request`, which runs
-        upstream of the usage-limit check — so the request that trips the limit is
-        measured and then never sent. Measured: 2 readings against 1 request. A
-        host billing or rate-limiting on reading count over-charges by one for
-        every turn that ends this way.
+        pydantic-ai checks the request limit at the start of the step, before
+        `before_model_request`, where `ReportContextUsage` measures — so the request
+        that trips the limit is never measured. Measured on pydantic-ai 2.59 and 2.66:
+        1 reading against 1 request. (On 2.36 the check came after the hook, and the
+        same turn read 2 against 1.)
         """
         readings: list[Any] = []
         recorder = TurnRecorder()
@@ -481,7 +481,7 @@ class TestContextReporting:
                 recorder=recorder,
                 usage_limits=UsageLimits(request_limit=1),
             )
-        assert len(readings) == 2
+        assert len(readings) == 1
         assert recorder.usage is not None
         assert recorder.usage.requests == 1
 
