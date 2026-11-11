@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/benballintyn/elja/compare/v0.5.0...v0.6.0) (2026-11-10)
+
+
+### Features
+
+* bound compaction's summarizer and make an unreachable target a typed outcome ([#43](https://github.com/benballintyn/elja/issues/43)) ([e7a3479](https://github.com/benballintyn/elja/commit/e7a3479a6cd10158cd4bf35ff85dd94af3c34154))
+
+
+### Bug Fixes
+
+* **deps:** require pydantic-ai-harness 0.59+ and pydantic-ai-slim 2.59+ ([#45](https://github.com/benballintyn/elja/issues/45)) ([0f6e407](https://github.com/benballintyn/elja/commit/0f6e40710fdc477af4a3a076b214d0da5b1cd2ad))
+
 ## [0.5.0](https://github.com/benballintyn/elja/compare/v0.4.0...v0.5.0) (2026-09-12)
 
 
